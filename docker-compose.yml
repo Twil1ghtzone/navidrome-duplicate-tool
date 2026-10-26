@@ -13,6 +13,7 @@ services:
       # Nur noetig, wenn Navidrome die Musik unter anderem Pfad sieht als dieser Container:
       # PATH_MAP: "/music:/music"
       KEEP_EXTS: "flac"
+      DEDUPE_SAME_EXTS: "flac"          # doppelte FLACs ebenfalls bereinigen (none = aus)
       DELETE_EXTS: "mp3"
       DURATION_TOLERANCE: "3"            # Sekunden
       BATCH_SIZE: "200"

@@ -7,7 +7,9 @@ Getestet gegen das aktuelle Navidrome-Schema (relative Pfade + `library`-Tabelle
 ## Funktionsweise
 1. `media_file` wird sortiert gestreamt (konstanter RAM, auch bei 10M+ Tracks) und nach
    `album_id + disc_number + order_title` gruppiert (`MATCH_MODE=artist_title` = albumuebergreifend, riskanter).
-2. Eine Gruppe wird nur bearbeitet, wenn sie eine Datei aus `KEEP_EXTS` (flac) **und** `DELETE_EXTS` (mp3) enthaelt.
+2. Pro Gruppe bleibt die beste Datei (FLAC bevorzugt, dann hoechste Bitrate/Groesse). Entfernt werden alle `DELETE_EXTS`-Dateien (mp3, sofern eine
+   FLAC existiert) **und** weitere Duplikate der Typen in `DEDUPE_SAME_EXTS` (Standard `flac` = doppelte FLACs; `none` = aus).
+   Bei gleichem Format muss zusaetzlich die Tracknummer uebereinstimmen.
 3. Schutzregeln (ganze Gruppe wird uebersprungen): Schutz-Begriffe (instrumental, karaoke, acapella ...) in Titel,
    Album, Kommentar, Pfad oder Tags; Exclude-Ordner; FLAC fehlt/leer auf Platte; MP3-Laenge weicht > `DURATION_TOLERANCE` s ab.
 4. Execute: Backup (`VACUUM INTO`) -> pro Block (`BATCH_SIZE`) **eine** `BEGIN IMMEDIATE`-Transaktion:

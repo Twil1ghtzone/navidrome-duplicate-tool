@@ -26,6 +26,7 @@ pub struct Env {
     pub path_map: Option<(String, String)>,
     pub keep_exts: Vec<String>,
     pub delete_exts: Vec<String>,
+    pub same_exts: Vec<String>,
     pub duration_tol: f64,
     pub batch_size: usize,
     pub backup_keep: usize,
@@ -63,6 +64,7 @@ impl Env {
             path_map,
             keep_exts: list("KEEP_EXTS", "flac"),
             delete_exts: list("DELETE_EXTS", "mp3"),
+            same_exts: list("DEDUPE_SAME_EXTS", "flac"),
             duration_tol: var("DURATION_TOLERANCE", "3").parse().unwrap_or(3.0),
             batch_size: var("BATCH_SIZE", "200").parse().unwrap_or(200).max(1),
             backup_keep: var("BACKUP_KEEP", "3").parse().unwrap_or(3),
@@ -184,6 +186,7 @@ struct Row {
     duration: f64,
     bit_rate: i64,
     comment: String,
+    track: i64,
 }
 
 fn s(r: &rusqlite::Row, i: usize) -> rusqlite::Result<String> {
@@ -224,7 +227,8 @@ pub fn run(sh: &Shared, execute: bool) {
 }
 
 fn open(env: &Env, query_only: bool) -> Result<Connection, String> {
-    let c = Connection::open(&env.db_path).map_err(|e| format!("DB oeffnen: {e}"))?;
+    let c = Connection::open_with_flags(&env.db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)
+        .map_err(|e| format!("DB oeffnen ({}): {e} – Pfad/Volume pruefen, es wird absichtlich KEINE neue DB angelegt", env.db_path))?;
     c.busy_timeout(std::time::Duration::from_secs(60)).map_err(|e| e.to_string())?;
     if query_only {
         c.execute_batch("PRAGMA query_only=ON; PRAGMA cache_size=-65536;").map_err(|e| e.to_string())?;
@@ -275,7 +279,10 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
     sh.log(format!("Report: {}", rpath.display()));
 
     let ext_sql = |v: &Vec<String>| v.iter().map(|e| format!("'{e}'")).collect::<Vec<_>>().join(",");
-    let all_exts = ext_sql(&env.keep_exts.iter().chain(env.delete_exts.iter()).cloned().collect());
+    let mut union: Vec<String> = env.keep_exts.iter().chain(env.delete_exts.iter()).chain(env.same_exts.iter()).cloned().collect();
+    union.sort();
+    union.dedup();
+    let all_exts = ext_sql(&union);
     if env.keep_exts.is_empty() || env.delete_exts.is_empty() {
         return Err("KEEP_EXTS/DELETE_EXTS leer".into());
     }
@@ -292,7 +299,7 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
         MatchMode::ArtistTitle => "artist_id, order_title",
     };
     let sql = format!(
-        "SELECT id, library_id, path, title, album, album_id, artist_id, disc_number, order_title, suffix, size, duration, bit_rate, comment \
+        "SELECT id, library_id, path, title, album, album_id, artist_id, disc_number, order_title, suffix, size, duration, bit_rate, comment, track_number \
          FROM media_file WHERE missing=0 AND lower(suffix) IN ({all_exts}) ORDER BY {order}"
     );
 
@@ -319,6 +326,7 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
             duration: f(r, 11).map_err(|e| e.to_string())?,
             bit_rate: n(r, 12).map_err(|e| e.to_string())?,
             comment: s(r, 13).map_err(|e| e.to_string())?,
+            track: n(r, 14).map_err(|e| e.to_string())?,
         };
         let (a, b, c, d) = (s(r, 5).unwrap_or_default(), s(r, 6).unwrap_or_default(), n(r, 7).unwrap_or(0), s(r, 8).unwrap_or_default());
         let k = if d.is_empty() {
@@ -434,9 +442,27 @@ impl<'a> Ctx<'a> {
         if g.len() < 2 {
             return Ok(());
         }
+        // Behaltene Datei: bevorzugt aus KEEP_EXTS (z.B. FLAC); gibt es keine, aus den Same-Format-Typen.
+        // Entfernt werden: alle DELETE_EXTS-Dateien (nur wenn eine KEEP-Datei existiert) sowie
+        // weitere Dateien der DEDUPE_SAME_EXTS-Typen (z.B. doppelte FLACs).
+        let rank = |r: &&Row| (r.bit_rate, r.size, std::cmp::Reverse(r.id.clone()));
         let keepers: Vec<&Row> = g.iter().filter(|r| self.env.keep_exts.contains(&r.suffix)).collect();
-        let dels: Vec<&Row> = g.iter().filter(|r| self.env.delete_exts.contains(&r.suffix)).collect();
-        if keepers.is_empty() || dels.is_empty() {
+        let keeper_row: &Row = match keepers.iter().copied().max_by_key(rank) {
+            Some(k) => k,
+            None => match g.iter().filter(|r| self.env.same_exts.contains(&r.suffix)).max_by_key(rank) {
+                Some(k) => k,
+                None => return Ok(()),
+            },
+        };
+        let have_keep = !keepers.is_empty();
+        let dels: Vec<&Row> = g
+            .iter()
+            .filter(|r| {
+                r.id != keeper_row.id
+                    && ((have_keep && self.env.delete_exts.contains(&r.suffix)) || self.env.same_exts.contains(&r.suffix))
+            })
+            .collect();
+        if dels.is_empty() {
             return Ok(());
         }
         let sh = self.sh;
@@ -454,7 +480,7 @@ impl<'a> Ctx<'a> {
             return Ok(());
         }
 
-        let keeper = (*keepers.iter().max_by_key(|r| (r.bit_rate, r.size)).unwrap()).clone();
+        let keeper = keeper_row.clone();
         let kpath = self.full(&keeper);
         match fs::metadata(&kpath) {
             Ok(m) if m.len() > 0 => {}
@@ -472,7 +498,16 @@ impl<'a> Ctx<'a> {
                 sh.log(format!("SKIP (Laenge weicht ab {:.1}s vs {:.1}s): {}", d.duration, keeper.duration, d.path));
                 continue;
             }
-            ok_dels.push((d.clone(), self.full(d)));
+            let dpath = self.full(d);
+            if dpath == kpath {
+                continue; // dieselbe physische Datei – niemals loeschen
+            }
+            if d.suffix == keeper.suffix && d.track != keeper.track {
+                sh.stats.mismatch.fetch_add(1, Relaxed);
+                sh.log(format!("SKIP (Tracknummer {} vs {} bei gleichem Format): {}", d.track, keeper.track, d.path));
+                continue;
+            }
+            ok_dels.push((d.clone(), dpath));
         }
         if ok_dels.is_empty() {
             return Ok(());
