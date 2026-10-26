@@ -1,0 +1,27 @@
+services:
+  navidrome-dedupe:
+    build: .
+    container_name: navidrome-dedupe
+    restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"
+    ports:
+      - "8085:8080"                      # http://<server-ip>:8085 im LAN
+    environment:
+      UI_USER: "${UI_USER:?UI_USER fehlt}"
+      UI_PASSWORD: "${UI_PASSWORD:?UI_PASSWORD fehlt}"
+      NAVIDROME_DB: /data/navidrome.db
+      # Nur noetig, wenn Navidrome die Musik unter anderem Pfad sieht als dieser Container:
+      # PATH_MAP: "/music:/music"
+      KEEP_EXTS: "flac"
+      DELETE_EXTS: "mp3"
+      DURATION_TOLERANCE: "3"            # Sekunden
+      BATCH_SIZE: "200"
+      BACKUP_KEEP: "3"
+      MATCH_MODE: "album"                # album | artist_title
+      DELETE_ROWS: "false"               # false = Navidrome-Eintrag nur als 'missing' markieren
+    volumes:
+      - "${NAVIDROME_DATA_DIR}:/data"    # ganzes Verzeichnis (SQLite-WAL braucht -wal/-shm)
+      - "${MUSIC_DIR}:/music"            # read-write: MP3s werden geloescht
+      - ./config:/config
+      - ./backups:/backups
+    stop_grace_period: 120s              # Zeit zum sauberen Beenden des laufenden Blocks

@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NAVIDROME-DEDUPE v0.1</title>
+<style>
+  :root { --fg:#33ff33; --dim:#1a9a1a; --bg:#020a02; --warn:#ffb000; --err:#ff4444; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg);
+         font:14px/1.4 "Courier New", Courier, monospace; text-shadow:0 0 4px rgba(51,255,51,.5); }
+  body::after { content:""; position:fixed; inset:0; pointer-events:none;
+         background:repeating-linear-gradient(0deg, rgba(0,0,0,.18) 0 1px, transparent 1px 3px); }
+  h1 { margin:0 0 4px; font-size:18px; letter-spacing:2px; }
+  .sub { color:var(--dim); margin-bottom:14px; }
+  .box { border:1px solid var(--fg); padding:10px 12px; margin-bottom:14px; }
+  .box > h2 { margin:-19px 0 8px; font-size:13px; background:var(--bg); display:inline-block; padding:0 6px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:6px 18px; }
+  .grid div span { color:#fff; float:right; }
+  button { font:inherit; color:var(--bg); background:var(--fg); border:0; padding:6px 14px; cursor:pointer; margin-right:8px; }
+  button:disabled { background:var(--dim); cursor:not-allowed; }
+  button.warn { background:var(--warn); }
+  textarea { width:100%; height:90px; background:#000; color:var(--fg); border:1px solid var(--dim); font:inherit; padding:6px; }
+  label { margin-right:18px; cursor:pointer; }
+  #bar { height:16px; border:1px solid var(--fg); margin:8px 0; }
+  #fill { height:100%; width:0; background:var(--fg); }
+  #log { height:340px; overflow:auto; background:#000; padding:8px; margin:0; white-space:pre-wrap; word-break:break-all; font-size:12px; }
+  .l-skip { color:var(--warn); } .l-err { color:var(--err); } .l-del { color:#fff; }
+  .blink { animation:b 1s steps(2) infinite; } @keyframes b { 50% { opacity:0; } }
+  .two { display:grid; grid-template-columns:1fr 1fr; gap:14px; } @media (max-width:700px){ .two{grid-template-columns:1fr;} }
+  small { color:var(--dim); }
+</style>
+</head>
+<body>
+<h1>&gt; NAVIDROME-DEDUPE<span class="blink">_</span></h1>
+<div class="sub">DB: {{DB}} | BEHALTEN: {{KEEP}} | LOESCHEN: {{DEL}} | STATUS: <b id="phase">...</b></div>
+
+<div class="box"><h2>[ STEUERUNG ]</h2>
+  <label><input type="radio" name="mode" value="dry" checked> DRY-RUN (nur simulieren)</label>
+  <label><input type="radio" name="mode" value="exec"> EXECUTE (echte Loeschung + Backup)</label><br><br>
+  <button id="start" onclick="startRun()">START</button>
+  <button id="stop" class="warn" onclick="stopRun()" disabled>STOP</button>
+  <small>Stop/Shutdown beendet immer erst den aktuellen DB-Block sauber.</small>
+</div>
+
+<div class="box"><h2>[ LIVE-STATISTIK ]</h2>
+  <div id="bar"><div id="fill"></div></div>
+  <div class="grid">
+    <div>Gescannt <span id="scanned">0</span></div>
+    <div>Gesamt <span id="total">0</span></div>
+    <div>Kandidaten-Gruppen <span id="candidates">0</span></div>
+    <div>Duplikate erkannt <span id="duplicates">0</span></div>
+    <div>Geloescht <span id="deleted">0</span></div>
+    <div><span id="freedlabel" style="float:none">Speicher frei</span> <span id="freed">0 B</span></div>
+    <div>Annotationen uebertragen <span id="annotations">0</span></div>
+    <div>Geschuetzt (Instr./Karaoke) <span id="protected">0</span></div>
+    <div>Exclude-Ordner <span id="excluded">0</span></div>
+    <div>Laenge weicht ab <span id="mismatch">0</span></div>
+    <div>Fehler <span id="errors">0</span></div>
+  </div>
+</div>
+
+<div class="two">
+  <div class="box"><h2>[ EXCLUDE-ORDNER ]</h2>
+    <textarea id="excludes" placeholder="Ein Ordnername/Pfadteil pro Zeile, z.B. DJ-Mixe"></textarea>
+  </div>
+  <div class="box"><h2>[ SCHUTZ-BEGRIFFE ]</h2>
+    <textarea id="keywords"></textarea>
+  </div>
+</div>
+<button onclick="saveCfg()" style="margin-bottom:14px">KONFIG SPEICHERN</button> <small id="cfgmsg"></small>
+
+<div class="box"><h2>[ LIVE-LOG ]</h2><pre id="log"></pre></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let since = 0, running = false;
+const fmt = n => n.toLocaleString("de-DE");
+function bytes(b){ const u=["B","KB","MB","GB","TB"]; let i=0; while(b>=1024&&i<4){b/=1024;i++;} return b.toFixed(i?2:0)+" "+u[i]; }
+async function api(path, opt) { const r = await fetch(path, opt); if (!r.ok) throw new Error(await r.text()); return r; }
+async function poll() {
+  try {
+    const d = await (await api("/api/status?since=" + since)).json();
+    running = d.running;
+    $("phase").textContent = (d.running ? "LAEUFT" : "BEREIT") + " - " + d.phase + (d.running ? (d.execute ? " [EXECUTE]" : " [DRY-RUN]") : "");
+    const s = d.stats;
+    for (const k of ["scanned","total","candidates","duplicates","deleted","annotations","protected","excluded","mismatch","errors"]) $(k).textContent = fmt(s[k]);
+    $("freed").textContent = bytes(s.bytes_freed);
+    $("freedlabel").textContent = d.execute ? "Speicher freigegeben" : "Speicher (Simulation)";
+    $("fill").style.width = (s.total ? Math.min(100, s.scanned / s.total * 100) : 0) + "%";
+    $("start").disabled = d.running; $("stop").disabled = !d.running;
+    const log = $("log"), stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
+    for (const [i, line] of d.log) {
+      const el = document.createElement("div");
+      el.className = /FEHLER/.test(line) ? "l-err" : /SKIP/.test(line) ? "l-skip" : /GELOESCHT/.test(line) ? "l-del" : "";
+      el.textContent = line; log.appendChild(el);
+    }
+    while (log.childElementCount > 1500) log.removeChild(log.firstChild);
+    if (stick) log.scrollTop = log.scrollHeight;
+    since = d.next;
+  } catch (e) { $("phase").textContent = "VERBINDUNG GESTOERT"; }
+  setTimeout(poll, running ? 1000 : 3000);
+}
+async function startRun() {
+  const exec = document.querySelector('input[name=mode]:checked').value === "exec";
+  if (exec && !confirm("ECHTER LAUF: MP3-Dateien werden unwiderruflich geloescht (DB-Backup wird vorher erstellt).\nFortfahren?")) return;
+  try { await api("/api/start", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({execute: exec}) }); }
+  catch (e) { alert("Start fehlgeschlagen: " + e.message); }
+}
+async function stopRun() { await api("/api/stop", { method:"POST" }); }
+const lines = t => t.split("\n").map(x => x.trim()).filter(Boolean);
+async function loadCfg() {
+  const c = await (await api("/api/config")).json();
+  $("excludes").value = c.excludes.join("\n"); $("keywords").value = c.keywords.join("\n");
+}
+async function saveCfg() {
+  try {
+    await api("/api/config", { method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({excludes: lines($("excludes").value), keywords: lines($("keywords").value)}) });
+    $("cfgmsg").textContent = "gespeichert.";
+  } catch (e) { $("cfgmsg").textContent = "FEHLER: " + e.message; }
+}
+if ({{MODE_EXECUTE}}) document.querySelector('input[value=exec]').checked = true;
+loadCfg(); poll();
+</script>
+</body>
+</html>
