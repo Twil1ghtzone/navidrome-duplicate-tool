@@ -1,6 +1,7 @@
 mod engine;
 
 use axum::{
+    body::Body,
     extract::{Query, Request, State},
     http::{header, StatusCode},
     middleware::{self, Next},
@@ -14,6 +15,8 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::{atomic::Ordering::Relaxed, Arc};
 use std::time::Duration;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 type App = Arc<Shared>;
 
@@ -54,6 +57,7 @@ async fn index(State(app): State<App>) -> Html<String> {
     let page = include_str!("../templates/index.html")
         .replace("{{MODE_EXECUTE}}", if app.execute.load(Relaxed) { "true" } else { "false" })
         .replace("{{DB}}", &app.env.db_path)
+        .replace("{{VERSION}}", VERSION)
         .replace("{{KEEP}}", &app.env.keep_exts.join(","))
         .replace("{{DEL}}", &app.env.delete_exts.join(","));
     Html(page)
@@ -65,24 +69,28 @@ struct Since {
 }
 
 async fn status(State(app): State<App>, Query(q): Query<Since>) -> Json<serde_json::Value> {
-    let st = &app.stats;
     let (next, lines): (u64, Vec<(u64, String)>) = {
         let g = app.log.lock().unwrap();
         let since = q.since.unwrap_or(0);
         (g.0, g.1.iter().filter(|(i, _)| *i > since).cloned().collect())
     };
+    let mut warnings: Vec<String> = vec![];
+    if !std::path::Path::new(&app.env.db_path).is_file() {
+        warnings.push(format!(
+            "Navidrome-Datenbank nicht gefunden: {} – das Volume fuer /data muss den Navidrome-Datenordner enthalten.",
+            app.env.db_path
+        ));
+    }
+    if app.env.require_dryrun && !app.running.load(Relaxed) && !engine::recent_dry_run(&app.env) {
+        warnings.push("Fuer EXECUTE ist zuerst ein vollstaendiger DRY-RUN noetig (letzte 7 Tage).".into());
+    }
     Json(json!({
+        "version": VERSION,
         "running": app.running.load(Relaxed),
         "execute": app.execute.load(Relaxed),
         "phase": *app.phase.lock().unwrap(),
-        "stats": {
-            "total": st.total.load(Relaxed), "scanned": st.scanned.load(Relaxed),
-            "candidates": st.candidates.load(Relaxed), "duplicates": st.duplicates.load(Relaxed),
-            "protected": st.protected.load(Relaxed), "excluded": st.excluded.load(Relaxed),
-            "mismatch": st.mismatch.load(Relaxed), "deleted": st.deleted.load(Relaxed),
-            "bytes_freed": st.bytes_freed.load(Relaxed), "annotations": st.annotations.load(Relaxed),
-            "errors": st.errors.load(Relaxed)
-        },
+        "stats": app.stats_json(),
+        "warnings": warnings,
         "next": next,
         "log": lines,
     }))
@@ -103,6 +111,12 @@ fn spawn_run(app: &App, execute: bool) -> bool {
 }
 
 async fn start(State(app): State<App>, Json(r): Json<StartReq>) -> impl IntoResponse {
+    if r.execute && app.env.require_dryrun && !engine::recent_dry_run(&app.env) {
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(json!({"ok": false, "error": "Sicherheitssperre: Bitte zuerst einen vollstaendigen Dry-Run durchfuehren (nicht aelter als 7 Tage, nicht vorzeitig gestoppt)."})),
+        );
+    }
     if spawn_run(&app, r.execute) {
         (StatusCode::OK, Json(json!({"ok": true})))
     } else {
@@ -127,6 +141,9 @@ async fn set_cfg(State(app): State<App>, Json(mut s): Json<Settings>) -> impl In
     for v in s.excludes.iter_mut().chain(s.keywords.iter_mut()) {
         *v = v.trim().to_string();
     }
+    if !(0.0..=60.0).contains(&s.duration_tol) {
+        return (StatusCode::BAD_REQUEST, "Laengen-Toleranz muss zwischen 0 und 60 Sekunden liegen").into_response();
+    }
     s.excludes.retain(|v| !v.is_empty());
     s.keywords.retain(|v| !v.is_empty());
     if let Err(e) = engine::save_settings(&app.env, &s) {
@@ -135,6 +152,44 @@ async fn set_cfg(State(app): State<App>, Json(mut s): Json<Settings>) -> impl In
     *app.settings.lock().unwrap() = s;
     app.log("Konfiguration gespeichert");
     StatusCode::OK.into_response()
+}
+
+async fn logs_zip(State(app): State<App>) -> Response {
+    let a = app.clone();
+    match tokio::task::spawn_blocking(move || engine::build_zip(&a)).await {
+        Ok(Ok(file)) => {
+            let stream = tokio_util::io::ReaderStream::new(tokio::fs::File::from_std(file));
+            let name = format!("navidrome-dedupe-logs-{}.zip", chrono::Local::now().format("%Y%m%d-%H%M%S"));
+            (
+                [
+                    (header::CONTENT_TYPE, "application/zip".to_string()),
+                    (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\"")),
+                ],
+                Body::from_stream(stream),
+            )
+                .into_response()
+        }
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("ZIP fehlgeschlagen: {e}")).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("ZIP fehlgeschlagen: {e}")).into_response(),
+    }
+}
+
+async fn history(State(app): State<App>) -> Json<serde_json::Value> {
+    let mut h = engine::history(&app.env);
+    h.reverse();
+    Json(json!({"history": h, "backups": engine::list_backups(&app.env)}))
+}
+
+async fn backup_now(State(app): State<App>) -> impl IntoResponse {
+    let a = app.clone();
+    match tokio::task::spawn_blocking(move || engine::manual_backup(&a)).await {
+        Ok(Ok(p)) => {
+            app.log(format!("Manuelles Backup erstellt: {p}"));
+            (StatusCode::OK, Json(json!({"ok": true, "path": p})))
+        }
+        Ok(Err(e)) => (StatusCode::CONFLICT, Json(json!({"ok": false, "error": e}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"ok": false, "error": e.to_string()}))),
+    }
 }
 
 async fn healthz() -> &'static str {
@@ -179,6 +234,13 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    if env.generated_pass {
+        eprintln!("==============================================================");
+        eprintln!(" UI_PASSWORD war nicht gesetzt. Generiertes Passwort fuer '{}':", env.ui_user);
+        eprintln!("   {}", env.ui_pass);
+        eprintln!(" (gespeichert in {}/.ui_password)", env.config_dir.display());
+        eprintln!("==============================================================");
+    }
     let execute_default = args.iter().any(|a| a == "--execute");
     let headless = args.iter().any(|a| a == "--headless");
     let app: App = Arc::new(Shared::new(env));
@@ -200,6 +262,9 @@ async fn main() {
         .route("/api/start", post(start))
         .route("/api/stop", post(stop))
         .route("/api/config", get(get_cfg).post(set_cfg))
+        .route("/api/logs.zip", get(logs_zip))
+        .route("/api/history", get(history))
+        .route("/api/backup", post(backup_now))
         .layer(middleware::from_fn_with_state(app.clone(), auth));
     let router = Router::new().route("/healthz", get(healthz)).merge(protected).with_state(app.clone());
 
@@ -207,7 +272,7 @@ async fn main() {
         eprintln!("bind {bind}: {e}");
         std::process::exit(2);
     });
-    app.log(format!("Web-UI auf http://{bind}  (DB: {})", app.env.db_path));
+    eprintln!("navidrome-dedupe {VERSION} – Web-UI auf http://{bind} (DB: {})", app.env.db_path);
 
     let a = app.clone();
     let server = axum::serve(listener, router).with_graceful_shutdown(async move {

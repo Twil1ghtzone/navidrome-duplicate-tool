@@ -3,125 +3,224 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NAVIDROME-DEDUPE v0.1</title>
+<title>Navidrome Duplicate Tool</title>
 <style>
-  :root { --fg:#33ff33; --dim:#1a9a1a; --bg:#020a02; --warn:#ffb000; --err:#ff4444; }
-  * { box-sizing: border-box; }
-  body { margin:0; padding:16px; background:var(--bg); color:var(--fg);
-         font:14px/1.4 "Courier New", Courier, monospace; text-shadow:0 0 4px rgba(51,255,51,.5); }
-  body::after { content:""; position:fixed; inset:0; pointer-events:none;
-         background:repeating-linear-gradient(0deg, rgba(0,0,0,.18) 0 1px, transparent 1px 3px); }
-  h1 { margin:0 0 4px; font-size:18px; letter-spacing:2px; }
-  .sub { color:var(--dim); margin-bottom:14px; }
-  .box { border:1px solid var(--fg); padding:10px 12px; margin-bottom:14px; }
-  .box > h2 { margin:-19px 0 8px; font-size:13px; background:var(--bg); display:inline-block; padding:0 6px; }
-  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:6px 18px; }
-  .grid div span { color:#fff; float:right; }
-  button { font:inherit; color:var(--bg); background:var(--fg); border:0; padding:6px 14px; cursor:pointer; margin-right:8px; }
-  button:disabled { background:var(--dim); cursor:not-allowed; }
-  button.warn { background:var(--warn); }
-  textarea { width:100%; height:90px; background:#000; color:var(--fg); border:1px solid var(--dim); font:inherit; padding:6px; }
-  label { margin-right:18px; cursor:pointer; }
-  #bar { height:16px; border:1px solid var(--fg); margin:8px 0; }
-  #fill { height:100%; width:0; background:var(--fg); }
-  #log { height:340px; overflow:auto; background:#000; padding:8px; margin:0; white-space:pre-wrap; word-break:break-all; font-size:12px; }
-  .l-skip { color:var(--warn); } .l-err { color:var(--err); } .l-del { color:#fff; }
-  .blink { animation:b 1s steps(2) infinite; } @keyframes b { 50% { opacity:0; } }
-  .two { display:grid; grid-template-columns:1fr 1fr; gap:14px; } @media (max-width:700px){ .two{grid-template-columns:1fr;} }
-  small { color:var(--dim); }
+  :root {
+    --bg:#f4f5f7; --card:#ffffff; --fg:#1f2430; --muted:#6b7280; --line:#e2e5ea;
+    --accent:#3d5a80; --accent-fg:#ffffff; --danger:#b3392f; --ok:#2f7d4f; --warn:#9a6700; --warn-bg:#fff6dd;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14171c; --card:#1c2027; --fg:#e6e8ec; --muted:#9aa3b2; --line:#2b313b;
+            --accent:#6d93c4; --accent-fg:#0f1318; --danger:#e07369; --ok:#5fb383; --warn:#e3b341; --warn-bg:#2d2610; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  main { max-width:1080px; margin:0 auto; padding:20px 16px 48px; }
+  header { display:flex; flex-wrap:wrap; align-items:center; gap:8px 14px; margin-bottom:16px; }
+  h1 { font-size:20px; margin:0; font-weight:600; }
+  .ver { color:var(--muted); font-size:13px; }
+  .pill { margin-left:auto; padding:3px 12px; border-radius:99px; border:1px solid var(--line); background:var(--card); font-size:13px; }
+  .pill.run { border-color:var(--accent); color:var(--accent); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px 18px; margin-bottom:16px; }
+  .card h2 { font-size:14px; margin:0 0 12px; font-weight:600; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+  .warn { background:var(--warn-bg); border:1px solid var(--warn); color:var(--warn); border-radius:8px; padding:8px 12px; margin-bottom:10px; font-size:14px; }
+  .row { display:flex; flex-wrap:wrap; gap:10px 16px; align-items:center; }
+  .seg { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .seg label { padding:7px 14px; cursor:pointer; font-size:14px; }
+  .seg input { display:none; }
+  .seg input:checked + span { font-weight:600; }
+  .seg label:has(input:checked) { background:var(--accent); color:var(--accent-fg); }
+  .seg label.exec:has(input:checked) { background:var(--danger); color:#fff; }
+  button, .btn { font:inherit; font-size:14px; padding:7px 16px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--fg); cursor:pointer; text-decoration:none; display:inline-block; }
+  button.primary { background:var(--accent); color:var(--accent-fg); border-color:var(--accent); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button:hover:not(:disabled), .btn:hover { filter:brightness(.96); }
+  .bar { height:8px; background:var(--line); border-radius:99px; overflow:hidden; margin:14px 0 4px; }
+  .bar > div { height:100%; width:0; background:var(--accent); transition:width .4s; }
+  .pct { font-size:13px; color:var(--muted); }
+  .tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin-top:12px; }
+  .tile { border:1px solid var(--line); border-radius:8px; padding:8px 12px; }
+  .tile b { display:block; font-size:20px; font-variant-numeric:tabular-nums; }
+  .tile span { font-size:12px; color:var(--muted); }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; } @media (max-width:760px){ .grid2 { grid-template-columns:1fr; } }
+  textarea, input[type=number], input[type=text] { width:100%; background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:8px 10px; font:13px var(--mono); }
+  textarea { height:100px; resize:vertical; }
+  label.f { display:block; font-size:13px; color:var(--muted); margin-bottom:4px; }
+  .opts { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; margin-top:14px; }
+  .opts input[type=number] { max-width:140px; }
+  #log { height:340px; overflow:auto; background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:8px 10px; margin:10px 0 0; font:12px/1.5 var(--mono); white-space:pre-wrap; word-break:break-all; }
+  .l-skip { color:var(--warn); } .l-err { color:var(--danger); } .l-del { color:var(--ok); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:500; }
+  .muted { color:var(--muted); font-size:13px; }
+  .msg { font-size:13px; margin-left:8px; color:var(--muted); }
 </style>
 </head>
 <body>
-<h1>&gt; NAVIDROME-DEDUPE<span class="blink">_</span></h1>
-<div class="sub">DB: {{DB}} | BEHALTEN: {{KEEP}} | LOESCHEN: {{DEL}} | STATUS: <b id="phase">...</b></div>
+<main>
+<header>
+  <h1>Navidrome Duplicate Tool</h1><span class="ver">v{{VERSION}}</span>
+  <span class="pill" id="pill">...</span>
+</header>
+<div id="warnings"></div>
 
-<div class="box"><h2>[ STEUERUNG ]</h2>
-  <label><input type="radio" name="mode" value="dry" checked> DRY-RUN (nur simulieren)</label>
-  <label><input type="radio" name="mode" value="exec"> EXECUTE (echte Loeschung + Backup)</label><br><br>
-  <button id="start" onclick="startRun()">START</button>
-  <button id="stop" class="warn" onclick="stopRun()" disabled>STOP</button>
-  <small>Stop/Shutdown beendet immer erst den aktuellen DB-Block sauber.</small>
-</div>
-
-<div class="box"><h2>[ LIVE-STATISTIK ]</h2>
-  <div id="bar"><div id="fill"></div></div>
-  <div class="grid">
-    <div>Gescannt <span id="scanned">0</span></div>
-    <div>Gesamt <span id="total">0</span></div>
-    <div>Kandidaten-Gruppen <span id="candidates">0</span></div>
-    <div>Duplikate erkannt <span id="duplicates">0</span></div>
-    <div>Geloescht <span id="deleted">0</span></div>
-    <div><span id="freedlabel" style="float:none">Speicher frei</span> <span id="freed">0 B</span></div>
-    <div>Annotationen uebertragen <span id="annotations">0</span></div>
-    <div>Geschuetzt (Instr./Karaoke) <span id="protected">0</span></div>
-    <div>Exclude-Ordner <span id="excluded">0</span></div>
-    <div>Laenge weicht ab <span id="mismatch">0</span></div>
-    <div>Fehler <span id="errors">0</span></div>
+<section class="card">
+  <h2>Steuerung</h2>
+  <div class="row">
+    <div class="seg">
+      <label><input type="radio" name="mode" value="dry" checked><span>Simulation (Dry-Run)</span></label>
+      <label class="exec"><input type="radio" name="mode" value="exec"><span>Ausführen (löscht Dateien)</span></label>
+    </div>
+    <button id="start" class="primary" onclick="startRun()">Start</button>
+    <button id="stop" onclick="stopRun()" disabled>Stopp</button>
+    <span class="muted">Stopp beendet immer erst den aktuellen Datenbank-Block sauber.</span>
   </div>
-</div>
-
-<div class="two">
-  <div class="box"><h2>[ EXCLUDE-ORDNER ]</h2>
-    <textarea id="excludes" placeholder="Ein Ordnername/Pfadteil pro Zeile, z.B. DJ-Mixe"></textarea>
+  <div class="bar"><div id="fill"></div></div>
+  <div class="pct" id="pct">0 %</div>
+  <div class="tiles">
+    <div class="tile"><b id="scanned">0</b><span>Titel gescannt</span></div>
+    <div class="tile"><b id="candidates">0</b><span>Kandidaten-Gruppen</span></div>
+    <div class="tile"><b id="duplicates">0</b><span>Duplikate erkannt</span></div>
+    <div class="tile"><b id="deleted">0</b><span>Dateien gelöscht</span></div>
+    <div class="tile"><b id="freed">0 B</b><span id="freedlabel">Speicher</span></div>
+    <div class="tile"><b id="annotations">0</b><span>Favoriten/Statistiken übertragen</span></div>
+    <div class="tile"><b id="protected">0</b><span>Geschützt (Instrumental u. ä.)</span></div>
+    <div class="tile"><b id="excluded">0</b><span>Ausgeschlossene Ordner</span></div>
+    <div class="tile"><b id="mismatch">0</b><span>Übersprungen (Länge/Track)</span></div>
+    <div class="tile"><b id="errors">0</b><span>Fehler</span></div>
   </div>
-  <div class="box"><h2>[ SCHUTZ-BEGRIFFE ]</h2>
-    <textarea id="keywords"></textarea>
-  </div>
-</div>
-<button onclick="saveCfg()" style="margin-bottom:14px">KONFIG SPEICHERN</button> <small id="cfgmsg"></small>
+</section>
 
-<div class="box"><h2>[ LIVE-LOG ]</h2><pre id="log"></pre></div>
+<section class="card">
+  <h2>Einstellungen</h2>
+  <div class="grid2">
+    <div><label class="f">Ausgeschlossene Ordner (ein Name oder Pfadteil pro Zeile)</label>
+      <textarea id="excludes" placeholder="DJ-Mixe"></textarea></div>
+    <div><label class="f">Schutz-Begriffe (Titel, Pfad, Album, Kommentar, Tags)</label>
+      <textarea id="keywords"></textarea></div>
+  </div>
+  <div class="opts">
+    <div><label class="f">Max. Duplikate pro Lauf (0 = unbegrenzt)</label><input type="number" id="max_delete" min="0" step="1"></div>
+    <div><label class="f">Längen-Toleranz in Sekunden</label><input type="number" id="duration_tol" min="0" max="60" step="0.5"></div>
+    <div><label class="f">Doppelte FLAC-Dateien</label>
+      <label><input type="checkbox" id="dedupe_flac"> ebenfalls bereinigen (beste Datei bleibt)</label></div>
+  </div>
+  <p style="margin:14px 0 0"><button onclick="saveCfg()">Einstellungen speichern</button><span class="msg" id="cfgmsg"></span></p>
+</section>
+
+<section class="card">
+  <h2>Live-Protokoll</h2>
+  <div class="row">
+    <input type="text" id="filter" placeholder="Filter (z. B. SKIP, FEHLER, Dateiname)" style="max-width:340px">
+    <a class="btn" href="/api/logs.zip" download>Alle Logs als ZIP herunterladen</a>
+  </div>
+  <pre id="log"></pre>
+</section>
+
+<section class="card">
+  <h2>Verlauf &amp; Backups</h2>
+  <table id="hist"><thead><tr><th>Start</th><th>Modus</th><th>Ergebnis</th><th>Duplikate</th><th>Gelöscht</th><th>Speicher</th><th>Fehler</th></tr></thead><tbody></tbody></table>
+  <p class="muted" id="nohist"></p>
+  <p style="margin:16px 0 6px"><button onclick="backupNow()">Backup jetzt erstellen</button><span class="msg" id="bkmsg"></span></p>
+  <table id="bk"><thead><tr><th>Backup-Datei (Ordner /backups)</th><th>Größe</th></tr></thead><tbody></tbody></table>
+</section>
+</main>
 
 <script>
 const $ = id => document.getElementById(id);
-let since = 0, running = false;
-const fmt = n => n.toLocaleString("de-DE");
-function bytes(b){ const u=["B","KB","MB","GB","TB"]; let i=0; while(b>=1024&&i<4){b/=1024;i++;} return b.toFixed(i?2:0)+" "+u[i]; }
-async function api(path, opt) { const r = await fetch(path, opt); if (!r.ok) throw new Error(await r.text()); return r; }
+let since = 0, running = false, histTick = 0;
+const fmt = n => Number(n).toLocaleString("de-DE");
+function bytes(b){ const u=["B","KB","MB","GB","TB"]; let i=0; b=Number(b); while(b>=1024&&i<4){b/=1024;i++;} return b.toFixed(i?2:0)+" "+u[i]; }
+async function api(path, opt) { const r = await fetch(path, opt); if (!r.ok) { let m = await r.text(); try { m = JSON.parse(m).error || m; } catch(_){} throw new Error(m); } return r; }
+function cell(tr, text){ const td=document.createElement("td"); td.textContent=text; tr.appendChild(td); }
+
 async function poll() {
   try {
     const d = await (await api("/api/status?since=" + since)).json();
     running = d.running;
-    $("phase").textContent = (d.running ? "LAEUFT" : "BEREIT") + " - " + d.phase + (d.running ? (d.execute ? " [EXECUTE]" : " [DRY-RUN]") : "");
+    const pill = $("pill");
+    pill.textContent = d.running ? ("Läuft – " + d.phase + (d.execute ? " (Ausführen)" : " (Simulation)")) : ("Bereit – " + d.phase);
+    pill.className = "pill" + (d.running ? " run" : "");
+    const w = $("warnings"); w.replaceChildren();
+    for (const m of d.warnings) { const e = document.createElement("div"); e.className = "warn"; e.textContent = m; w.appendChild(e); }
     const s = d.stats;
-    for (const k of ["scanned","total","candidates","duplicates","deleted","annotations","protected","excluded","mismatch","errors"]) $(k).textContent = fmt(s[k]);
+    for (const k of ["scanned","candidates","duplicates","deleted","annotations","protected","excluded","mismatch","errors"]) $(k).textContent = fmt(s[k]);
     $("freed").textContent = bytes(s.bytes_freed);
     $("freedlabel").textContent = d.execute ? "Speicher freigegeben" : "Speicher (Simulation)";
-    $("fill").style.width = (s.total ? Math.min(100, s.scanned / s.total * 100) : 0) + "%";
+    const pct = s.total ? Math.min(100, s.scanned / s.total * 100) : 0;
+    $("fill").style.width = pct + "%"; $("pct").textContent = pct.toFixed(1) + " %  (" + fmt(s.scanned) + " / " + fmt(s.total) + ")";
     $("start").disabled = d.running; $("stop").disabled = !d.running;
     const log = $("log"), stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
-    for (const [i, line] of d.log) {
+    for (const [, line] of d.log) {
       const el = document.createElement("div");
       el.className = /FEHLER/.test(line) ? "l-err" : /SKIP/.test(line) ? "l-skip" : /GELOESCHT/.test(line) ? "l-del" : "";
       el.textContent = line; log.appendChild(el);
     }
     while (log.childElementCount > 1500) log.removeChild(log.firstChild);
+    applyFilter();
     if (stick) log.scrollTop = log.scrollHeight;
     since = d.next;
-  } catch (e) { $("phase").textContent = "VERBINDUNG GESTOERT"; }
+    if (!d.running && histTick++ % 5 === 0) loadHistory();
+  } catch (e) { $("pill").textContent = "Verbindung gestört"; }
   setTimeout(poll, running ? 1000 : 3000);
 }
+function applyFilter() {
+  const q = $("filter").value.toLowerCase();
+  for (const el of $("log").children) el.style.display = (!q || el.textContent.toLowerCase().includes(q)) ? "" : "none";
+}
+$("filter").addEventListener("input", applyFilter);
+
 async function startRun() {
   const exec = document.querySelector('input[name=mode]:checked').value === "exec";
-  if (exec && !confirm("ECHTER LAUF: MP3-Dateien werden unwiderruflich geloescht (DB-Backup wird vorher erstellt).\nFortfahren?")) return;
+  if (exec) {
+    const a = prompt("ECHTER LAUF: Duplikate werden unwiderruflich gelöscht (vorher wird ein Datenbank-Backup erstellt).\nZur Bestätigung LÖSCHEN eintippen:");
+    const v = (a || "").trim().toUpperCase();
+    if (v !== "LOESCHEN" && v !== "LÖSCHEN") return;
+  }
   try { await api("/api/start", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({execute: exec}) }); }
-  catch (e) { alert("Start fehlgeschlagen: " + e.message); }
+  catch (e) { alert("Start nicht möglich: " + e.message); }
 }
 async function stopRun() { await api("/api/stop", { method:"POST" }); }
+
 const lines = t => t.split("\n").map(x => x.trim()).filter(Boolean);
 async function loadCfg() {
   const c = await (await api("/api/config")).json();
   $("excludes").value = c.excludes.join("\n"); $("keywords").value = c.keywords.join("\n");
+  $("max_delete").value = c.max_delete; $("duration_tol").value = c.duration_tol; $("dedupe_flac").checked = c.dedupe_flac;
 }
 async function saveCfg() {
   try {
-    await api("/api/config", { method:"POST", headers:{"content-type":"application/json"},
-      body: JSON.stringify({excludes: lines($("excludes").value), keywords: lines($("keywords").value)}) });
-    $("cfgmsg").textContent = "gespeichert.";
-  } catch (e) { $("cfgmsg").textContent = "FEHLER: " + e.message; }
+    await api("/api/config", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({
+      excludes: lines($("excludes").value), keywords: lines($("keywords").value),
+      max_delete: Math.max(0, parseInt($("max_delete").value || "0", 10)), duration_tol: parseFloat($("duration_tol").value || "3"),
+      dedupe_flac: $("dedupe_flac").checked }) });
+    $("cfgmsg").textContent = "Gespeichert.";
+  } catch (e) { $("cfgmsg").textContent = "Fehler: " + e.message; }
+}
+async function loadHistory() {
+  try {
+    const d = await (await api("/api/history")).json();
+    const tb = $("hist").tBodies[0]; tb.replaceChildren();
+    for (const h of d.history.slice(0, 15)) {
+      const tr = document.createElement("tr");
+      cell(tr, h.start); cell(tr, h.mode === "execute" ? "Ausführen" : "Simulation"); cell(tr, h.result);
+      cell(tr, fmt(h.stats.duplicates)); cell(tr, fmt(h.stats.deleted)); cell(tr, bytes(h.stats.bytes_freed)); cell(tr, fmt(h.stats.errors));
+      tb.appendChild(tr);
+    }
+    $("nohist").textContent = d.history.length ? "" : "Noch keine Läufe.";
+    const bb = $("bk").tBodies[0]; bb.replaceChildren();
+    for (const b of d.backups) { const tr = document.createElement("tr"); cell(tr, b.name); cell(tr, bytes(b.size)); bb.appendChild(tr); }
+  } catch (e) {}
+}
+async function backupNow() {
+  $("bkmsg").textContent = "Backup läuft ...";
+  try { await api("/api/backup", { method:"POST" }); $("bkmsg").textContent = "Backup erstellt."; loadHistory(); }
+  catch (e) { $("bkmsg").textContent = "Fehler: " + e.message; }
 }
 if ({{MODE_EXECUTE}}) document.querySelector('input[value=exec]').checked = true;
-loadCfg(); poll();
+loadCfg(); loadHistory(); poll();
 </script>
 </body>
 </html>

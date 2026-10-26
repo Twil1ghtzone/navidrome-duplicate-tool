@@ -3,6 +3,8 @@
 
 use rusqlite::{params, Connection, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use base64::Engine as _;
+use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{BufWriter, Write};
@@ -34,6 +36,9 @@ pub struct Env {
     pub delete_rows: bool,
     pub ui_user: String,
     pub ui_pass: String,
+    pub generated_pass: bool,
+    pub require_dryrun: bool,
+    pub log_keep: usize,
 }
 
 fn var(k: &str, d: &str) -> String {
@@ -47,12 +52,38 @@ fn list(k: &str, d: &str) -> Vec<String> {
         .collect()
 }
 
+fn auto_password(dir: &Path) -> Result<String, String> {
+    let f = dir.join(".ui_password");
+    if let Ok(p) = fs::read_to_string(&f) {
+        let p = p.trim().to_string();
+        if !p.is_empty() {
+            return Ok(p);
+        }
+    }
+    let mut buf = [0u8; 18];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut r| std::io::Read::read_exact(&mut r, &mut buf))
+        .map_err(|e| format!("kein Zufall fuer Passwort-Generierung: {e} – bitte UI_PASSWORD setzen"))?;
+    let p = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf);
+    fs::create_dir_all(dir).map_err(|e| format!("CONFIG_DIR {} nicht beschreibbar: {e}", dir.display()))?;
+    fs::write(&f, &p).map_err(|e| format!("Passwort speichern: {e} – bitte UI_PASSWORD setzen"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&f, fs::Permissions::from_mode(0o600));
+    }
+    Ok(p)
+}
+
 impl Env {
     pub fn from_env() -> Result<Env, String> {
-        let ui_user = var("UI_USER", "");
-        let ui_pass = var("UI_PASSWORD", "");
-        if ui_user.is_empty() || ui_pass.is_empty() {
-            return Err("UI_USER und UI_PASSWORD muessen gesetzt sein".into());
+        let ui_user = var("UI_USER", "admin");
+        let config_dir: PathBuf = var("CONFIG_DIR", "/config").into();
+        let mut ui_pass = var("UI_PASSWORD", "");
+        let mut generated_pass = false;
+        if ui_pass.is_empty() {
+            ui_pass = auto_password(&config_dir)?;
+            generated_pass = true;
         }
         let path_map = std::env::var("PATH_MAP").ok().and_then(|v| {
             v.split_once(':').map(|(a, b)| (a.trim_end_matches('/').to_string(), b.trim_end_matches('/').to_string()))
@@ -60,7 +91,7 @@ impl Env {
         Ok(Env {
             db_path: var("NAVIDROME_DB", "/data/navidrome.db"),
             backup_dir: var("BACKUP_DIR", "/backups").into(),
-            config_dir: var("CONFIG_DIR", "/config").into(),
+            config_dir,
             path_map,
             keep_exts: list("KEEP_EXTS", "flac"),
             delete_exts: list("DELETE_EXTS", "mp3"),
@@ -72,14 +103,23 @@ impl Env {
             delete_rows: var("DELETE_ROWS", "false") == "true",
             ui_user,
             ui_pass,
+            generated_pass,
+            require_dryrun: var("REQUIRE_DRYRUN", "true") != "false",
+            log_keep: var("LOG_KEEP", "30").parse().unwrap_or(30),
         })
     }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub excludes: Vec<String>,
     pub keywords: Vec<String>,
+    /// 0 = unbegrenzt; sonst Lauf stoppt nach so vielen erkannten Duplikaten
+    pub max_delete: u64,
+    /// doppelte FLACs (DEDUPE_SAME_EXTS) ebenfalls bereinigen
+    pub dedupe_flac: bool,
+    pub duration_tol: f64,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -87,6 +127,9 @@ impl Default for Settings {
             excludes: vec![],
             keywords: ["instrumental", "karaoke", "acapella", "a cappella", "a capella", "accapella"]
                 .iter().map(|s| s.to_string()).collect(),
+            max_delete: 0,
+            dedupe_flac: true,
+            duration_tol: 3.0,
         }
     }
 }
@@ -118,6 +161,7 @@ pub struct Shared {
     pub execute: AtomicBool,
     pub phase: Mutex<String>,
     pub log: Mutex<(u64, VecDeque<(u64, String)>)>,
+    pub logfile: Mutex<Option<fs::File>>,
 }
 
 impl Shared {
@@ -133,11 +177,15 @@ impl Shared {
             execute: AtomicBool::new(false),
             phase: Mutex::new("bereit".into()),
             log: Mutex::new((0, VecDeque::new())),
+            logfile: Mutex::new(None),
         }
     }
     pub fn log(&self, msg: impl AsRef<str>) {
         let line = format!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), msg.as_ref());
         eprintln!("{line}");
+        if let Some(f) = self.logfile.lock().unwrap().as_mut() {
+            let _ = writeln!(f, "{line}");
+        }
         let mut g = self.log.lock().unwrap();
         g.0 += 1;
         let seq = g.0;
@@ -145,6 +193,17 @@ impl Shared {
         while g.1.len() > 1000 {
             g.1.pop_front();
         }
+    }
+    pub fn stats_json(&self) -> Value {
+        let st = &self.stats;
+        json!({
+            "total": st.total.load(Relaxed), "scanned": st.scanned.load(Relaxed),
+            "candidates": st.candidates.load(Relaxed), "duplicates": st.duplicates.load(Relaxed),
+            "protected": st.protected.load(Relaxed), "excluded": st.excluded.load(Relaxed),
+            "mismatch": st.mismatch.load(Relaxed), "deleted": st.deleted.load(Relaxed),
+            "bytes_freed": st.bytes_freed.load(Relaxed), "annotations": st.annotations.load(Relaxed),
+            "errors": st.errors.load(Relaxed)
+        })
     }
     fn phase(&self, p: &str) {
         *self.phase.lock().unwrap() = p.to_string();
@@ -165,7 +224,12 @@ fn settings_path(env: &Env) -> PathBuf {
     env.config_dir.join("settings.json")
 }
 fn load_settings(env: &Env) -> Settings {
-    fs::read_to_string(settings_path(env)).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    fs::read_to_string(settings_path(env)).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_else(|| {
+        let mut s = Settings::default();
+        s.duration_tol = env.duration_tol;
+        s.dedupe_flac = !env.same_exts.iter().any(|e| e == "none");
+        s
+    })
 }
 pub fn save_settings(env: &Env, s: &Settings) -> std::io::Result<()> {
     fs::create_dir_all(&env.config_dir)?;
@@ -210,20 +274,143 @@ pub fn run(sh: &Shared, execute: bool) {
     sh.stop.store(false, Relaxed);
     sh.execute.store(execute, Relaxed);
     sh.reset_stats();
+    let started = chrono::Local::now();
+    let mode = if execute { "execute" } else { "dry-run" };
+    let logname = format!("{}-{mode}.log", started.format("%Y%m%d-%H%M%S"));
+    let ldir = sh.env.config_dir.join("logs");
+    let _ = fs::create_dir_all(&ldir);
+    *sh.logfile.lock().unwrap() = fs::File::create(ldir.join(&logname)).ok();
     sh.log(format!("=== START ({}) ===", if execute { "EXECUTE – echte Loeschung" } else { "DRY-RUN – es wird nichts veraendert" }));
-    match run_inner(sh, execute) {
-        Ok(()) => {
-            let msg = if sh.halt() { "abgebrochen/gestoppt (sauber beendet)" } else { "fertig" };
-            sh.phase(msg);
-            sh.log(format!("=== ENDE: {msg} ==="));
-        }
+    let (result, completed) = match run_inner(sh, execute) {
+        Ok(()) if sh.halt() => ("gestoppt", false),
+        Ok(()) => ("fertig", true),
         Err(e) => {
             sh.stats.errors.fetch_add(1, Relaxed);
-            sh.phase("FEHLER");
             sh.log(format!("FEHLER: {e}"));
+            ("fehler", false)
+        }
+    };
+    sh.phase(result);
+    sh.log(format!("=== ENDE: {result} ==="));
+    let ended = chrono::Local::now();
+    add_history(
+        &sh.env,
+        json!({
+            "start": started.format("%Y-%m-%d %H:%M:%S").to_string(), "end": ended.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "end_ts": chrono::Utc::now().timestamp(), "mode": mode, "result": result, "completed": completed,
+            "log": logname, "stats": sh.stats_json(),
+        }),
+    );
+    *sh.logfile.lock().unwrap() = None;
+    rotate(&ldir, sh.env.log_keep);
+    rotate(&sh.env.config_dir.join("reports"), sh.env.log_keep);
+    sh.running.store(false, Relaxed);
+}
+
+fn rotate(dir: &Path, keep: usize) {
+    if let Ok(rd) = fs::read_dir(dir) {
+        let mut v: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_file()).collect();
+        v.sort();
+        while v.len() > keep.max(1) {
+            let _ = fs::remove_file(v.remove(0));
         }
     }
+}
+
+// ───────────────────────── Verlauf, Backups, Log-ZIP ─────────────────────────
+
+fn history_path(env: &Env) -> PathBuf {
+    env.config_dir.join("history.json")
+}
+pub fn history(env: &Env) -> Vec<Value> {
+    fs::read_to_string(history_path(env)).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+fn add_history(env: &Env, entry: Value) {
+    let mut h = history(env);
+    h.push(entry);
+    let n = h.len();
+    if n > 100 {
+        h.drain(0..n - 100);
+    }
+    let _ = fs::write(history_path(env), serde_json::to_string_pretty(&h).unwrap_or_default());
+}
+/// Sicherheitsgurt: Execute nur nach vollstaendigem Dry-Run der letzten 7 Tage.
+pub fn recent_dry_run(env: &Env) -> bool {
+    let min = chrono::Utc::now().timestamp() - 7 * 86400;
+    history(env).iter().any(|e| {
+        e["mode"] == "dry-run" && e["completed"] == true && e["end_ts"].as_i64().unwrap_or(0) >= min
+    })
+}
+
+pub fn list_backups(env: &Env) -> Vec<Value> {
+    let mut v: Vec<(String, u64)> = fs::read_dir(&env.backup_dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let n = e.file_name().to_string_lossy().to_string();
+                    (n.starts_with("navidrome-backup-") && n.ends_with(".db")).then(|| (n, e.metadata().map(|m| m.len()).unwrap_or(0)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v.reverse();
+    v.into_iter().map(|(n, s)| json!({"name": n, "size": s})).collect()
+}
+
+pub fn manual_backup(sh: &Shared) -> Result<String, String> {
+    if sh.running.swap(true, Relaxed) {
+        return Err("Es laeuft gerade ein Scan".into());
+    }
+    let r = open(&sh.env, false).and_then(|w| backup(sh, &w));
     sh.running.store(false, Relaxed);
+    r.map(|p| p.display().to_string())
+}
+
+/// Alle Logs + Reports + Verlauf + Einstellungen als ZIP (temporaere Datei wird sofort ausgehaengt).
+pub fn build_zip(sh: &Shared) -> std::io::Result<fs::File> {
+    use std::io::{Seek, SeekFrom};
+    use zip::write::SimpleFileOptions;
+    let env = &sh.env;
+    fs::create_dir_all(&env.config_dir)?;
+    let tmp = env.config_dir.join(format!(".tmp-{}.zip", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)));
+    let file = fs::OpenOptions::new().read(true).write(true).create_new(true).open(&tmp)?;
+    let _ = fs::remove_file(&tmp);
+    let mut zw = zip::ZipWriter::new(file);
+    let opt = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated).large_file(true);
+    let info = format!(
+        "navidrome-dedupe {}\ndb: {}\nkeep: {:?}\ndelete: {:?}\nsame: {:?}\nmatch_mode: {}\ndelete_rows: {}\nsettings: {}\n",
+        env!("CARGO_PKG_VERSION"),
+        env.db_path,
+        env.keep_exts,
+        env.delete_exts,
+        env.same_exts,
+        if env.match_mode == MatchMode::Album { "album" } else { "artist_title" },
+        env.delete_rows,
+        serde_json::to_string(&*sh.settings.lock().unwrap()).unwrap_or_default()
+    );
+    zw.start_file("system-info.txt", opt)?;
+    zw.write_all(info.as_bytes())?;
+    for dir in ["logs", "reports"] {
+        if let Ok(rd) = fs::read_dir(env.config_dir.join(dir)) {
+            let mut v: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_file()).collect();
+            v.sort();
+            for p in v {
+                let name = p.file_name().unwrap().to_string_lossy().to_string();
+                zw.start_file(format!("{dir}/{name}"), opt)?;
+                std::io::copy(&mut fs::File::open(&p)?, &mut zw)?;
+            }
+        }
+    }
+    for n in ["history.json"] {
+        if let Ok(mut f) = fs::File::open(env.config_dir.join(n)) {
+            zw.start_file(n, opt)?;
+            std::io::copy(&mut f, &mut zw)?;
+        }
+    }
+    let mut file = zw.finish()?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(file)
 }
 
 fn open(env: &Env, query_only: bool) -> Result<Connection, String> {
@@ -245,10 +432,14 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
 
     let mut libs: HashMap<i64, String> = HashMap::new();
     {
-        let mut st = reader.prepare("SELECT id, path FROM library").map_err(|e| e.to_string())?;
+        let mut st = reader.prepare("SELECT id, path FROM library").map_err(|e| format!("Das ist keine gueltige Navidrome-Datenbank (Tabelle 'library' fehlt): {e} – Volume fuer /data pruefen"))?;
         let it = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))).map_err(|e| e.to_string())?;
         for x in it {
             let (id, p) = x.map_err(|e| e.to_string())?;
+            let mapped = map_root(env, &p);
+            if !Path::new(&mapped).is_dir() {
+                return Err(format!("Bibliothekspfad '{mapped}' (Navidrome: '{p}') existiert in diesem Container nicht – /music-Volume bzw. PATH_MAP pruefen"));
+            }
             sh.log(format!("Bibliothek {id}: {p}"));
             libs.insert(id, p);
         }
@@ -274,12 +465,13 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let rdir = env.config_dir.join("reports");
     let _ = fs::create_dir_all(&rdir);
-    let rpath = rdir.join(format!("{}-{ts}.tsv", if execute { "execute" } else { "dryrun" }));
+    let rpath = rdir.join(format!("{ts}-{}.tsv", if execute { "execute" } else { "dryrun" }));
     let report = fs::File::create(&rpath).ok().map(BufWriter::new);
     sh.log(format!("Report: {}", rpath.display()));
 
+    let same_exts: Vec<String> = if settings.dedupe_flac { env.same_exts.clone() } else { vec![] };
     let ext_sql = |v: &Vec<String>| v.iter().map(|e| format!("'{e}'")).collect::<Vec<_>>().join(",");
-    let mut union: Vec<String> = env.keep_exts.iter().chain(env.delete_exts.iter()).chain(env.same_exts.iter()).cloned().collect();
+    let mut union: Vec<String> = env.keep_exts.iter().chain(env.delete_exts.iter()).chain(same_exts.iter()).cloned().collect();
     union.sort();
     union.dedup();
     let all_exts = ext_sql(&union);
@@ -303,7 +495,7 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
          FROM media_file WHERE missing=0 AND lower(suffix) IN ({all_exts}) ORDER BY {order}"
     );
 
-    let mut ctx = Ctx { sh, env, settings, libs, reader: &reader, tags_ok, has_rated_at, writer, batch: vec![], report, execute };
+    let mut ctx = Ctx { sh, env, same_exts, settings, libs, reader: &reader, tags_ok, has_rated_at, writer, batch: vec![], report, execute };
     sh.phase(if execute { "scanne + loesche" } else { "scanne (Dry-Run)" });
 
     let mut stmt = reader.prepare(&sql).map_err(|e| e.to_string())?;
@@ -382,6 +574,7 @@ fn backup(sh: &Shared, w: &Connection) -> Result<PathBuf, String> {
 struct Ctx<'a> {
     sh: &'a Shared,
     env: &'a Env,
+    same_exts: Vec<String>,
     settings: Settings,
     libs: HashMap<i64, String>,
     reader: &'a Connection,
@@ -393,6 +586,13 @@ struct Ctx<'a> {
     execute: bool,
 }
 
+fn map_root(env: &Env, root: &str) -> String {
+    match &env.path_map {
+        Some((from, to)) if root.starts_with(from.as_str()) => format!("{to}{}", &root[from.len()..]),
+        _ => root.to_string(),
+    }
+}
+
 fn norm(p: &str) -> String {
     p.replace('\\', "/").to_lowercase()
 }
@@ -400,11 +600,7 @@ fn norm(p: &str) -> String {
 impl<'a> Ctx<'a> {
     fn full(&self, r: &Row) -> PathBuf {
         let root = self.libs.get(&r.library_id).cloned().unwrap_or_default();
-        let root = match &self.env.path_map {
-            Some((from, to)) if root.starts_with(from.as_str()) => format!("{to}{}", &root[from.len()..]),
-            _ => root,
-        };
-        Path::new(&root).join(&r.path)
+        Path::new(&map_root(self.env, &root)).join(&r.path)
     }
 
     fn is_excluded(&self, full: &Path) -> bool {
@@ -446,10 +642,17 @@ impl<'a> Ctx<'a> {
         // Entfernt werden: alle DELETE_EXTS-Dateien (nur wenn eine KEEP-Datei existiert) sowie
         // weitere Dateien der DEDUPE_SAME_EXTS-Typen (z.B. doppelte FLACs).
         let rank = |r: &&Row| (r.bit_rate, r.size, std::cmp::Reverse(r.id.clone()));
+        let max = self.settings.max_delete;
+        if max > 0 && self.sh.stats.duplicates.load(Relaxed) >= max {
+            if !self.sh.stop.swap(true, Relaxed) {
+                self.sh.log(format!("Limit von {max} Duplikaten erreicht – Lauf wird sauber beendet"));
+            }
+            return Ok(());
+        }
         let keepers: Vec<&Row> = g.iter().filter(|r| self.env.keep_exts.contains(&r.suffix)).collect();
         let keeper_row: &Row = match keepers.iter().copied().max_by_key(rank) {
             Some(k) => k,
-            None => match g.iter().filter(|r| self.env.same_exts.contains(&r.suffix)).max_by_key(rank) {
+            None => match g.iter().filter(|r| self.same_exts.contains(&r.suffix)).max_by_key(rank) {
                 Some(k) => k,
                 None => return Ok(()),
             },
@@ -459,7 +662,7 @@ impl<'a> Ctx<'a> {
             .iter()
             .filter(|r| {
                 r.id != keeper_row.id
-                    && ((have_keep && self.env.delete_exts.contains(&r.suffix)) || self.env.same_exts.contains(&r.suffix))
+                    && ((have_keep && self.env.delete_exts.contains(&r.suffix)) || self.same_exts.contains(&r.suffix))
             })
             .collect();
         if dels.is_empty() {
@@ -493,7 +696,7 @@ impl<'a> Ctx<'a> {
 
         let mut ok_dels = vec![];
         for d in dels {
-            if (d.duration - keeper.duration).abs() > self.env.duration_tol {
+            if (d.duration - keeper.duration).abs() > self.settings.duration_tol {
                 sh.stats.mismatch.fetch_add(1, Relaxed);
                 sh.log(format!("SKIP (Laenge weicht ab {:.1}s vs {:.1}s): {}", d.duration, keeper.duration, d.path));
                 continue;

@@ -1,38 +1,41 @@
-# navidrome-duplicate-tool
+# Navidrome Duplicate Tool
 
-Retro-Web-UI (Rust/Axum, Vanilla HTML/JS) zum sicheren Entfernen von MP3-Duplikaten, wenn eine FLAC-Version
-desselben Titels existiert. Arbeitet direkt auf der Navidrome-SQLite-DB (`media_file`, `annotation`, `playlist_tracks`).
-Getestet gegen das aktuelle Navidrome-Schema (relative Pfade + `library`-Tabelle, `annotation.rated_at`, FTS5-Trigger).
+Web-UI zum sicheren Entfernen von Duplikaten (MP3 neben FLAC, doppelte FLACs) in einer Navidrome-Bibliothek.
+Arbeitet direkt auf der Navidrome-SQLite-DB und uebertraegt Favoriten, Wiedergabezaehler, Bewertungen und Playlist-Eintraege
+auf die behaltene Datei.
 
-## Funktionsweise
-1. `media_file` wird sortiert gestreamt (konstanter RAM, auch bei 10M+ Tracks) und nach
-   `album_id + disc_number + order_title` gruppiert (`MATCH_MODE=artist_title` = albumuebergreifend, riskanter).
-2. Pro Gruppe bleibt die beste Datei (FLAC bevorzugt, dann hoechste Bitrate/Groesse). Entfernt werden alle `DELETE_EXTS`-Dateien (mp3, sofern eine
-   FLAC existiert) **und** weitere Duplikate der Typen in `DEDUPE_SAME_EXTS` (Standard `flac` = doppelte FLACs; `none` = aus).
-   Bei gleichem Format muss zusaetzlich die Tracknummer uebereinstimmen.
-3. Schutzregeln (ganze Gruppe wird uebersprungen): Schutz-Begriffe (instrumental, karaoke, acapella ...) in Titel,
-   Album, Kommentar, Pfad oder Tags; Exclude-Ordner; FLAC fehlt/leer auf Platte; MP3-Laenge weicht > `DURATION_TOLERANCE` s ab.
-4. Execute: Backup (`VACUUM INTO`) -> pro Block (`BATCH_SIZE`) **eine** `BEGIN IMMEDIATE`-Transaktion:
-   Annotationen auf die FLAC-ID mergen (Plays addieren, Rating = Max, Favorit = OR, aeltestes `starred_at`),
-   Verifikation, Playlist-Eintraege umbiegen, MP3-Zeile als `missing=1` markieren (oder loeschen mit `DELETE_ROWS=true`).
-   **Erst nach Commit** werden die MP3-Dateien geloescht.
-5. SIGTERM/Stop: der laufende Block wird sauber abgeschlossen, nie mitten in einer Transaktion abgebrochen.
-6. Audit: TSV-Reports unter `config/reports/`, DB-Backups unter `backups/` (die letzten `BACKUP_KEEP`).
+## Installation (Dockge / Docker Compose)
+1. `docker-compose.yml` aus diesem Repo als Stack einfuegen (oder den Service in deinen bestehenden Stack kopieren).
+2. Pfade und `UI_PASSWORD` anpassen: `/data` = Navidrome-Datenordner (mit `navidrome.db`), `/music` = Musik (read-write, gleicher Pfad wie bei Navidrome).
+3. Starten, `http://<server-ip>:8085` oeffnen. Ist `UI_PASSWORD` leer, wird eines erzeugt und im Container-Log angezeigt (gespeichert in `/config/.ui_password`).
 
-## Installation
-```bash
-git clone https://github.com/Twil1ghtzone/navidrome-duplicate-tool.git && cd navidrome-duplicate-tool
-cp .env.example .env && nano .env        # Passwort + Pfade setzen
-docker compose up -d --build
-```
-UI: `http://<server-ip>:8085` (Basic Auth mit `UI_USER`/`UI_PASSWORD`). Reihenfolge: **erst Dry-Run**, Report pruefen, dann Execute.
+## Updates
+Das Image wird bei jedem Push auf `main` automatisch per GitHub Actions gebaut und nach `ghcr.io/twil1ghtzone/navidrome-duplicate-tool:latest` veroeffentlicht.
+In Dockge genuegt **Aktualisieren** (pull + Neuerstellung). Einmalig noetig: Auf GitHub unter *Profil -> Packages -> navidrome-duplicate-tool ->
+Package settings -> Change visibility* das Paket auf **Public** stellen, sonst kann der Server es nicht ohne Login ziehen.
+Ohne Registry geht auch der Build direkt aus GitHub (siehe Kommentar in der Compose-Datei, `pull_policy: build`).
 
-Wichtig:
-- `NAVIDROME_DATA_DIR` muss das **Verzeichnis** mit `navidrome.db` sein (WAL-Dateien `-wal`/`-shm` muessen mit erreichbar sein), lokales Dateisystem, kein NFS/SMB.
-- Musikpfad im Container muss dem Pfad der Navidrome-Bibliothek entsprechen (oder `PATH_MAP="/music:/mnt/music"` setzen).
-- `PUID/PGID` = Benutzer, dem DB und Musik gehoeren.
-- Nach einem Lauf in Navidrome einen Scan starten (Album-Zaehler aktualisieren), danach ggf. "Fehlende Dateien" entfernen.
-- Plane Platz fuer das Backup ein (Groesse ~ navidrome.db).
+## Ablauf und Schutzmechanismen
+- Gruppierung nach `album_id + Disc + Titel`; die beste Datei bleibt (FLAC zuerst, dann Bitrate/Groesse).
+- Entfernt werden MP3s (wenn eine FLAC existiert) und doppelte FLACs (abschaltbar). Bei gleichem Format muss die Tracknummer stimmen.
+- Ganze Gruppe wird uebersprungen bei Schutz-Begriffen (instrumental, karaoke, acapella ... in Titel/Pfad/Album/Kommentar/Tags),
+  Exclude-Ordnern, fehlender FLAC auf Platte oder abweichender Laenge (Toleranz einstellbar).
+- **Sicherheitssperre:** "Ausfuehren" ist erst nach einem vollstaendigen Dry-Run (letzte 7 Tage) moeglich (`REQUIRE_DRYRUN=false` schaltet das ab) und verlangt die Eingabe von LOESCHEN.
+- **Limit pro Lauf** (z. B. erst 50 Duplikate testen), Backup vor jedem Execute (`VACUUM INTO`), pro Block eine ACID-Transaktion,
+  Dateien werden erst nach dem Commit geloescht, Graceful Shutdown beendet immer erst den aktuellen Block.
+- Annotation-Merge: Plays addieren, Rating = Maximum, Favorit bleibt erhalten, aeltestes `starred_at`; danach Verifikation.
+- Navidrome-Eintraege der geloeschten Dateien werden als `missing` markiert (`DELETE_ROWS=true` loescht sie). Danach in Navidrome einen Scan starten.
 
-CLI: `navidrome-dedupe --headless [--execute]` (einmaliger Lauf ohne UI; Default = Dry-Run).
-Die UI hat keine TLS-Verschluesselung: nur im LAN betreiben oder hinter einen Reverse-Proxy setzen.
+## Logs, Verlauf, Backups
+- Jeder Lauf schreibt ein vollstaendiges Log (`/config/logs`) und einen TSV-Report (`/config/reports`), Verlauf in `/config/history.json`.
+- Button **Alle Logs als ZIP herunterladen** (Logs, Reports, Verlauf, System-Info). Aufbewahrung: `LOG_KEEP` (Standard 30).
+- Backups unter `/backups` (`BACKUP_KEEP`, Standard 3), manuell per Button. Wiederherstellen: Navidrome stoppen, `navidrome.db` (+ `-wal`/`-shm`) durch das Backup ersetzen.
+
+## Umgebungsvariablen (alle optional ausser Pfaden)
+`UI_USER` (admin), `UI_PASSWORD`, `NAVIDROME_DB` (/data/navidrome.db), `PATH_MAP` (`/navidrome-pfad:/container-pfad`), `KEEP_EXTS` (flac),
+`DELETE_EXTS` (mp3), `DEDUPE_SAME_EXTS` (flac, `none` = aus), `DURATION_TOLERANCE` (3), `BATCH_SIZE` (200), `BACKUP_KEEP` (3),
+`MATCH_MODE` (`album` | `artist_title`), `DELETE_ROWS` (false), `REQUIRE_DRYRUN` (true), `LOG_KEEP` (30).
+Toleranz, Limit, Exclude-Ordner, Schutz-Begriffe und FLAC-Duplikate sind zusaetzlich in der UI einstellbar.
+
+Hinweise: DB-Verzeichnis auf lokalem Dateisystem (kein NFS/SMB, wegen WAL). Die UI hat kein TLS: nur im LAN oder hinter Reverse-Proxy betreiben.
+CLI: `navidrome-dedupe --headless [--execute]` (einmaliger Lauf ohne UI).

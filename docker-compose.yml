@@ -1,28 +1,23 @@
 services:
   navidrome-dedupe:
-    build: .
+    # Fertiges Image aus GitHub Actions: In Dockge/Portainer reicht "Aktualisieren" (= pull + recreate).
+    image: ghcr.io/twil1ghtzone/navidrome-duplicate-tool:latest
+    # Alternative ohne Registry (baut bei jedem "up" neu aus GitHub): image-Zeile entfernen und stattdessen
+    # build: https://github.com/Twil1ghtzone/navidrome-duplicate-tool.git#main
+    # pull_policy: build
     container_name: navidrome-dedupe
     restart: unless-stopped
-    user: "${PUID:-1000}:${PGID:-1000}"
+    user: "0:0"                          # wie Navidrome; sonst UID:GID von Navidrome eintragen
     ports:
-      - "8085:8080"                      # http://<server-ip>:8085 im LAN
+      - "8085:8080"                      # UI: http://<server-ip>:8085
     environment:
-      UI_USER: "${UI_USER:?UI_USER fehlt}"
-      UI_PASSWORD: "${UI_PASSWORD:?UI_PASSWORD fehlt}"
-      NAVIDROME_DB: /data/navidrome.db
-      # Nur noetig, wenn Navidrome die Musik unter anderem Pfad sieht als dieser Container:
-      # PATH_MAP: "/music:/music"
-      KEEP_EXTS: "flac"
-      DEDUPE_SAME_EXTS: "flac"          # doppelte FLACs ebenfalls bereinigen (none = aus)
-      DELETE_EXTS: "mp3"
-      DURATION_TOLERANCE: "3"            # Sekunden
-      BATCH_SIZE: "200"
-      BACKUP_KEEP: "3"
-      MATCH_MODE: "album"                # album | artist_title
-      DELETE_ROWS: "false"               # false = Navidrome-Eintrag nur als 'missing' markieren
+      UI_USER: "admin"
+      UI_PASSWORD: "BITTE-AENDERN"       # leer lassen = Passwort wird erzeugt und steht im Container-Log
     volumes:
-      - "${NAVIDROME_DATA_DIR}:/data"    # ganzes Verzeichnis (SQLite-WAL braucht -wal/-shm)
-      - "${MUSIC_DIR}:/music"            # read-write: MP3s werden geloescht
-      - ./config:/config
-      - ./backups:/backups
-    stop_grace_period: 120s              # Zeit zum sauberen Beenden des laufenden Blocks
+      - ./data/navidrome:/data           # Navidrome-Datenordner (enthaelt navidrome.db)
+      - /mnt/tank/music:/music           # Musik, read-write (gleicher Pfad wie bei Navidrome)
+      - ./dedupe/config:/config
+      - ./dedupe/backups:/backups
+    stop_grace_period: 120s
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
