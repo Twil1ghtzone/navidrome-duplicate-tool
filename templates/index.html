@@ -5,231 +5,350 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Navidrome Duplicate Tool</title>
 <style>
+  /* Neutral, ohne Effekte: keine Schatten, keine Animationen, keine Rundungen. */
   :root {
-    --bg:#f4f5f7; --card:#ffffff; --fg:#1f2430; --muted:#6b7280; --line:#e2e5ea;
-    --accent:#3d5a80; --accent-fg:#ffffff; --danger:#b3392f; --ok:#2f7d4f; --warn:#9a6700; --warn-bg:#fff6dd;
-    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --bg:#ffffff; --panel:#fafafa; --fg:#1a1a1a; --muted:#666666; --line:#d4d4d4;
+    --accent:#3a3a3a; --bar:#555555;
+    --err:#a4262c; --warn:#8a6100; --ok:#1f6f3f; --skip:#5a5a5a;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace;
   }
   @media (prefers-color-scheme: dark) {
-    :root { --bg:#14171c; --card:#1c2027; --fg:#e6e8ec; --muted:#9aa3b2; --line:#2b313b;
-            --accent:#6d93c4; --accent-fg:#0f1318; --danger:#e07369; --ok:#5fb383; --warn:#e3b341; --warn-bg:#2d2610; }
+    :root { --bg:#17191c; --panel:#1e2125; --fg:#e4e6e8; --muted:#9a9ea4; --line:#343941;
+            --accent:#d8dade; --bar:#8d939b; --err:#e4867f; --warn:#d8b05a; --ok:#73b98c; --skip:#9a9ea4; }
   }
   * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
-  main { max-width:1080px; margin:0 auto; padding:20px 16px 48px; }
-  header { display:flex; flex-wrap:wrap; align-items:center; gap:8px 14px; margin-bottom:16px; }
-  h1 { font-size:20px; margin:0; font-weight:600; }
-  .ver { color:var(--muted); font-size:13px; }
-  .pill { margin-left:auto; padding:3px 12px; border-radius:99px; border:1px solid var(--line); background:var(--card); font-size:13px; }
-  .pill.run { border-color:var(--accent); color:var(--accent); }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px 18px; margin-bottom:16px; }
-  .card h2 { font-size:14px; margin:0 0 12px; font-weight:600; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
-  .warn { background:var(--warn-bg); border:1px solid var(--warn); color:var(--warn); border-radius:8px; padding:8px 12px; margin-bottom:10px; font-size:14px; }
-  .row { display:flex; flex-wrap:wrap; gap:10px 16px; align-items:center; }
-  .seg { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
-  .seg label { padding:7px 14px; cursor:pointer; font-size:14px; }
-  .seg input { display:none; }
-  .seg input:checked + span { font-weight:600; }
-  .seg label:has(input:checked) { background:var(--accent); color:var(--accent-fg); }
-  .seg label.exec:has(input:checked) { background:var(--danger); color:#fff; }
-  button, .btn { font:inherit; font-size:14px; padding:7px 16px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--fg); cursor:pointer; text-decoration:none; display:inline-block; }
-  button.primary { background:var(--accent); color:var(--accent-fg); border-color:var(--accent); }
-  button:disabled { opacity:.45; cursor:not-allowed; }
-  button:hover:not(:disabled), .btn:hover { filter:brightness(.96); }
-  .bar { height:8px; background:var(--line); border-radius:99px; overflow:hidden; margin:14px 0 4px; }
-  .bar > div { height:100%; width:0; background:var(--accent); transition:width .4s; }
-  .pct { font-size:13px; color:var(--muted); }
-  .tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin-top:12px; }
-  .tile { border:1px solid var(--line); border-radius:8px; padding:8px 12px; }
-  .tile b { display:block; font-size:20px; font-variant-numeric:tabular-nums; }
-  .tile span { font-size:12px; color:var(--muted); }
-  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; } @media (max-width:760px){ .grid2 { grid-template-columns:1fr; } }
-  textarea, input[type=number], input[type=text] { width:100%; background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:8px 10px; font:13px var(--mono); }
-  textarea { height:100px; resize:vertical; }
-  label.f { display:block; font-size:13px; color:var(--muted); margin-bottom:4px; }
-  .opts { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; margin-top:14px; }
-  .opts input[type=number] { max-width:140px; }
-  #log { height:340px; overflow:auto; background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:8px 10px; margin:10px 0 0; font:12px/1.5 var(--mono); white-space:pre-wrap; word-break:break-all; }
-  .l-skip { color:var(--warn); } .l-err { color:var(--danger); } .l-del { color:var(--ok); }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  main { max-width:1000px; margin:0 auto; padding:16px 14px 40px; }
+  h1 { font-size:17px; font-weight:600; margin:0; }
+  h2 { font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.06em;
+       color:var(--muted); margin:0 0 10px; }
+  header { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; margin-bottom:14px;
+           padding-bottom:10px; border-bottom:1px solid var(--line); }
+  header .v { color:var(--muted); font:12px var(--mono); }
+  header .st { margin-left:auto; font:12px var(--mono); color:var(--muted); }
+  header .st.run { color:var(--fg); font-weight:600; }
+  section { border:1px solid var(--line); background:var(--panel); padding:12px 14px; margin-bottom:12px; }
+  .warn { border-left:3px solid var(--warn); color:var(--warn);
+          padding:6px 10px; margin-bottom:8px; font-size:13px; }
+
+  /* Steuerung */
+  .ctl { display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; }
+  label.r { font-size:13px; cursor:pointer; }
+  button, .btn { font:13px inherit; padding:5px 12px; border:1px solid var(--line);
+                 background:var(--bg); color:var(--fg); cursor:pointer; text-decoration:none; }
+  button.go { border-color:var(--accent); font-weight:600; }
+  button:disabled { color:var(--muted); cursor:not-allowed; }
+  .hint { color:var(--muted); font-size:12px; }
+
+  /* Statusleiste */
+  .bar { height:6px; background:var(--line); margin:12px 0 6px; }
+  .bar>div { height:100%; width:0; background:var(--bar); }
+  .line { font:12px/1.6 var(--mono); color:var(--muted); word-break:break-word; }
+  .line b { color:var(--fg); font-weight:600; }
+
+  /* Zahlen: dichte Liste statt grosser Kacheln */
+  .nums { display:grid; grid-template-columns:repeat(auto-fit,minmax(215px,1fr));
+          gap:0 20px; margin-top:10px; border-top:1px solid var(--line); }
+  .nums div { display:flex; justify-content:space-between; gap:10px;
+              padding:3px 0; border-bottom:1px solid var(--line); font-size:13px; }
+  .nums span { color:var(--muted); }
+  .nums b { font:13px var(--mono); font-variant-numeric:tabular-nums; }
+
+  /* Protokoll */
+  .logbar { display:flex; flex-wrap:wrap; gap:8px 10px; align-items:center; margin-bottom:8px; }
+  input[type=text], input[type=number], select, textarea {
+    font:13px var(--mono); background:var(--bg); color:var(--fg);
+    border:1px solid var(--line); padding:4px 7px; }
+  input[type=text].f { width:260px; }
+  textarea { width:100%; height:78px; resize:vertical; }
+  #log { height:360px; overflow:auto; background:var(--bg); border:1px solid var(--line);
+         padding:6px 8px; margin:0; font:12px/1.5 var(--mono); white-space:pre-wrap; word-break:break-all; }
+  #log div[data-l=err]  { color:var(--err); }
+  #log div[data-l=warn] { color:var(--warn); }
+  #log div[data-l=del]  { color:var(--ok); }
+  #log div[data-l=skip] { color:var(--skip); }
+  /* Stufenfilter rein per CSS - kostet kein JS pro Zeile */
+  #log.only-del  div:not([data-l=del]),
+  #log.only-skip div:not([data-l=skip]),
+  #log.only-prob div:not([data-l=err]):not([data-l=warn]),
+  #log.only-err  div:not([data-l=err]) { display:none; }
+  #log div.hid { display:none; }
+
+  /* Einstellungen */
+  .set { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  @media (max-width:720px) { .set { grid-template-columns:1fr; } }
+  .fl { display:block; font-size:12px; color:var(--muted); margin-bottom:3px; }
+  .chk { display:block; font-size:13px; margin:0 0 5px; }
+  .chk input { margin-right:6px; }
+
   table { width:100%; border-collapse:collapse; font-size:13px; }
-  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
-  th { color:var(--muted); font-weight:500; }
-  .muted { color:var(--muted); font-size:13px; }
-  .msg { font-size:13px; margin-left:8px; color:var(--muted); }
+  th, td { text-align:left; padding:4px 8px 4px 0; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:500; font-size:12px; }
+  td.n { font:12px var(--mono); font-variant-numeric:tabular-nums; }
+  .msg { font-size:12px; color:var(--muted); margin-left:8px; }
 </style>
 </head>
 <body>
 <main>
 <header>
-  <h1>Navidrome Duplicate Tool</h1><span class="ver">v{{VERSION}}</span>
-  <span class="pill" id="pill">...</span>
+  <h1>Navidrome Duplicate Tool</h1>
+  <span class="v">v{{VERSION}} · behalten: {{KEEP}} · entfernen: {{DEL}} · DB: {{DB}}</span>
+  <span class="st" id="st">verbinde …</span>
 </header>
 <div id="warnings"></div>
 
-<section class="card">
-  <h2>Steuerung</h2>
-  <div class="row">
-    <div class="seg">
-      <label><input type="radio" name="mode" value="dry" checked><span>Simulation (Dry-Run)</span></label>
-      <label class="exec"><input type="radio" name="mode" value="exec"><span>Ausführen (löscht Dateien)</span></label>
-    </div>
-    <button id="start" class="primary" onclick="startRun()">Start</button>
+<section>
+  <h2>Lauf</h2>
+  <div class="ctl">
+    <label class="r"><input type="radio" name="mode" value="dry" checked> Dry-Run (ändert nichts)</label>
+    <label class="r"><input type="radio" name="mode" value="exec"> Ausführen (löscht Dateien)</label>
+    <button id="start" class="go" onclick="startRun()">Start</button>
     <button id="stop" onclick="stopRun()" disabled>Stopp</button>
-    <span class="muted">Stopp beendet immer erst den aktuellen Datenbank-Block sauber.</span>
+    <span class="hint">Stopp beendet immer erst den laufenden Datenbank-Block.</span>
   </div>
   <div class="bar"><div id="fill"></div></div>
-  <div class="pct" id="pct">0 %</div>
-  <div class="tiles">
-    <div class="tile"><b id="scanned">0</b><span>Titel gescannt</span></div>
-    <div class="tile"><b id="candidates">0</b><span>Kandidaten-Gruppen</span></div>
-    <div class="tile"><b id="duplicates">0</b><span>Duplikate erkannt</span></div>
-    <div class="tile"><b id="same_format">0</b><span>davon gleiches Format (z.&nbsp;B. FLAC/FLAC)</span></div>
-    <div class="tile"><b id="deleted">0</b><span>Dateien gelöscht</span></div>
-    <div class="tile"><b id="freed">0 B</b><span id="freedlabel">Speicher</span></div>
-    <div class="tile"><b id="annotations">0</b><span>Favoriten/Statistiken übertragen</span></div>
-    <div class="tile"><b id="playlists">0</b><span>Playlists aktualisiert</span></div>
-    <div class="tile"><b id="protected">0</b><span>Geschützt (Instrumental u. ä.)</span></div>
-    <div class="tile"><b id="excluded">0</b><span>Ausgeschlossene Ordner</span></div>
-    <div class="tile"><b id="mismatch">0</b><span>Übersprungen (Länge/Track)</span></div>
-    <div class="tile"><b id="errors">0</b><span>Fehler</span></div>
+  <div class="line" id="prog">–</div>
+  <div class="nums">
+    <div><span>Titel gescannt</span><b id="scanned">0</b></div>
+    <div><span>Kandidaten-Gruppen</span><b id="candidates">0</b></div>
+    <div><span>Duplikate erkannt</span><b id="duplicates">0</b></div>
+    <div><span>davon gleiches Format</span><b id="same_format">0</b></div>
+    <div><span>zum Löschen vorgemerkt</span><b id="planned">0</b></div>
+    <div><span>Dateien gelöscht</span><b id="deleted">0</b></div>
+    <div><span>Speicher</span><b id="freed">0 B</b></div>
+    <div><span>Favoriten/Statistiken übertragen</span><b id="annotations">0</b></div>
+    <div><span>Playlists aktualisiert</span><b id="playlists">0</b></div>
+    <div><span>Tag-Warnungen</span><b id="tags_lost">0</b></div>
+    <div><span>geschützt (Instrumental u.&nbsp;ä.)</span><b id="protected">0</b></div>
+    <div><span>ausgeschlossene Ordner</span><b id="excluded">0</b></div>
+    <div><span>übersprungen (Länge/Track/Tags)</span><b id="mismatch">0</b></div>
+    <div><span>Fehler</span><b id="errors">0</b></div>
   </div>
 </section>
 
-<section class="card">
-  <h2>Einstellungen</h2>
-  <div class="grid2">
-    <div><label class="f">Ausgeschlossene Ordner (ein Name oder Pfadteil pro Zeile)</label>
-      <textarea id="excludes" placeholder="DJ-Mixe"></textarea></div>
-    <div><label class="f">Schutz-Begriffe (Titel, Pfad, Album, Kommentar, Tags)</label>
-      <textarea id="keywords"></textarea></div>
-  </div>
-  <div class="opts">
-    <div><label class="f">Max. Duplikate pro Lauf (0 = unbegrenzt)</label><input type="number" id="max_delete" min="0" step="1"></div>
-    <div><label class="f">Längen-Toleranz in Sekunden</label><input type="number" id="duration_tol" min="0" max="60" step="0.5"></div>
-    <div><label class="f">Doppelte Dateien gleichen Formats (FLAC/FLAC)</label>
-      <label><input type="checkbox" id="dedupe_flac"> ebenfalls bereinigen (beste Datei bleibt)</label></div>
-    <div><label class="f">Playlists</label>
-      <label><input type="checkbox" id="playlist_keep_duplicates"> Eintrag immer umbiegen, auch wenn der Titel dadurch doppelt in der Playlist steht (Playlist wird nie kürzer)</label></div>
-    <div><label class="f">MusicBrainz</label>
-      <label><input type="checkbox" id="require_mbz_match"> bei unterschiedlicher Recording-ID nichts löschen</label></div>
-    <div><label class="f">Tracknummer</label>
-      <label><input type="checkbox" id="require_same_track"> bei gleichem Format muss die Tracknummer übereinstimmen</label></div>
-  </div>
-  <p style="margin:14px 0 0"><button onclick="saveCfg()">Einstellungen speichern</button><span class="msg" id="cfgmsg"></span></p>
-</section>
-
-<section class="card">
-  <h2>Live-Protokoll</h2>
-  <div class="row">
-    <input type="text" id="filter" placeholder="Filter (z. B. SKIP, FEHLER, Dateiname)" style="max-width:340px">
-    <a class="btn" href="/api/logs.zip" download>Alle Logs als ZIP herunterladen</a>
+<section>
+  <h2>Protokoll</h2>
+  <div class="logbar">
+    <input type="text" class="f" id="filter" placeholder="Textfilter (Dateiname, Album …)">
+    <select id="level" onchange="setLevel()">
+      <option value="">alle Zeilen</option>
+      <option value="only-del">nur Löschungen</option>
+      <option value="only-skip">nur Übersprungene</option>
+      <option value="only-prob">nur Warnungen und Fehler</option>
+      <option value="only-err">nur Fehler</option>
+    </select>
+    <label class="r"><input type="checkbox" id="auto" checked> Automatisch scrollen</label>
+    <span class="hint" id="lc">0 Zeilen</span>
+    <a class="btn" href="/api/logs.zip" download>Logs als ZIP</a>
   </div>
   <pre id="log"></pre>
+  <div class="hint" style="margin-top:6px">Vollständiges Log und TSV-Report jedes Laufs: <code>/config/logs</code> bzw. <code>/config/reports</code>.</div>
 </section>
 
-<section class="card">
-  <h2>Verlauf &amp; Backups</h2>
+<section>
+  <h2>Einstellungen</h2>
+  <div class="set">
+    <div>
+      <label class="fl">Ausgeschlossene Ordner (ein Name oder Pfadteil pro Zeile)</label>
+      <textarea id="excludes" placeholder="DJ-Mixe"></textarea>
+    </div>
+    <div>
+      <label class="fl">Schutz-Begriffe (Titel, Pfad, Album, Kommentar, Tags)</label>
+      <textarea id="keywords"></textarea>
+    </div>
+    <div>
+      <label class="fl">Max. Duplikate pro Lauf (0 = unbegrenzt)</label>
+      <input type="number" id="max_delete" min="0" step="1" style="width:110px">
+      <label class="fl" style="margin-top:10px">Längen-Toleranz in Sekunden</label>
+      <input type="number" id="duration_tol" min="0" max="60" step="0.5" style="width:110px">
+    </div>
+    <div>
+      <label class="fl">Regeln</label>
+      <label class="chk"><input type="checkbox" id="dedupe_flac"> doppelte Dateien gleichen Formats bereinigen (FLAC/FLAC)</label>
+      <label class="chk"><input type="checkbox" id="strip_copy_suffix"> „Song (1)“, „Song (2)“, „Song - Copy“ als dasselbe Stück behandeln</label>
+      <label class="chk"><input type="checkbox" id="skip_on_tag_loss"> nicht löschen, wenn die Kopie Tag-Felder hat, die der behaltenen Datei fehlen</label>
+      <label class="chk"><input type="checkbox" id="require_mbz_match"> nicht löschen bei unterschiedlicher MusicBrainz-Recording-ID</label>
+      <label class="chk"><input type="checkbox" id="require_same_track"> gleiche Tracknummer verlangen (bei gleichem Format)</label>
+      <label class="chk"><input type="checkbox" id="playlist_keep_duplicates"> Playlist-Einträge immer umbiegen, auch wenn der Titel dadurch doppelt vorkommt (Playlist wird nie kürzer)</label>
+    </div>
+  </div>
+  <p style="margin:12px 0 0"><button onclick="saveCfg()">Speichern</button><span class="msg" id="cfgmsg"></span></p>
+</section>
+
+<section>
+  <h2>Verlauf</h2>
   <table id="hist"><thead><tr><th>Start</th><th>Modus</th><th>Ergebnis</th><th>Duplikate</th><th>Gelöscht</th><th>Speicher</th><th>Fehler</th></tr></thead><tbody></tbody></table>
-  <p class="muted" id="nohist"></p>
-  <p style="margin:16px 0 6px"><button onclick="backupNow()">Backup jetzt erstellen</button><span class="msg" id="bkmsg"></span></p>
-  <table id="bk"><thead><tr><th>Backup-Datei (Ordner /backups)</th><th>Größe</th></tr></thead><tbody></tbody></table>
+  <p class="hint" id="nohist"></p>
+</section>
+
+<section>
+  <h2>Backups</h2>
+  <p style="margin:0 0 10px"><button onclick="backupNow()">Backup jetzt erstellen</button><span class="msg" id="bkmsg"></span></p>
+  <table id="bk"><thead><tr><th>Datei in /backups</th><th>Größe</th></tr></thead><tbody></tbody></table>
+  <p class="hint" id="nobk"></p>
 </section>
 </main>
 
 <script>
+"use strict";
 const $ = id => document.getElementById(id);
-let since = 0, running = false, histTick = 0;
-const fmt = n => Number(n).toLocaleString("de-DE");
-function bytes(b){ const u=["B","KB","MB","GB","TB"]; let i=0; b=Number(b); while(b>=1024&&i<4){b/=1024;i++;} return b.toFixed(i?2:0)+" "+u[i]; }
-async function api(path, opt) { const r = await fetch(path, opt); if (!r.ok) { let m = await r.text(); try { m = JSON.parse(m).error || m; } catch(_){} throw new Error(m); } return r; }
-function cell(tr, text){ const td=document.createElement("td"); td.textContent=text; tr.appendChild(td); }
+const NUMS = ["scanned","candidates","duplicates","same_format","planned","deleted","annotations",
+              "playlists","tags_lost","protected","excluded","mismatch","errors"];
+const MAXLINES = 800;
+let since = 0, running = false, idleTicks = 0, last = {};
 
+const fmt = n => Number(n || 0).toLocaleString("de-DE");
+function bytes(b) { const u = ["B","KB","MB","GB","TB"]; let i = 0; b = Number(b) || 0;
+  while (b >= 1024 && i < 4) { b /= 1024; i++; } return b.toFixed(i ? 2 : 0) + " " + u[i]; }
+function hms(s) { s = Math.max(0, Math.round(s || 0));
+  const p = n => String(n).padStart(2, "0");
+  return p(Math.floor(s / 3600)) + ":" + p(Math.floor(s / 60) % 60) + ":" + p(s % 60); }
+function level(line) {
+  if (line.indexOf("FEHLER") >= 0) return "err";
+  if (line.indexOf("TAG-WARNUNG") >= 0) return "warn";
+  if (line.indexOf("GELOESCHT") >= 0 || line.indexOf("FEHLTE-SCHON") >= 0) return "del";
+  if (line.indexOf("SKIP") >= 0) return "skip";
+  return "";
+}
+async function api(path, opt) {
+  const r = await fetch(path, opt);
+  if (!r.ok) { let m = await r.text(); try { m = JSON.parse(m).error || m; } catch (_) {} throw new Error(m); }
+  return r;
+}
+function cell(tr, text, mono) { const td = document.createElement("td");
+  if (mono) td.className = "n"; td.textContent = text; tr.appendChild(td); }
+
+/* Status */
 async function poll() {
   try {
     const d = await (await api("/api/status?since=" + since)).json();
     running = d.running;
-    const pill = $("pill");
-    pill.textContent = d.running ? ("Läuft – " + d.phase + (d.execute ? " (Ausführen)" : " (Simulation)")) : ("Bereit – " + d.phase);
-    pill.className = "pill" + (d.running ? " run" : "");
-    const w = $("warnings"); w.replaceChildren();
-    for (const m of d.warnings) { const e = document.createElement("div"); e.className = "warn"; e.textContent = m; w.appendChild(e); }
-    const s = d.stats;
-    for (const k of ["scanned","candidates","duplicates","same_format","deleted","annotations","playlists","protected","excluded","mismatch","errors"]) $(k).textContent = fmt(s[k] || 0);
-    $("freed").textContent = bytes(s.bytes_freed);
-    $("freedlabel").textContent = d.execute ? "Speicher freigegeben" : "Speicher (Simulation)";
-    const pct = s.total ? Math.min(100, s.scanned / s.total * 100) : 0;
-    $("fill").style.width = pct + "%"; $("pct").textContent = pct.toFixed(1) + " %  (" + fmt(s.scanned) + " / " + fmt(s.total) + ")";
-    $("start").disabled = d.running; $("stop").disabled = !d.running;
-    const log = $("log"), stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
-    for (const [, line] of d.log) {
-      const el = document.createElement("div");
-      el.className = /FEHLER/.test(line) ? "l-err" : /SKIP/.test(line) ? "l-skip" : /GELOESCHT/.test(line) ? "l-del" : "";
-      el.textContent = line; log.appendChild(el);
+    const st = $("st");
+    st.textContent = (d.running ? "läuft · " : "bereit · ") + d.phase + (d.execute ? " · AUSFÜHREN" : " · Dry-Run");
+    st.className = "st" + (d.running ? " run" : "");
+
+    const w = $("warnings"), txt = (d.warnings || []).join("\u0000");
+    if (txt !== last.warn) {
+      last.warn = txt; w.replaceChildren();
+      for (const m of d.warnings || []) { const e = document.createElement("div"); e.className = "warn"; e.textContent = m; w.appendChild(e); }
     }
-    while (log.childElementCount > 1500) log.removeChild(log.firstChild);
-    applyFilter();
-    if (stick) log.scrollTop = log.scrollHeight;
+
+    const s = d.stats;
+    for (const k of NUMS) if (last[k] !== s[k]) { last[k] = s[k]; $(k).textContent = fmt(s[k]); }
+    if (last.bf !== s.bytes_freed) { last.bf = s.bytes_freed; $("freed").textContent = bytes(s.bytes_freed); }
+
+    const pct = s.total ? Math.min(100, s.scanned / s.total * 100) : 0;
+    $("fill").style.width = pct.toFixed(1) + "%";
+    const parts = ["Phase: " + d.phase,
+                   fmt(s.scanned) + " / " + fmt(s.total) + " Titel (" + pct.toFixed(1).replace(".", ",") + " %)"];
+    if (d.rate) parts.push(fmt(Math.round(d.rate)) + " Titel/s");
+    if (d.elapsed) parts.push("Laufzeit " + hms(d.elapsed));
+    if (d.eta != null) parts.push("Rest ca. " + hms(d.eta));
+    $("prog").textContent = parts.join(" · ");
+
+    $("start").disabled = d.running; $("stop").disabled = !d.running;
+
+    if (d.log && d.log.length) {
+      const log = $("log");
+      const stick = $("auto").checked;
+      const q = $("filter").value.toLowerCase();
+      const frag = document.createDocumentFragment();
+      for (const entry of d.log) {
+        const line = entry[1];
+        const el = document.createElement("div");
+        const l = level(line);
+        if (l) el.dataset.l = l;
+        el.textContent = line;
+        if (q && line.toLowerCase().indexOf(q) < 0) el.className = "hid";
+        frag.appendChild(el);
+      }
+      log.appendChild(frag);
+      while (log.childElementCount > MAXLINES) log.removeChild(log.firstChild);
+      $("lc").textContent = fmt(log.childElementCount) + " Zeilen";
+      if (stick) log.scrollTop = log.scrollHeight;
+    }
     since = d.next;
-    if (!d.running && histTick++ % 5 === 0) loadHistory();
-  } catch (e) { $("pill").textContent = "Verbindung gestört"; }
-  setTimeout(poll, running ? 1000 : 3000);
+    if (!d.running && idleTicks++ % 6 === 0) loadHistory();
+  } catch (e) { $("st").textContent = "Verbindung gestört"; }
+  setTimeout(poll, running ? 1000 : 4000);
 }
+
+/* Protokoll-Filter: Text in JS (nur bei Eingabe), Stufe per CSS-Klasse */
 function applyFilter() {
   const q = $("filter").value.toLowerCase();
-  for (const el of $("log").children) el.style.display = (!q || el.textContent.toLowerCase().includes(q)) ? "" : "none";
+  for (const el of $("log").children) el.className = (!q || el.textContent.toLowerCase().indexOf(q) >= 0) ? "" : "hid";
 }
 $("filter").addEventListener("input", applyFilter);
+function setLevel() { $("log").className = $("level").value; }
 
+/* Steuerung */
 async function startRun() {
-  const exec = document.querySelector('input[name=mode]:checked').value === "exec";
+  const exec = document.querySelector("input[name=mode]:checked").value === "exec";
   if (exec) {
-    const a = prompt("ECHTER LAUF: Duplikate werden unwiderruflich gelöscht (vorher wird ein Datenbank-Backup erstellt).\nZur Bestätigung LÖSCHEN eintippen:");
-    const v = (a || "").trim().toUpperCase();
+    const v = (prompt("Dateien werden unwiderruflich gelöscht (vorher wird ein Datenbank-Backup erstellt).\nZur Bestätigung LÖSCHEN eintippen:") || "").trim().toUpperCase();
     if (v !== "LOESCHEN" && v !== "LÖSCHEN") return;
   }
-  try { await api("/api/start", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({execute: exec}) }); }
-  catch (e) { alert("Start nicht möglich: " + e.message); }
+  try {
+    await api("/api/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ execute: exec }) });
+    $("log").replaceChildren();
+  } catch (e) { alert("Start nicht möglich: " + e.message); }
 }
-async function stopRun() { await api("/api/stop", { method:"POST" }); }
+async function stopRun() { await api("/api/stop", { method: "POST" }); }
 
+/* Einstellungen */
+const FLAGS = ["dedupe_flac","strip_copy_suffix","skip_on_tag_loss","require_mbz_match","require_same_track","playlist_keep_duplicates"];
 const lines = t => t.split("\n").map(x => x.trim()).filter(Boolean);
 async function loadCfg() {
   const c = await (await api("/api/config")).json();
-  $("excludes").value = c.excludes.join("\n"); $("keywords").value = c.keywords.join("\n");
-  $("max_delete").value = c.max_delete; $("duration_tol").value = c.duration_tol;
-  for (const k of ["dedupe_flac","playlist_keep_duplicates","require_mbz_match","require_same_track"]) $(k).checked = !!c[k];
+  $("excludes").value = c.excludes.join("\n");
+  $("keywords").value = c.keywords.join("\n");
+  $("max_delete").value = c.max_delete;
+  $("duration_tol").value = c.duration_tol;
+  for (const k of FLAGS) $(k).checked = !!c[k];
 }
 async function saveCfg() {
+  const body = {
+    excludes: lines($("excludes").value), keywords: lines($("keywords").value),
+    max_delete: Math.max(0, parseInt($("max_delete").value || "0", 10)),
+    duration_tol: parseFloat($("duration_tol").value || "3")
+  };
+  for (const k of FLAGS) body[k] = $(k).checked;
   try {
-    await api("/api/config", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({
-      excludes: lines($("excludes").value), keywords: lines($("keywords").value),
-      max_delete: Math.max(0, parseInt($("max_delete").value || "0", 10)), duration_tol: parseFloat($("duration_tol").value || "3"),
-      dedupe_flac: $("dedupe_flac").checked, playlist_keep_duplicates: $("playlist_keep_duplicates").checked,
-      require_mbz_match: $("require_mbz_match").checked, require_same_track: $("require_same_track").checked }) });
-    $("cfgmsg").textContent = "Gespeichert.";
+    await api("/api/config", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    $("cfgmsg").textContent = "gespeichert";
   } catch (e) { $("cfgmsg").textContent = "Fehler: " + e.message; }
 }
+
+/* Verlauf und Backups */
 async function loadHistory() {
   try {
     const d = await (await api("/api/history")).json();
     const tb = $("hist").tBodies[0]; tb.replaceChildren();
     for (const h of d.history.slice(0, 15)) {
       const tr = document.createElement("tr");
-      cell(tr, h.start); cell(tr, h.mode === "execute" ? "Ausführen" : "Simulation"); cell(tr, h.result);
-      cell(tr, fmt(h.stats.duplicates)); cell(tr, fmt(h.stats.deleted)); cell(tr, bytes(h.stats.bytes_freed)); cell(tr, fmt(h.stats.errors));
+      cell(tr, h.start, true);
+      cell(tr, h.mode === "execute" ? "Ausführen" : "Dry-Run");
+      cell(tr, h.result);
+      cell(tr, fmt(h.stats.duplicates), true);
+      cell(tr, fmt(h.stats.deleted), true);
+      cell(tr, bytes(h.stats.bytes_freed), true);
+      cell(tr, fmt(h.stats.errors), true);
       tb.appendChild(tr);
     }
     $("nohist").textContent = d.history.length ? "" : "Noch keine Läufe.";
     const bb = $("bk").tBodies[0]; bb.replaceChildren();
-    for (const b of d.backups) { const tr = document.createElement("tr"); cell(tr, b.name); cell(tr, bytes(b.size)); bb.appendChild(tr); }
+    for (const b of d.backups) { const tr = document.createElement("tr"); cell(tr, b.name, true); cell(tr, bytes(b.size), true); bb.appendChild(tr); }
+    $("nobk").textContent = d.backups.length ? "" : "Noch keine Backups.";
   } catch (e) {}
 }
 async function backupNow() {
-  $("bkmsg").textContent = "Backup läuft ...";
-  try { await api("/api/backup", { method:"POST" }); $("bkmsg").textContent = "Backup erstellt."; loadHistory(); }
+  $("bkmsg").textContent = "läuft …";
+  try { await api("/api/backup", { method: "POST" }); $("bkmsg").textContent = "erstellt"; loadHistory(); }
   catch (e) { $("bkmsg").textContent = "Fehler: " + e.message; }
 }
-if ({{MODE_EXECUTE}}) document.querySelector('input[value=exec]').checked = true;
+
+if ({{MODE_EXECUTE}}) document.querySelector("input[value=exec]").checked = true;
 loadCfg(); loadHistory(); poll();
 </script>
 </body>

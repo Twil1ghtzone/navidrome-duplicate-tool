@@ -40,13 +40,31 @@ geloeschte Datei zeigt. Schlaegt die Pruefung fehl, wird der Block zurueckgeroll
 
 ## Duplikat-Logik und Schutzmechanismen
 - Gruppierung nach `album_id + Disc + Titel` (`MATCH_MODE=artist_title` gruppiert albumuebergreifend).
-- Behalten wird die beste Datei: zuerst das Wunschformat (`KEEP_EXTS`, Standard FLAC), dann Bit-Tiefe, Samplerate,
-  Kanaele, Bitrate und Groesse – bei FLAC/FLAC entscheidet also die echte Qualitaet, nicht nur die Dateigroesse.
+- **Kopien mit Zaehler im Namen** wie `Song (1)`, `Song (2)`, `Song [3]`, `Song - Copy`, `Song Kopie` werden auf
+  `Song` normalisiert und damit ueberhaupt erst als Duplikat erkannt (abschaltbar). Echte Klammer-Zusaetze wie
+  `Song (Live)` oder `Song (Remix 2)` bleiben unangetastet, und bei gleicher Qualitaet gewinnt die Datei,
+  deren Dateiname keine Kopie ist.
+- Behalten wird die beste Datei in dieser Reihenfolge: Wunschformat (`KEEP_EXTS`, Standard FLAC), Bit-Tiefe,
+  Samplerate, Kanaele, **Tag-Vollstaendigkeit**, "keine Kopie"-Dateiname, dann Bitrate und Groesse.
+
+## Tags
+Bei FLAC gegen FLAC entscheidet zuerst die echte Audio-Qualitaet, danach aber die Tags – Bitrate und Dateigroesse
+sind bei identischem Audio bedeutungslos, fehlende Tags nicht. Geprueft werden Album-Interpret, Interpret, Album,
+Titel, Track- und Disc-Nummer, Jahr, Datum, Genre, Kommentar, Liedtext, MusicBrainz-IDs, Katalognummer, BPM,
+Cover, Sortiertitel, Explicit-Kennzeichen, ReplayGain und der Tag-Block von Navidrome.
+
+Pro Titel wird dafuer nur eine ~20 Byte grosse Flag-Zeichenkette aus der Datenbank geholt (ein Zeichen je Feld),
+nicht der ganze Tag-Satz – das bleibt auch bei Millionen Titeln guenstig.
+
+Haette die zu loeschende Datei ein Feld, das der behaltenen fehlt, erscheint eine `TAG-WARNUNG` im Protokoll mit
+den betroffenen Feldern, der Zaehler "Tag-Warnungen" steigt und der Report vermerkt `tagverlust=...`.
+Mit der Option **"nicht loeschen, wenn die Kopie Tag-Felder hat, die der behaltenen Datei fehlen"** wird die
+Gruppe stattdessen uebersprungen. Das Tool schreibt selbst keine Tags in Audiodateien.
 - Entfernt werden MP3s (nur wenn eine FLAC existiert) und doppelte Dateien gleichen Formats, z. B. FLAC/FLAC (abschaltbar).
 - Uebersprungen wird bei: Schutz-Begriffen (instrumental, karaoke, acapella ... in Titel/Pfad/Album/Kommentar/Tags),
   Exclude-Ordnern, fehlender oder leerer Zieldatei auf Platte, abweichender Laenge (Toleranz einstellbar),
-  unterschiedlicher MusicBrainz-Recording-ID, abweichender Tracknummer bei gleichem Format und
-  **Hardlinks auf dieselbe Datei** (gleiche Inode).
+  unterschiedlicher MusicBrainz-Recording-ID, abweichender Tracknummer bei gleichem Format,
+  **Hardlinks auf dieselbe Datei** (gleiche Inode) und auf Wunsch bei drohendem Tag-Verlust.
 - **Sicherheitssperre:** "Ausfuehren" ist erst nach einem vollstaendigen Dry-Run (letzte 7 Tage) moeglich (`REQUIRE_DRYRUN=false` schaltet das ab) und verlangt die Eingabe von LOESCHEN.
 - **Limit pro Lauf** (z. B. erst 50 Duplikate testen), Backup vor jedem Execute (`VACUUM INTO`), pro Block eine ACID-Transaktion,
   Dateien werden erst nach dem Commit geloescht, Graceful Shutdown beendet immer erst den aktuellen Block.
@@ -65,7 +83,28 @@ geloeschte Datei zeigt. Schlaegt die Pruefung fehl, wird der Block zurueckgeroll
 `DELETE_EXTS` (mp3), `DEDUPE_SAME_EXTS` (flac, `none` = aus), `DURATION_TOLERANCE` (3), `BATCH_SIZE` (200), `BACKUP_KEEP` (3),
 `MATCH_MODE` (`album` | `artist_title`), `DELETE_ROWS` (false), `REQUIRE_DRYRUN` (true), `LOG_KEEP` (30).
 In der UI einstellbar: Toleranz, Limit pro Lauf, Exclude-Ordner, Schutz-Begriffe, Bereinigung gleicher Formate,
-Playlist-Verhalten, MusicBrainz-Pruefung und Tracknummer-Pruefung.
+Kopie-Erkennung, Tag-Verlust-Sperre, Playlist-Verhalten, MusicBrainz-Pruefung und Tracknummer-Pruefung.
+
+## Oberflaeche
+Bewusst schlicht: eine HTML-Seite ohne Framework, ohne Animationen, in Hell und Dunkel.
+Oben eine Statuszeile mit Phase, Fortschritt, Durchsatz in Titeln pro Sekunde, Laufzeit und geschaetzter Restzeit
+(serverseitig berechnet), darunter alle Zaehler als dichte Liste. Das Protokoll zeigt jede Entscheidung mit
+Begruendung, laesst sich nach Text filtern und nach Stufe umschalten (Loeschungen, Uebersprungene,
+Warnungen und Fehler) – die Stufenfilter laufen rein ueber CSS, kosten also kein JavaScript pro Zeile.
+`/api/status` liefert nur neue Protokollzeilen seit dem letzten Abruf, die Warnungen werden hoechstens
+alle 15 Sekunden neu ermittelt, und im Leerlauf wird nur alle 4 Sekunden abgefragt.
+
+## Als Navidrome-Plugin?
+Geht nicht sinnvoll. Navidrome-Plugins sind WebAssembly-Module (Extism) mit festen Faehigkeiten –
+MetadataAgent, Scrobbler, Lyrics, SonicSimilarity, TaskWorker, Lifecycle, Scheduler- und WebSocket-Callbacks.
+Eine eigene Seite in der Navidrome-Oberflaeche ist nicht vorgesehen; sichtbar wird ein Plugin nur als Eintrag
+mit Namen, Beschreibung und einem Einstellungsformular. Vor allem bekommen Plugins keinen Zugriff auf die
+SQLite-Datenbank: ueber den Library-Dienst gibt es nur Bibliotheks-Kennzahlen und lesenden Dateizugriff.
+Die Kernarbeit dieses Tools – Favoriten, Playlists, Lesezeichen und Historie in einer einzigen Transaktion
+umhaengen – laesst sich damit nicht abbilden.
+
+Fuer ein integriertes Gefuehl eignet sich ein Reverse-Proxy, der Navidrome unter `/` und dieses Tool unter
+z. B. `/dedupe/` ausliefert.
 
 ## Entwicklung
 `cargo test` startet die Integrationstests. Sie bauen eine Navidrome-aehnliche Datenbank samt echten Dateien auf und

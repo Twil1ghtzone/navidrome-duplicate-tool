@@ -143,6 +143,12 @@ pub struct Settings {
     pub require_mbz_match: bool,
     /// Bei gleichem Format muss die Tracknummer uebereinstimmen.
     pub require_same_track: bool,
+    /// Titel wie "Song (1)", "Song (2)", "Song - Copy" werden auf "Song" normalisiert,
+    /// damit solche Kopien ueberhaupt als Duplikat erkannt werden.
+    pub strip_copy_suffix: bool,
+    /// Haette die zu loeschende Datei Tag-Felder, die der behaltenen fehlen,
+    /// wird die Gruppe uebersprungen statt die Tags zu verlieren.
+    pub skip_on_tag_loss: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -156,6 +162,8 @@ impl Default for Settings {
             playlist_keep_duplicates: true,
             require_mbz_match: true,
             require_same_track: true,
+            strip_copy_suffix: true,
+            skip_on_tag_loss: false,
         }
     }
 }
@@ -169,6 +177,8 @@ pub struct Stats {
     pub candidates: AtomicU64,
     pub duplicates: AtomicU64,
     pub same_format: AtomicU64,
+    pub planned: AtomicU64,
+    pub tags_lost: AtomicU64,
     pub protected: AtomicU64,
     pub excluded: AtomicU64,
     pub mismatch: AtomicU64,
@@ -190,6 +200,12 @@ pub struct Shared {
     pub limit: AtomicBool,
     pub execute: AtomicBool,
     pub phase: Mutex<String>,
+    /// Unix-Sekunden des Laufbeginns (0 = kein Lauf) – fuer Rate und Restzeit
+    pub started_ts: AtomicU64,
+    /// Unix-Sekunden des Laufendes (0 = laeuft noch) – friert die Laufzeit nach dem Ende ein
+    pub ended_ts: AtomicU64,
+    /// zwischengespeicherte Warnungen: (Zeitstempel, Texte)
+    pub warn_cache: Mutex<(i64, Vec<String>)>,
     pub log: Mutex<(u64, VecDeque<(u64, String)>)>,
     pub logfile: Mutex<Option<fs::File>>,
 }
@@ -207,6 +223,9 @@ impl Shared {
             limit: AtomicBool::new(false),
             execute: AtomicBool::new(false),
             phase: Mutex::new("bereit".into()),
+            started_ts: AtomicU64::new(0),
+            ended_ts: AtomicU64::new(0),
+            warn_cache: Mutex::new((0, vec![])),
             log: Mutex::new((0, VecDeque::new())),
             logfile: Mutex::new(None),
         }
@@ -230,7 +249,8 @@ impl Shared {
         json!({
             "total": st.total.load(Relaxed), "scanned": st.scanned.load(Relaxed),
             "candidates": st.candidates.load(Relaxed), "duplicates": st.duplicates.load(Relaxed),
-            "same_format": st.same_format.load(Relaxed),
+            "same_format": st.same_format.load(Relaxed), "planned": st.planned.load(Relaxed),
+            "tags_lost": st.tags_lost.load(Relaxed),
             "protected": st.protected.load(Relaxed), "excluded": st.excluded.load(Relaxed),
             "mismatch": st.mismatch.load(Relaxed), "deleted": st.deleted.load(Relaxed),
             "bytes_freed": st.bytes_freed.load(Relaxed), "annotations": st.annotations.load(Relaxed),
@@ -243,8 +263,9 @@ impl Shared {
     }
     fn reset_stats(&self) {
         let s = &self.stats;
-        for a in [&s.total, &s.scanned, &s.candidates, &s.duplicates, &s.same_format, &s.protected,
-                  &s.excluded, &s.mismatch, &s.deleted, &s.bytes_freed, &s.annotations, &s.playlists, &s.errors] {
+        for a in [&s.total, &s.scanned, &s.candidates, &s.duplicates, &s.same_format, &s.planned,
+                  &s.tags_lost, &s.protected, &s.excluded, &s.mismatch, &s.deleted, &s.bytes_freed,
+                  &s.annotations, &s.playlists, &s.errors] {
             a.store(0, Relaxed);
         }
     }
@@ -284,6 +305,35 @@ fn cols(c: &Connection, table: &str) -> Vec<String> {
     st.query_map([], |r| r.get::<_, String>(1))
         .map(|it| it.filter_map(|x| x.ok()).collect())
         .unwrap_or_default()
+}
+
+/// Tag-Felder, deren Vorhandensein pro Datei als Flag abgefragt wird.
+/// (Flag, Spalte, Anzeigename, numerisch)
+const TAG_FIELDS: &[(char, &str, &str, bool)] = &[
+    ('A', "album_artist", "Album-Interpret", false),
+    ('r', "artist", "Interpret", false),
+    ('b', "album", "Album", false),
+    ('t', "title", "Titel", false),
+    ('n', "track_number", "Tracknummer", true),
+    ('d', "disc_number", "Disc-Nummer", true),
+    ('y', "year", "Jahr", true),
+    ('D', "date", "Datum", false),
+    ('g', "genre", "Genre", false),
+    ('c', "comment", "Kommentar", false),
+    ('l', "lyrics", "Liedtext", false),
+    ('m', "mbz_recording_id", "MusicBrainz-Recording", false),
+    ('M', "mbz_album_id", "MusicBrainz-Album", false),
+    ('k', "catalog_num", "Katalognummer", false),
+    ('p', "bpm", "BPM", true),
+    ('v', "has_cover_art", "Cover", true),
+    ('s', "sort_title", "Sortiertitel", false),
+    ('x', "explicit_status", "Explicit-Kennzeichen", false),
+    ('R', "rg_track_gain", "ReplayGain", true),
+    ('T', "tags", "weitere Tags", false),
+];
+
+fn tag_label(flag: char) -> &'static str {
+    TAG_FIELDS.iter().find(|(f, ..)| *f == flag).map(|(_, _, l, _)| *l).unwrap_or("?")
 }
 
 /// Welche Tabellen/Spalten hat diese Navidrome-Datenbank?
@@ -332,6 +382,87 @@ impl Schema {
     fn expr(&self, col: &str, fallback: &str) -> String {
         if self.mf(col) { col.to_string() } else { fallback.to_string() }
     }
+    /// Ein kompakter SQL-Ausdruck, der pro Zeile eine Zeichenkette mit einem Zeichen
+    /// je Tag-Feld liefert ("-" = leer). So kostet die Tag-Pruefung nur ~20 Byte pro Titel,
+    /// statt alle Tag-Spalten zu uebertragen.
+    fn tag_flags_expr(&self) -> String {
+        let parts: Vec<String> = TAG_FIELDS
+            .iter()
+            .filter(|(_, col, _, _)| self.mf(col))
+            .map(|(flag, col, _, numeric)| {
+                if *numeric {
+                    format!("CASE WHEN COALESCE({col},0)<>0 THEN '{flag}' ELSE '-' END")
+                } else if *col == "tags" {
+                    format!("CASE WHEN COALESCE({col},'') NOT IN ('','{{}}') THEN '{flag}' ELSE '-' END")
+                } else {
+                    format!("CASE WHEN COALESCE({col},'')<>'' THEN '{flag}' ELSE '-' END")
+                }
+            })
+            .collect();
+        if parts.is_empty() { "''".to_string() } else { parts.join(" || ") }
+    }
+}
+
+// ── Titel-Normalisierung: "Song (1)", "Song (2)", "Song - Copy" sind dasselbe Stueck ──
+
+/// Entfernt einen angehaengten Zaehler in Klammern, z. B. "song (1)" -> "song".
+fn strip_counter(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let close = match b.last()? {
+        b')' => b'(',
+        b']' => b'[',
+        b'}' => b'{',
+        _ => return None,
+    };
+    let mut i = b.len() - 1;
+    let mut digits = 0usize;
+    while i > 0 {
+        i -= 1;
+        if b[i].is_ascii_digit() {
+            digits += 1;
+        } else {
+            break;
+        }
+    }
+    if digits == 0 || b[i] != close {
+        return None;
+    }
+    Some(s[..i].trim_end().to_string())
+}
+
+const COPY_SUFFIXES: &[&str] = &[
+    " - copy", " copy", " - kopie", " kopie", " - copia", " copia", " - duplicate", " duplicate", " dup",
+];
+
+/// Gruppierschluessel aus einem Titel. `strip=false` gibt den Titel unveraendert (nur getrimmt) zurueck.
+fn norm_title(t: &str, strip: bool) -> String {
+    let mut s = t.trim().to_lowercase();
+    if !strip {
+        return s;
+    }
+    loop {
+        let before = s.len();
+        if let Some(x) = strip_counter(s.trim_end()) {
+            s = x;
+        }
+        for suf in COPY_SUFFIXES {
+            if s.ends_with(suf) {
+                s.truncate(s.len() - suf.len());
+            }
+        }
+        s = s.trim_end().trim_end_matches(['-', '_', '.']).trim_end().to_string();
+        if s.len() == before {
+            break;
+        }
+    }
+    s
+}
+
+/// Sieht der Dateiname nach einer Kopie aus ("track (1).flac")?
+fn is_copy_name(path: &str) -> bool {
+    let stem = Path::new(path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let stem = stem.trim().to_lowercase();
+    !stem.is_empty() && norm_title(&stem, true) != stem
 }
 
 // ───────────────────────── Datenmodell ─────────────────────────
@@ -353,7 +484,20 @@ struct Row {
     mbz: String,
     comment: String,
     tags: String,
+    tag_flags: String,
     track: i64,
+}
+
+impl Row {
+    /// Anzahl gesetzter Tag-Felder.
+    fn tag_score(&self) -> i64 {
+        self.tag_flags.chars().filter(|c| *c != '-').count() as i64
+    }
+    /// Tag-Felder, die diese Datei hat und `other` fehlen.
+    fn tags_missing_in(&self, other: &Row) -> Vec<char> {
+        let have: Vec<char> = other.tag_flags.chars().filter(|c| *c != '-').collect();
+        self.tag_flags.chars().filter(|c| *c != '-' && !have.contains(c)).collect()
+    }
 }
 
 /// Eine geplante Loeschung (Zeile der Plan-Datei).
@@ -385,6 +529,8 @@ pub fn run(sh: &Shared, execute: bool) {
     sh.execute.store(execute, Relaxed);
     sh.reset_stats();
     let started = chrono::Local::now();
+    sh.started_ts.store(started.timestamp().max(0) as u64, Relaxed);
+    sh.ended_ts.store(0, Relaxed);
     let mode = if execute { "execute" } else { "dry-run" };
     let logname = format!("{}-{mode}.log", started.format("%Y%m%d-%H%M%S"));
     let ldir = sh.env.config_dir.join("logs");
@@ -404,6 +550,7 @@ pub fn run(sh: &Shared, execute: bool) {
     sh.phase(result);
     sh.log(format!("=== ENDE: {result} ==="));
     let ended = chrono::Local::now();
+    sh.ended_ts.store(ended.timestamp().max(0) as u64, Relaxed);
     add_history(
         &sh.env,
         json!({
@@ -681,7 +828,7 @@ fn scan(
     };
     let sql = format!(
         "SELECT id, library_id, path, title, album, album_id, artist_id, {disc}, {ot}, suffix, size, duration, bit_rate, \
-                {comment}, {track}, {srate}, {depth}, {chan}, {mbz}, {tags} \
+                {comment}, {track}, {srate}, {depth}, {chan}, {mbz}, {tags}, {flags} \
          FROM media_file WHERE {missing}lower(suffix) IN ({all_exts}) ORDER BY {order}",
         comment = schema.expr("comment", "''"),
         track = schema.expr("track_number", "0"),
@@ -690,6 +837,7 @@ fn scan(
         chan = schema.expr("channels", "0"),
         mbz = schema.expr("mbz_recording_id", "''"),
         tags = if schema.mf("tags") { "CAST(tags AS TEXT)" } else { "''" },
+        flags = schema.tag_flags_expr(),
     );
 
     let mut ctx = Ctx { sh, env, same_exts: same_exts.to_vec(), settings: settings.clone(), libs: libs.clone(), plan, planned: 0 };
@@ -721,9 +869,12 @@ fn scan(
             channels: n(r, 17),
             mbz: s(r, 18),
             tags: s(r, 19),
+            tag_flags: s(r, 20),
         };
-        let (album_id, artist_id, disc_v, title_key) = (s(r, 5), s(r, 6), n(r, 7), s(r, 8));
-        let k = if title_key.trim().is_empty() {
+        let (album_id, artist_id, disc_v, raw_title) = (s(r, 5), s(r, 6), n(r, 7), s(r, 8));
+        // "Song (1)" und "Song" landen damit in derselben Gruppe
+        let title_key = norm_title(&raw_title, settings.strip_copy_suffix);
+        let k = if title_key.is_empty() {
             format!("\u{0}{}", row.id) // ohne Titel nie gruppieren
         } else if env.match_mode == MatchMode::Album {
             format!("{album_id}\u{1}{disc_v}\u{1}{title_key}")
@@ -799,12 +950,19 @@ impl<'a, 'p> Ctx<'a, 'p> {
     }
 
     /// Qualitaetsrang: je groesser, desto eher wird die Datei behalten.
-    fn qual(&self, r: &Row) -> (i32, i64, i64, i64, i64, i64, std::cmp::Reverse<String>) {
+    /// Reihenfolge: Wunschformat, echte Audio-Qualitaet (Bit-Tiefe, Samplerate, Kanaele),
+    /// Tag-Vollstaendigkeit, "keine Kopie"-Dateiname, dann Bitrate und Groesse.
+    /// Bitrate und Groesse sind bei identischem FLAC-Audio bedeutungslos, Tags nicht –
+    /// deshalb stehen die Tags davor.
+    #[allow(clippy::type_complexity)]
+    fn qual(&self, r: &Row) -> (i32, i64, i64, i64, i64, i64, i64, i64, std::cmp::Reverse<String>) {
         let ext = match self.env.keep_exts.iter().position(|e| e == &r.suffix) {
             Some(i) => -(i as i32),
             None => -1000,
         };
-        (ext, r.bit_depth, r.sample_rate, r.channels, r.bit_rate, r.size, std::cmp::Reverse(r.id.clone()))
+        let not_a_copy = if is_copy_name(&r.path) { 0 } else { 1 };
+        (ext, r.bit_depth, r.sample_rate, r.channels, r.tag_score(), not_a_copy, r.bit_rate, r.size,
+         std::cmp::Reverse(r.id.clone()))
     }
 
     fn write_plan(&mut self, keeper: &Row, kpath: &Path, d: &Row, dpath: &Path, reason: &str) -> Result<(), String> {
@@ -820,6 +978,7 @@ impl<'a, 'p> Ctx<'a, 'p> {
         )
         .map_err(|e| format!("Plan-Datei schreiben: {e}"))?;
         self.planned += 1;
+        self.sh.stats.planned.fetch_add(1, Relaxed);
         Ok(())
     }
 
@@ -915,11 +1074,33 @@ impl<'a, 'p> Ctx<'a, 'p> {
                 sh.log(format!("SKIP (Tracknummer {} vs {} bei gleichem Format): {}", d.track, keeper.track, d.path));
                 continue;
             }
-            let reason = if same_format {
+            let mut reason = if same_format {
                 format!("gleiches-format:{}", d.suffix)
             } else {
                 format!("{}->{}", d.suffix, keeper.suffix)
             };
+            // Tags: haette die zu loeschende Datei Felder, die der behaltenen fehlen?
+            let lost = d.tags_missing_in(&keeper);
+            if !lost.is_empty() {
+                let names: Vec<&str> = lost.iter().copied().map(tag_label).collect();
+                reason.push_str(&format!(";tagverlust={}", lost.iter().collect::<String>()));
+                sh.stats.tags_lost.fetch_add(1, Relaxed);
+                if self.settings.skip_on_tag_loss {
+                    sh.stats.mismatch.fetch_add(1, Relaxed);
+                    sh.log(format!(
+                        "SKIP (Tag-Verlust: {} nur in der Kopie vorhanden): {}",
+                        names.join(", "),
+                        d.path
+                    ));
+                    continue;
+                }
+                sh.log(format!(
+                    "TAG-WARNUNG: {} fehlen der behaltenen Datei {} (aus {})",
+                    names.join(", "),
+                    keeper.path,
+                    d.path
+                ));
+            }
             sh.stats.duplicates.fetch_add(1, Relaxed);
             if same_format {
                 sh.stats.same_format.fetch_add(1, Relaxed);
@@ -1349,6 +1530,7 @@ mod tests {
         duration real, bit_rate integer, comment varchar, track_number integer,
         sample_rate integer, bit_depth integer, channels integer,
         mbz_recording_id varchar, tags varchar, missing bool default 0,
+        album_artist varchar, genre varchar, lyrics varchar, year integer, has_cover_art bool default 0,
         average_rating real not null default 0);
     CREATE TABLE annotation (
         user_id varchar not null, item_id varchar not null, item_type varchar not null,
@@ -1439,6 +1621,114 @@ mod tests {
             log_keep: 5,
         };
         (env, music, cfg)
+    }
+
+    /// Haengt ein Paar "g3.flac" / "g3 (1).flac" an die Fixture an.
+    /// Das Original hat Genre und Liedtext, die Kopie nur einen Kommentar –
+    /// so laesst sich Kopie-Erkennung und Tag-Warnung zusammen pruefen.
+    fn add_copy_pair(env: &Env, music: &Path) {
+        fs::write(music.join("g3.flac"), vec![b'x'; 800]).unwrap();
+        fs::write(music.join("g3 (1).flac"), vec![b'x'; 800]).unwrap();
+        let c = Connection::open(&env.db_path).unwrap();
+        let ins = "INSERT INTO media_file (id, library_id, path, title, album, album_id, artist_id, disc_number, \
+                   order_title, suffix, size, duration, bit_rate, comment, track_number, sample_rate, bit_depth, \
+                   channels, mbz_recording_id, tags, missing, genre, lyrics) \
+                   VALUES (?1, 1, ?2, ?3, 'Album', 'alb1', 'art1', 1, ?4, 'flac', 800, 240.0, 800, ?5, 3, 44100, 16, 2, '', '{}', 0, ?6, ?7)";
+        c.execute(ins, params!["flacOrig", "g3.flac", "Song Three", "song three", "", "Rock", "la la"]).unwrap();
+        c.execute(ins, params!["flacCopy", "g3 (1).flac", "Song Three (1)", "song three (1)", "aus dem Netz", Option::<String>::None, Option::<String>::None]).unwrap();
+    }
+
+    #[test]
+    fn title_normalisation() {
+        for (raw, want) in [
+            ("Song (1)", "song"),
+            ("Song (12)", "song"),
+            ("Song [2]", "song"),
+            ("Song - Copy", "song"),
+            ("Song Kopie", "song"),
+            ("Song (1) (2)", "song"),
+            ("Song", "song"),
+            // echte Klammer-Zusaetze duerfen nicht verschwinden
+            ("Song (Live)", "song (live)"),
+            ("Song (Remix 2)", "song (remix 2)"),
+            ("Nocturne No. 2", "nocturne no. 2"),
+        ] {
+            assert_eq!(norm_title(raw, true), want, "norm_title({raw:?})");
+        }
+        // abgeschaltet bleibt der Titel unveraendert
+        assert_eq!(norm_title("Song (1)", false), "song (1)");
+        assert!(is_copy_name("/musik/track (1).flac"));
+        assert!(is_copy_name("/musik/track - Copy.flac"));
+        assert!(!is_copy_name("/musik/track.flac"));
+        assert!(!is_copy_name("/musik/track (Live).flac"));
+    }
+
+    #[test]
+    fn copy_suffix_duplicates_are_found_and_original_kept() {
+        let (env, music, _cfg) = fixture();
+        add_copy_pair(&env, &music);
+        let sh = Shared::new(env);
+        run(&sh, true);
+        assert_eq!(sh.stats.errors.load(Relaxed), 0);
+        assert!(music.join("g3.flac").exists(), "Original mit den besseren Tags bleibt");
+        assert!(!music.join("g3 (1).flac").exists(), "die (1)-Kopie wird geloescht");
+        assert_eq!(sh.stats.tags_lost.load(Relaxed), 1, "Kommentar nur in der Kopie -> Warnung");
+    }
+
+    #[test]
+    fn copy_suffix_detection_can_be_disabled() {
+        let (env, music, _cfg) = fixture();
+        add_copy_pair(&env, &music);
+        let sh = Shared::new(env);
+        sh.settings.lock().unwrap().strip_copy_suffix = false;
+        run(&sh, true);
+        assert!(music.join("g3 (1).flac").exists(), "ohne Normalisierung bleibt die Kopie liegen");
+        assert_eq!(sh.stats.tags_lost.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn tag_loss_can_block_the_deletion() {
+        let (env, music, _cfg) = fixture();
+        add_copy_pair(&env, &music);
+        let sh = Shared::new(env);
+        sh.settings.lock().unwrap().skip_on_tag_loss = true;
+        run(&sh, true);
+        assert!(music.join("g3 (1).flac").exists(), "Tag-Verlust verhindert das Loeschen");
+        assert_eq!(sh.stats.tags_lost.load(Relaxed), 1);
+        assert!(!music.join("g1.mp3").exists(), "andere Gruppen laufen normal weiter");
+    }
+
+    #[test]
+    fn better_tags_win_when_audio_quality_is_equal() {
+        let (env, music, _cfg) = fixture();
+        add_copy_pair(&env, &music);
+        // Die Kopie ist groesser und hat die hoehere Bitrate - trotzdem muss das
+        // besser getaggte Original gewinnen, weil Tags vor Bitrate/Groesse zaehlen.
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("UPDATE media_file SET size=99999, bit_rate=1200 WHERE id='flacCopy'", []).unwrap();
+        }
+        let sh = Shared::new(env);
+        run(&sh, true);
+        assert!(music.join("g3.flac").exists(), "besser getaggtes Original bleibt");
+        assert!(!music.join("g3 (1).flac").exists());
+    }
+
+    #[test]
+    fn audio_quality_still_beats_tags() {
+        let (env, music, _cfg) = fixture();
+        add_copy_pair(&env, &music);
+        // Die Kopie ist 24 bit - echte Audio-Qualitaet schlaegt die Tags,
+        // der Tag-Verlust wird aber protokolliert.
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("UPDATE media_file SET bit_depth=24 WHERE id='flacCopy'", []).unwrap();
+        }
+        let sh = Shared::new(env);
+        run(&sh, true);
+        assert!(music.join("g3 (1).flac").exists(), "24-bit-Datei bleibt");
+        assert!(!music.join("g3.flac").exists());
+        assert!(sh.stats.tags_lost.load(Relaxed) >= 1, "Genre/Liedtext-Verlust gemeldet");
     }
 
     #[test]

@@ -68,29 +68,56 @@ struct Since {
     since: Option<u64>,
 }
 
+/// Warnungen sind teuer (Dateisystem + history.json), deshalb maximal alle 15 Sekunden neu.
+fn warnings(app: &App) -> Vec<String> {
+    const TTL: i64 = 15;
+    let now = chrono::Utc::now().timestamp();
+    let mut c = app.warn_cache.lock().unwrap();
+    if c.0 + TTL > now {
+        return c.1.clone();
+    }
+    let mut w: Vec<String> = vec![];
+    if !std::path::Path::new(&app.env.db_path).is_file() {
+        w.push(format!(
+            "Navidrome-Datenbank nicht gefunden: {} – das Volume fuer /data muss den Navidrome-Datenordner enthalten.",
+            app.env.db_path
+        ));
+    }
+    if app.env.require_dryrun && !app.running.load(Relaxed) && !engine::recent_dry_run(&app.env) {
+        w.push("Fuer AUSFUEHREN ist zuerst ein vollstaendiger Dry-Run noetig (letzte 7 Tage).".into());
+    }
+    *c = (now, w.clone());
+    w
+}
+
 async fn status(State(app): State<App>, Query(q): Query<Since>) -> Json<serde_json::Value> {
     let (next, lines): (u64, Vec<(u64, String)>) = {
         let g = app.log.lock().unwrap();
         let since = q.since.unwrap_or(0);
         (g.0, g.1.iter().filter(|(i, _)| *i > since).cloned().collect())
     };
-    let mut warnings: Vec<String> = vec![];
-    if !std::path::Path::new(&app.env.db_path).is_file() {
-        warnings.push(format!(
-            "Navidrome-Datenbank nicht gefunden: {} – das Volume fuer /data muss den Navidrome-Datenordner enthalten.",
-            app.env.db_path
-        ));
-    }
-    if app.env.require_dryrun && !app.running.load(Relaxed) && !engine::recent_dry_run(&app.env) {
-        warnings.push("Fuer EXECUTE ist zuerst ein vollstaendiger DRY-RUN noetig (letzte 7 Tage).".into());
-    }
+    let running = app.running.load(Relaxed);
+    let stats = app.stats_json();
+    // Laufzeit, Durchsatz und geschaetzte Restzeit serverseitig – die UI muss nichts rechnen
+    let started = app.started_ts.load(Relaxed);
+    let ended = app.ended_ts.load(Relaxed);
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    // nach dem Lauf bleibt die Laufzeit stehen statt weiterzuzaehlen
+    let elapsed = if started == 0 { 0 } else { if ended > 0 { ended } else { now }.saturating_sub(started) };
+    let scanned = stats["scanned"].as_u64().unwrap_or(0);
+    let total = stats["total"].as_u64().unwrap_or(0);
+    let rate = if elapsed > 0 { scanned as f64 / elapsed as f64 } else { 0.0 };
+    let eta = if running && rate > 0.5 && total > scanned { Some(((total - scanned) as f64 / rate) as u64) } else { None };
     Json(json!({
         "version": VERSION,
-        "running": app.running.load(Relaxed),
+        "running": running,
         "execute": app.execute.load(Relaxed),
         "phase": *app.phase.lock().unwrap(),
-        "stats": app.stats_json(),
-        "warnings": warnings,
+        "stats": stats,
+        "elapsed": elapsed,
+        "rate": (rate * 10.0).round() / 10.0,
+        "eta": eta,
+        "warnings": warnings(&app),
         "next": next,
         "log": lines,
     }))
