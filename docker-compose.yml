@@ -18,6 +18,7 @@ services:
       - /mnt/tank/music:/music           # Musik, read-write (gleicher Pfad wie bei Navidrome)
       - ./dedupe/config:/config
       - ./dedupe/backups:/backups
+      - ./dedupe/trash:/trash              # Papierkorb, falls "verschieben statt loeschen" aktiv ist
     stop_grace_period: 120s
     labels:
       - com.centurylinklabs.watchtower.enable=true
