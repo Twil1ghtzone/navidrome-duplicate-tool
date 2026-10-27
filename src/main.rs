@@ -219,8 +219,8 @@ async fn backup_now(State(app): State<App>) -> impl IntoResponse {
     }
 }
 
-async fn healthz() -> &'static str {
-    "ok"
+async fn healthz() -> String {
+    format!("ok navidrome-dedupe {VERSION}")
 }
 
 async fn shutdown_signal() {

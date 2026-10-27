@@ -86,6 +86,11 @@ In der UI einstellbar: Toleranz, Limit pro Lauf, Exclude-Ordner, Schutz-Begriffe
 Kopie-Erkennung, Tag-Verlust-Sperre, Playlist-Verhalten, MusicBrainz-Pruefung und Tracknummer-Pruefung.
 
 ## Oberflaeche
+Die laufende Programmversion steht neben dem Namen im Seitenkopf und im Browser-Tab-Titel.
+Meldet der Server nach einem Container-Update eine andere Version als die geladene Seite, wird das Feld
+hervorgehoben und laedt auf Klick neu. `GET /healthz` antwortet mit `ok navidrome-dedupe <version>`,
+`GET /api/status` enthaelt die Version als Feld `version`.
+
 Bewusst schlicht: eine HTML-Seite ohne Framework, ohne Animationen, in Hell und Dunkel.
 Oben eine Statuszeile mit Phase, Fortschritt, Durchsatz in Titeln pro Sekunde, Laufzeit und geschaetzter Restzeit
 (serverseitig berechnet), darunter alle Zaehler als dichte Liste. Das Protokoll zeigt jede Entscheidung mit

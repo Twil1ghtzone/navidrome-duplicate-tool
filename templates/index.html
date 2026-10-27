@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Navidrome Duplicate Tool</title>
+<title>Navidrome Duplicate Tool v{{VERSION}}</title>
 <style>
   /* Neutral, ohne Effekte: keine Schatten, keine Animationen, keine Rundungen. */
   :root {
@@ -25,6 +25,8 @@
        color:var(--muted); margin:0 0 10px; }
   header { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; margin-bottom:14px;
            padding-bottom:10px; border-bottom:1px solid var(--line); }
+  header .ver { font:12px var(--mono); border:1px solid var(--line); padding:1px 6px; color:var(--fg); }
+  header .ver.old { border-color:var(--warn); color:var(--warn); cursor:pointer; }
   header .v { color:var(--muted); font:12px var(--mono); }
   header .st { margin-left:auto; font:12px var(--mono); color:var(--muted); }
   header .st.run { color:var(--fg); font-weight:600; }
@@ -93,7 +95,8 @@
 <main>
 <header>
   <h1>Navidrome Duplicate Tool</h1>
-  <span class="v">v{{VERSION}} · behalten: {{KEEP}} · entfernen: {{DEL}} · DB: {{DB}}</span>
+  <span class="ver" id="ver" title="laufende Programmversion">v{{VERSION}}</span>
+  <span class="v">behalten: {{KEEP}} · entfernen: {{DEL}} · DB: {{DB}}</span>
   <span class="st" id="st">verbinde …</span>
 </header>
 <div id="warnings"></div>
@@ -197,6 +200,7 @@ const NUMS = ["scanned","candidates","duplicates","same_format","planned","delet
               "playlists","tags_lost","protected","excluded","mismatch","errors"];
 const MAXLINES = 800;
 let since = 0, running = false, idleTicks = 0, last = {};
+const PAGE_VERSION = "{{VERSION}}";
 
 const fmt = n => Number(n || 0).toLocaleString("de-DE");
 function bytes(b) { const u = ["B","KB","MB","GB","TB"]; let i = 0; b = Number(b) || 0;
@@ -224,6 +228,13 @@ async function poll() {
   try {
     const d = await (await api("/api/status?since=" + since)).json();
     running = d.running;
+    if (d.version && d.version !== PAGE_VERSION && !last.upd) {
+      last.upd = true;
+      const v = $("ver");
+      v.textContent = "v" + d.version + " – neu laden";
+      v.className = "ver old";
+      v.onclick = () => location.reload();
+    }
     const st = $("st");
     st.textContent = (d.running ? "läuft · " : "bereit · ") + d.phase + (d.execute ? " · AUSFÜHREN" : " · Dry-Run");
     st.className = "st" + (d.running ? " run" : "");
