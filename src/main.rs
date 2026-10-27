@@ -55,6 +55,18 @@ async fn auth(State(app): State<App>, req: Request, next: Next) -> Response {
         .into_response()
 }
 
+/// Nichts aus diesem Dienst darf zwischengespeichert werden. Sonst zeigt der Browser
+/// (oder ein Reverse-Proxy) nach einem Container-Update weiter die alte Oberflaeche,
+/// obwohl laengst eine neue Version laeuft.
+async fn no_cache(req: Request, next: Next) -> Response {
+    let mut res = next.run(req).await;
+    let h = res.headers_mut();
+    h.insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store, no-cache, must-revalidate"));
+    h.insert(header::PRAGMA, header::HeaderValue::from_static("no-cache"));
+    h.insert(header::EXPIRES, header::HeaderValue::from_static("0"));
+    res
+}
+
 async fn index(State(app): State<App>) -> Html<String> {
     let page = include_str!("../templates/index.html")
         .replace("{{MODE_EXECUTE}}", if app.execute.load(Relaxed) { "true" } else { "false" })
@@ -299,7 +311,11 @@ async fn main() {
         .route("/api/history", get(history))
         .route("/api/backup", post(backup_now))
         .layer(middleware::from_fn_with_state(app.clone(), auth));
-    let router = Router::new().route("/healthz", get(healthz)).merge(protected).with_state(app.clone());
+    let router = Router::new()
+        .route("/healthz", get(healthz))
+        .merge(protected)
+        .layer(middleware::from_fn(no_cache))
+        .with_state(app.clone());
 
     let listener = tokio::net::TcpListener::bind(&bind).await.unwrap_or_else(|e| {
         eprintln!("bind {bind}: {e}");
