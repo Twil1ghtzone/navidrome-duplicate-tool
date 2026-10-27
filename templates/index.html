@@ -38,9 +38,17 @@
   .ctl { display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; }
   label.r { font-size:13px; cursor:pointer; }
   button, .btn { font:13px inherit; padding:5px 12px; border:1px solid var(--line);
-                 background:var(--bg); color:var(--fg); cursor:pointer; text-decoration:none; }
+                 background:var(--bg); color:var(--fg); cursor:pointer; text-decoration:none;
+                 user-select:none; }
   button.go { border-color:var(--accent); font-weight:600; }
+  button:hover:not(:disabled), .btn:hover { border-color:var(--accent); }
+  button:active:not(:disabled), .btn:active { background:var(--line); transform:translateY(1px); }
+  button:focus-visible, .btn:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+    outline:2px solid var(--accent); outline-offset:1px; }
   button:disabled { color:var(--muted); cursor:not-allowed; }
+  button.busy { color:var(--muted); }
+  button.done { border-color:var(--ok); color:var(--ok); }
+  button.fail { border-color:var(--err); color:var(--err); }
   .hint { color:var(--muted); font-size:12px; }
 
   /* Statusleiste */
@@ -103,6 +111,15 @@
 
 <section>
   <h2>Lauf</h2>
+  <div class="ctl" style="margin-bottom:8px">
+    <label class="fl" style="margin:0">Suchverfahren</label>
+    <select id="mode">
+      <option value="both">beides: Dateiinhalt + Navidrome-Datenbank (gründlich)</option>
+      <option value="content">nur Dateiinhalt (findet identische Dateien überall)</option>
+      <option value="db">nur Navidrome-Datenbank (schnell, Album + Titel)</option>
+    </select>
+    <span class="hint" id="modehint"></span>
+  </div>
   <div class="ctl">
     <label class="r"><input type="radio" name="mode" value="dry" checked> Dry-Run (ändert nichts)</label>
     <label class="r"><input type="radio" name="mode" value="exec"> Ausführen (löscht Dateien)</label>
@@ -114,9 +131,12 @@
   <div class="line" id="prog">–</div>
   <div class="nums">
     <div><span>Titel gescannt</span><b id="scanned">0</b></div>
+    <div><span>Dateien im Dateisystem</span><b id="files">0</b></div>
+    <div><span>nicht in Navidrome</span><b id="unknown">0</b></div>
     <div><span>Kandidaten-Gruppen</span><b id="candidates">0</b></div>
     <div><span>Duplikate erkannt</span><b id="duplicates">0</b></div>
     <div><span>davon gleiches Format</span><b id="same_format">0</b></div>
+    <div><span>davon inhaltlich identisch</span><b id="exact">0</b></div>
     <div><span>zum Löschen vorgemerkt</span><b id="planned">0</b></div>
     <div><span>Dateien gelöscht</span><b id="deleted">0</b></div>
     <div><span>Speicher</span><b id="freed">0 B</b></div>
@@ -174,9 +194,12 @@
       <label class="chk"><input type="checkbox" id="require_mbz_match"> nicht löschen bei unterschiedlicher MusicBrainz-Recording-ID</label>
       <label class="chk"><input type="checkbox" id="require_same_track"> gleiche Tracknummer verlangen (bei gleichem Format)</label>
       <label class="chk"><input type="checkbox" id="playlist_keep_duplicates"> Playlist-Einträge immer umbiegen, auch wenn der Titel dadurch doppelt vorkommt (Playlist wird nie kürzer)</label>
+      <label class="chk"><input type="checkbox" id="verify_bytes"> Treffer ohne FLAC-Prüfsumme vor dem Löschen Byte für Byte vergleichen</label>
+      <label class="chk"><input type="checkbox" id="report_unknown"> Dateien auflisten, die Navidrome nicht kennt</label>
+      <label class="chk"><input type="checkbox" id="use_trash"> in den Papierkorb verschieben statt löschen (Ordner /trash)</label>
     </div>
   </div>
-  <p style="margin:12px 0 0"><button onclick="saveCfg()">Speichern</button><span class="msg" id="cfgmsg"></span></p>
+  <p style="margin:12px 0 0"><button onclick="saveCfg(this)">Speichern</button><span class="msg" id="cfgmsg"></span></p>
 </section>
 
 <section>
@@ -187,7 +210,7 @@
 
 <section>
   <h2>Backups</h2>
-  <p style="margin:0 0 10px"><button onclick="backupNow()">Backup jetzt erstellen</button><span class="msg" id="bkmsg"></span></p>
+  <p style="margin:0 0 10px"><button onclick="backupNow(this)">Backup jetzt erstellen</button><span class="msg" id="bkmsg"></span></p>
   <table id="bk"><thead><tr><th>Datei in /backups</th><th>Größe</th></tr></thead><tbody></tbody></table>
   <p class="hint" id="nobk"></p>
 </section>
@@ -196,8 +219,8 @@
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
-const NUMS = ["scanned","candidates","duplicates","same_format","planned","deleted","annotations",
-              "playlists","tags_lost","protected","excluded","mismatch","errors"];
+const NUMS = ["scanned","files","unknown","candidates","duplicates","same_format","exact","planned",
+              "deleted","annotations","playlists","tags_lost","protected","excluded","mismatch","errors"];
 const MAXLINES = 800;
 let since = 0, running = false, idleTicks = 0, last = {};
 const PAGE_VERSION = "{{VERSION}}";
@@ -222,6 +245,25 @@ async function api(path, opt) {
 }
 function cell(tr, text, mono) { const td = document.createElement("td");
   if (mono) td.className = "n"; td.textContent = text; tr.appendChild(td); }
+
+/* Jeder Knopf zeigt, dass er etwas tut, und danach kurz, ob es geklappt hat. */
+async function press(btn, label, job) {
+  if (btn.dataset.busy) return;
+  const text = btn.dataset.label || btn.textContent;
+  btn.dataset.label = text; btn.dataset.busy = "1";
+  btn.disabled = true; btn.className = (btn.dataset.base || btn.className) + " busy";
+  btn.dataset.base = btn.dataset.base || btn.className.replace(" busy", "");
+  btn.textContent = label;
+  let ok = true, err = "";
+  try { await job(); } catch (e) { ok = false; err = e.message; }
+  btn.textContent = ok ? "✓ " + text : "✗ " + text;
+  btn.className = btn.dataset.base + (ok ? " done" : " fail");
+  if (!ok) alert(err);
+  setTimeout(() => {
+    btn.textContent = text; btn.className = btn.dataset.base;
+    btn.disabled = false; delete btn.dataset.busy;
+  }, ok ? 1400 : 2500);
+}
 
 /* Status */
 async function poll() {
@@ -258,7 +300,8 @@ async function poll() {
     if (d.eta != null) parts.push("Rest ca. " + hms(d.eta));
     $("prog").textContent = parts.join(" · ");
 
-    $("start").disabled = d.running; $("stop").disabled = !d.running;
+    if (!$("start").dataset.busy) $("start").disabled = d.running;
+    if (!$("stop").dataset.busy) $("stop").disabled = !d.running;
 
     if (d.log && d.log.length) {
       const log = $("log");
@@ -297,18 +340,20 @@ function setLevel() { $("log").className = $("level").value; }
 async function startRun() {
   const exec = document.querySelector("input[name=mode]:checked").value === "exec";
   if (exec) {
-    const v = (prompt("Dateien werden unwiderruflich gelöscht (vorher wird ein Datenbank-Backup erstellt).\nZur Bestätigung LÖSCHEN eintippen:") || "").trim().toUpperCase();
+    const hint = $("use_trash").checked ? "Dateien werden in den Papierkorb verschoben" : "Dateien werden unwiderruflich gelöscht";
+    const v = (prompt(hint + " (vorher wird ein Datenbank-Backup erstellt).\nZur Bestätigung LÖSCHEN eintippen:") || "").trim().toUpperCase();
     if (v !== "LOESCHEN" && v !== "LÖSCHEN") return;
   }
-  try {
+  await press($("start"), "startet …", async () => {
     await api("/api/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ execute: exec }) });
-    $("log").replaceChildren();
-  } catch (e) { alert("Start nicht möglich: " + e.message); }
+    $("log").replaceChildren(); since = 0;
+  });
 }
-async function stopRun() { await api("/api/stop", { method: "POST" }); }
+async function stopRun() { await press($("stop"), "stoppt …", () => api("/api/stop", { method: "POST" })); }
 
 /* Einstellungen */
-const FLAGS = ["dedupe_flac","strip_copy_suffix","skip_on_tag_loss","require_mbz_match","require_same_track","playlist_keep_duplicates"];
+const FLAGS = ["dedupe_flac","strip_copy_suffix","skip_on_tag_loss","require_mbz_match","require_same_track",
+               "playlist_keep_duplicates","verify_bytes","report_unknown","use_trash"];
 const lines = t => t.split("\n").map(x => x.trim()).filter(Boolean);
 async function loadCfg() {
   const c = await (await api("/api/config")).json();
@@ -317,18 +362,29 @@ async function loadCfg() {
   $("max_delete").value = c.max_delete;
   $("duration_tol").value = c.duration_tol;
   for (const k of FLAGS) $(k).checked = !!c[k];
+  $("mode").value = c.mode || "both";
+  modeHint();
 }
-async function saveCfg() {
+const MODE_HINT = {
+  both: "läuft erst über die Dateien, dann über die Datenbank – findet am meisten",
+  content: "liest jede Datei an (bei FLAC nur ~50 Byte) und vergleicht das Audio selbst",
+  db: "nutzt nur Navidromes Album- und Titelangaben, rührt das Dateisystem nicht an"
+};
+function modeHint() { $("modehint").textContent = MODE_HINT[$("mode").value] || ""; }
+$("mode").addEventListener("change", modeHint);
+async function saveCfg(btn) {
   const body = {
     excludes: lines($("excludes").value), keywords: lines($("keywords").value),
     max_delete: Math.max(0, parseInt($("max_delete").value || "0", 10)),
-    duration_tol: parseFloat($("duration_tol").value || "3")
+    duration_tol: parseFloat($("duration_tol").value || "3"),
+    mode: $("mode").value
   };
   for (const k of FLAGS) body[k] = $(k).checked;
-  try {
+  $("cfgmsg").textContent = "";
+  await press(btn, "speichert …", async () => {
     await api("/api/config", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-    $("cfgmsg").textContent = "gespeichert";
-  } catch (e) { $("cfgmsg").textContent = "Fehler: " + e.message; }
+    $("cfgmsg").textContent = "gespeichert um " + new Date().toLocaleTimeString("de-DE");
+  });
 }
 
 /* Verlauf und Backups */
@@ -353,10 +409,13 @@ async function loadHistory() {
     $("nobk").textContent = d.backups.length ? "" : "Noch keine Backups.";
   } catch (e) {}
 }
-async function backupNow() {
-  $("bkmsg").textContent = "läuft …";
-  try { await api("/api/backup", { method: "POST" }); $("bkmsg").textContent = "erstellt"; loadHistory(); }
-  catch (e) { $("bkmsg").textContent = "Fehler: " + e.message; }
+async function backupNow(btn) {
+  $("bkmsg").textContent = "";
+  await press(btn, "sichert …", async () => {
+    await api("/api/backup", { method: "POST" });
+    $("bkmsg").textContent = "Backup erstellt";
+    loadHistory();
+  });
 }
 
 if ({{MODE_EXECUTE}}) document.querySelector("input[value=exec]").checked = true;

@@ -38,6 +38,7 @@ pub enum MatchMode {
 pub struct Env {
     pub db_path: String,
     pub backup_dir: PathBuf,
+    pub trash_dir: PathBuf,
     pub config_dir: PathBuf,
     pub path_map: Option<(String, String)>,
     pub keep_exts: Vec<String>,
@@ -105,6 +106,7 @@ impl Env {
         Ok(Env {
             db_path: var("NAVIDROME_DB", "/data/navidrome.db"),
             backup_dir: var("BACKUP_DIR", "/backups").into(),
+            trash_dir: var("TRASH_DIR", "/trash").into(),
             config_dir,
             path_map,
             keep_exts: list("KEEP_EXTS", "flac"),
@@ -149,6 +151,14 @@ pub struct Settings {
     /// Haette die zu loeschende Datei Tag-Felder, die der behaltenen fehlen,
     /// wird die Gruppe uebersprungen statt die Tags zu verlieren.
     pub skip_on_tag_loss: bool,
+    /// Suchverfahren: "db" (Navidrome-Gruppierung), "content" (Dateiinhalt) oder "both".
+    pub mode: String,
+    /// Bei nicht-FLAC-Treffern den Audiobereich zusaetzlich Byte fuer Byte vergleichen.
+    pub verify_bytes: bool,
+    /// Beim Bibliotheks-Scan melden, welche Dateien Navidrome nicht kennt.
+    pub report_unknown: bool,
+    /// Geloeschte Dateien in den Papierkorb verschieben statt entfernen.
+    pub use_trash: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -164,6 +174,10 @@ impl Default for Settings {
             require_same_track: true,
             strip_copy_suffix: true,
             skip_on_tag_loss: false,
+            mode: "both".into(),
+            verify_bytes: true,
+            report_unknown: true,
+            use_trash: false,
         }
     }
 }
@@ -178,6 +192,9 @@ pub struct Stats {
     pub duplicates: AtomicU64,
     pub same_format: AtomicU64,
     pub planned: AtomicU64,
+    pub files: AtomicU64,
+    pub unknown: AtomicU64,
+    pub exact: AtomicU64,
     pub tags_lost: AtomicU64,
     pub protected: AtomicU64,
     pub excluded: AtomicU64,
@@ -250,6 +267,8 @@ impl Shared {
             "total": st.total.load(Relaxed), "scanned": st.scanned.load(Relaxed),
             "candidates": st.candidates.load(Relaxed), "duplicates": st.duplicates.load(Relaxed),
             "same_format": st.same_format.load(Relaxed), "planned": st.planned.load(Relaxed),
+            "files": st.files.load(Relaxed), "unknown": st.unknown.load(Relaxed),
+            "exact": st.exact.load(Relaxed),
             "tags_lost": st.tags_lost.load(Relaxed),
             "protected": st.protected.load(Relaxed), "excluded": st.excluded.load(Relaxed),
             "mismatch": st.mismatch.load(Relaxed), "deleted": st.deleted.load(Relaxed),
@@ -258,23 +277,24 @@ impl Shared {
             "errors": st.errors.load(Relaxed)
         })
     }
-    fn phase(&self, p: &str) {
+    pub fn phase(&self, p: &str) {
         *self.phase.lock().unwrap() = p.to_string();
     }
     fn reset_stats(&self) {
         let s = &self.stats;
         for a in [&s.total, &s.scanned, &s.candidates, &s.duplicates, &s.same_format, &s.planned,
+                  &s.files, &s.unknown, &s.exact,
                   &s.tags_lost, &s.protected, &s.excluded, &s.mismatch, &s.deleted, &s.bytes_freed,
                   &s.annotations, &s.playlists, &s.errors] {
             a.store(0, Relaxed);
         }
     }
     /// Abbruch durch Nutzer oder Signal – dann wird NICHTS mehr angewendet.
-    fn halt(&self) -> bool {
+    pub fn halt(&self) -> bool {
         self.stop.load(Relaxed) || self.shutdown.load(Relaxed)
     }
     /// Scan-Ende: Abbruch oder Lauf-Limit.
-    fn scan_done(&self) -> bool {
+    pub fn scan_done(&self) -> bool {
         self.halt() || self.limit.load(Relaxed)
     }
 }
@@ -297,7 +317,7 @@ pub fn save_settings(env: &Env, s: &Settings) -> std::io::Result<()> {
 
 // ───────────────────────── Schema-Erkennung ─────────────────────────
 
-fn cols(c: &Connection, table: &str) -> Vec<String> {
+pub fn cols(c: &Connection, table: &str) -> Vec<String> {
     let mut st = match c.prepare(&format!("PRAGMA table_info(\"{}\")", table.replace('"', ""))) {
         Ok(s) => s,
         Err(_) => return vec![],
@@ -332,13 +352,13 @@ const TAG_FIELDS: &[(char, &str, &str, bool)] = &[
     ('T', "tags", "weitere Tags", false),
 ];
 
-fn tag_label(flag: char) -> &'static str {
+pub fn tag_label(flag: char) -> &'static str {
     TAG_FIELDS.iter().find(|(f, ..)| *f == flag).map(|(_, _, l, _)| *l).unwrap_or("?")
 }
 
 /// Welche Tabellen/Spalten hat diese Navidrome-Datenbank?
 pub struct Schema {
-    mf: HashSet<String>,
+    pub mf: HashSet<String>,
     ann: HashSet<String>,
     playlist: HashSet<String>,
     /// Lesezeichen-Spalten ausser dem Schluessel (user_id, item_id, item_type)
@@ -347,7 +367,7 @@ pub struct Schema {
 }
 
 impl Schema {
-    fn load(c: &Connection) -> Result<Schema, String> {
+    pub fn load(c: &Connection) -> Result<Schema, String> {
         let mut st = c
             .prepare("SELECT name FROM sqlite_master WHERE type IN ('table','view')")
             .map_err(|e| e.to_string())?;
@@ -372,20 +392,20 @@ impl Schema {
             tables,
         })
     }
-    fn mf(&self, c: &str) -> bool {
+    pub fn mf(&self, c: &str) -> bool {
         self.mf.contains(c)
     }
-    fn table(&self, t: &str) -> bool {
+    pub fn table(&self, t: &str) -> bool {
         self.tables.contains(t)
     }
     /// Spaltenausdruck fuer das SELECT: existiert die Spalte nicht, liefert `fallback`.
-    fn expr(&self, col: &str, fallback: &str) -> String {
+    pub fn expr(&self, col: &str, fallback: &str) -> String {
         if self.mf(col) { col.to_string() } else { fallback.to_string() }
     }
     /// Ein kompakter SQL-Ausdruck, der pro Zeile eine Zeichenkette mit einem Zeichen
     /// je Tag-Feld liefert ("-" = leer). So kostet die Tag-Pruefung nur ~20 Byte pro Titel,
     /// statt alle Tag-Spalten zu uebertragen.
-    fn tag_flags_expr(&self) -> String {
+    pub fn tag_flags_expr(&self) -> String {
         let parts: Vec<String> = TAG_FIELDS
             .iter()
             .filter(|(_, col, _, _)| self.mf(col))
@@ -435,7 +455,7 @@ const COPY_SUFFIXES: &[&str] = &[
 ];
 
 /// Gruppierschluessel aus einem Titel. `strip=false` gibt den Titel unveraendert (nur getrimmt) zurueck.
-fn norm_title(t: &str, strip: bool) -> String {
+pub fn norm_title(t: &str, strip: bool) -> String {
     let mut s = t.trim().to_lowercase();
     if !strip {
         return s;
@@ -459,7 +479,7 @@ fn norm_title(t: &str, strip: bool) -> String {
 }
 
 /// Sieht der Dateiname nach einer Kopie aus ("track (1).flac")?
-fn is_copy_name(path: &str) -> bool {
+pub fn is_copy_name(path: &str) -> bool {
     let stem = Path::new(path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     let stem = stem.trim().to_lowercase();
     !stem.is_empty() && norm_title(&stem, true) != stem
@@ -488,15 +508,80 @@ struct Row {
     track: i64,
 }
 
+/// Anzahl gesetzter Tag-Felder in einer Flag-Zeichenkette.
+pub fn tag_score(flags: &str) -> i64 {
+    flags.chars().filter(|c| *c != '-').count() as i64
+}
+
+/// Tag-Felder, die `a` hat und `b` fehlen.
+pub fn tags_missing(a: &str, b: &str) -> Vec<char> {
+    let have: Vec<char> = b.chars().filter(|c| *c != '-').collect();
+    a.chars().filter(|c| *c != '-' && !have.contains(c)).collect()
+}
+
 impl Row {
     /// Anzahl gesetzter Tag-Felder.
     fn tag_score(&self) -> i64 {
-        self.tag_flags.chars().filter(|c| *c != '-').count() as i64
+        tag_score(&self.tag_flags)
     }
     /// Tag-Felder, die diese Datei hat und `other` fehlen.
     fn tags_missing_in(&self, other: &Row) -> Vec<char> {
-        let have: Vec<char> = other.tag_flags.chars().filter(|c| *c != '-').collect();
-        self.tag_flags.chars().filter(|c| *c != '-' && !have.contains(c)).collect()
+        tags_missing(&self.tag_flags, &other.tag_flags)
+    }
+}
+
+/// Schreibt die Plan-Datei und verhindert, dass dieselbe Datei doppelt geplant
+/// oder eine bereits zum Loeschen vorgemerkte Datei als "behalten" eingetragen wird.
+pub struct Planner {
+    plan: BufWriter<fs::File>,
+    pub planned: u64,
+    doomed: HashSet<String>,
+}
+
+impl Planner {
+    pub fn new(file: fs::File) -> Result<Planner, String> {
+        let mut plan = BufWriter::new(file);
+        writeln!(plan, "#keeper_id\tkeeper_path\tdel_id\tdel_path\tdel_size\treason").map_err(|e| e.to_string())?;
+        Ok(Planner { plan, planned: 0, doomed: HashSet::new() })
+    }
+
+    /// Merkt eine Loeschung vor. Gibt false zurueck, wenn sie verworfen wurde.
+    pub fn add(
+        &mut self,
+        sh: &Shared,
+        keeper_id: &str,
+        keeper_path: &str,
+        del_id: &str,
+        del_path: &str,
+        size: i64,
+        reason: &str,
+    ) -> Result<bool, String> {
+        if keeper_path == del_path || del_path.is_empty() {
+            return Ok(false);
+        }
+        if self.doomed.contains(del_path) {
+            return Ok(false); // schon vorgemerkt, z. B. von einem anderen Suchverfahren
+        }
+        if self.doomed.contains(keeper_path) {
+            // Die Datei, die wir behalten wollten, wird selbst geloescht – niemals beides.
+            sh.stats.errors.fetch_add(1, Relaxed);
+            sh.log(format!("SKIP (zu behaltende Datei ist selbst zum Loeschen vorgemerkt): {del_path}"));
+            return Ok(false);
+        }
+        writeln!(
+            self.plan,
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            esc(keeper_id), esc(keeper_path), esc(del_id), esc(del_path), size.max(0), esc(reason)
+        )
+        .map_err(|e| format!("Plan-Datei schreiben: {e}"))?;
+        self.doomed.insert(del_path.to_string());
+        self.planned += 1;
+        sh.stats.planned.fetch_add(1, Relaxed);
+        Ok(true)
+    }
+
+    pub fn flush(&mut self) -> Result<(), String> {
+        self.plan.flush().map_err(|e| e.to_string())
     }
 }
 
@@ -728,6 +813,13 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
     fs::create_dir_all(&rdir).map_err(|e| format!("Report-Ordner {}: {e}", rdir.display()))?;
     let plan_path = rdir.join(format!("{ts}-{}-plan.tsv", if execute { "execute" } else { "dryrun" }));
 
+    let mode = settings.mode.to_lowercase();
+    let (do_content, do_db) = match mode.as_str() {
+        "db" => (false, true),
+        "content" => (true, false),
+        _ => (true, true),
+    };
+
     let planned = {
         let reader = open(env, true)?;
         let schema = Schema::load(&reader)?;
@@ -738,13 +830,29 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
             schema.table("scrobbles"), schema.table("scrobble_buffer"), schema.table("share"),
             schema.table("playlist_tracks")
         ));
+        sh.log(format!(
+            "Suchverfahren: {}",
+            match (do_content, do_db) {
+                (true, true) => "Dateiinhalt + Navidrome-Datenbank",
+                (true, false) => "nur Dateiinhalt",
+                _ => "nur Navidrome-Datenbank",
+            }
+        ));
+        // Fortschrittsmassstab: Navidromes Titelzahl, pro aktivem Suchverfahren einmal
+        let media_count = count_relevant(&reader, &schema, &env.keep_exts, &env.delete_exts, &same_exts)?;
+        let phases = do_content as u64 + do_db as u64;
+        sh.stats.total.store(media_count * phases.max(1), Relaxed);
+        sh.log(format!("{media_count} relevante Titel in Navidrome"));
         sh.log(format!("Report/Plan: {}", plan_path.display()));
-        let plan = fs::File::create(&plan_path).map_err(|e| format!("Plan-Datei: {e}"))?;
-        let mut plan = BufWriter::new(plan);
-        writeln!(plan, "#keeper_id\tkeeper_path\tdel_id\tdel_path\tdel_size\treason").map_err(|e| e.to_string())?;
-        let n = scan(sh, &reader, &schema, &settings, &libs, &same_exts, &mut plan)?;
-        plan.flush().map_err(|e| e.to_string())?;
-        n
+        let mut planner = Planner::new(fs::File::create(&plan_path).map_err(|e| format!("Plan-Datei: {e}"))?)?;
+        if do_content && !sh.scan_done() {
+            crate::content::scan(sh, env, &reader, &schema, &settings, &libs, &same_exts, &mut planner)?;
+        }
+        if do_db && !sh.scan_done() {
+            scan(sh, &reader, &schema, &settings, &libs, &same_exts, &mut planner)?;
+        }
+        planner.flush()?;
+        planner.planned
     }; // Reader hier geschlossen: ab jetzt blockiert keine Lese-Transaktion den WAL-Checkpoint
 
     sh.log(format!("Plan fertig: {planned} Loeschungen vorgemerkt"));
@@ -766,8 +874,35 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
     let bk = backup(sh, &w)?;
     sh.log(format!("Backup erstellt: {}", bk.display()));
     sh.phase("uebertrage + loesche");
+    let trash = if settings.use_trash {
+        let dir = env.trash_dir.join(&ts);
+        fs::create_dir_all(&dir).map_err(|e| format!("Papierkorb {}: {e}", dir.display()))?;
+        sh.log(format!("Papierkorb aktiv: {} (dort liegen die entfernten Dateien)", dir.display()));
+        Some(dir)
+    } else {
+        None
+    };
     let applied = rdir.join(format!("{ts}-execute-applied.tsv"));
-    apply(sh, &mut w, &schema, &settings, &plan_path, &applied)
+    apply(sh, &mut w, &schema, &settings, trash.as_deref(), &plan_path, &applied)
+}
+
+/// Zahl der Titel, die ueberhaupt in Frage kommen – dient als Massstab fuer den Fortschritt.
+fn count_relevant(
+    reader: &Connection,
+    schema: &Schema,
+    keep: &[String],
+    del: &[String],
+    same: &[String],
+) -> Result<u64, String> {
+    let mut union: Vec<String> = keep.iter().chain(del.iter()).chain(same.iter()).cloned().collect();
+    union.sort();
+    union.dedup();
+    let list = union.iter().map(|e| format!("'{e}'")).collect::<Vec<_>>().join(",");
+    let missing = if schema.mf("missing") { "missing=0 AND " } else { "" };
+    let n: i64 = reader
+        .query_row(&format!("SELECT count(*) FROM media_file WHERE {missing}lower(suffix) IN ({list})"), [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    Ok(n.max(0) as u64)
 }
 
 fn libraries(sh: &Shared, reader: &Connection) -> Result<HashMap<i64, String>, String> {
@@ -802,8 +937,8 @@ fn scan(
     settings: &Settings,
     libs: &HashMap<i64, String>,
     same_exts: &[String],
-    plan: &mut BufWriter<fs::File>,
-) -> Result<u64, String> {
+    planner: &mut Planner,
+) -> Result<(), String> {
     let env = &sh.env;
     let ext_sql = |v: &[String]| v.iter().map(|e| format!("'{e}'")).collect::<Vec<_>>().join(",");
     let mut union: Vec<String> = env.keep_exts.iter().chain(env.delete_exts.iter()).chain(same_exts.iter()).cloned().collect();
@@ -812,12 +947,6 @@ fn scan(
     let all_exts = ext_sql(&union);
 
     let missing = if schema.mf("missing") { "missing=0 AND " } else { "" };
-    sh.phase("zaehle Titel");
-    let total: i64 = reader
-        .query_row(&format!("SELECT count(*) FROM media_file WHERE {missing}lower(suffix) IN ({all_exts})"), [], |r| r.get(0))
-        .map_err(|e| e.to_string())?;
-    sh.stats.total.store(total as u64, Relaxed);
-    sh.log(format!("{total} relevante Dateien ({all_exts})"));
 
     // Sortier-/Gruppierschluessel: identischer Ausdruck in SELECT und ORDER BY
     let ot = schema.expr("order_title", "lower(title)");
@@ -840,7 +969,7 @@ fn scan(
         flags = schema.tag_flags_expr(),
     );
 
-    let mut ctx = Ctx { sh, env, same_exts: same_exts.to_vec(), settings: settings.clone(), libs: libs.clone(), plan, planned: 0 };
+    let mut ctx = Ctx { sh, env, same_exts: same_exts.to_vec(), settings: settings.clone(), libs: libs.clone(), planner };
     sh.phase("scanne und plane");
 
     let mut stmt = reader.prepare(&sql).map_err(|e| format!("Abfrage vorbereiten: {e}"))?;
@@ -891,7 +1020,7 @@ fn scan(
     if !sh.scan_done() {
         ctx.group(group)?;
     }
-    Ok(ctx.planned)
+    Ok(())
 }
 
 struct Ctx<'a, 'p> {
@@ -900,29 +1029,28 @@ struct Ctx<'a, 'p> {
     same_exts: Vec<String>,
     settings: Settings,
     libs: HashMap<i64, String>,
-    plan: &'p mut BufWriter<fs::File>,
-    planned: u64,
+    planner: &'p mut Planner,
 }
 
-fn map_root(env: &Env, root: &str) -> String {
+pub fn map_root(env: &Env, root: &str) -> String {
     match &env.path_map {
         Some((from, to)) if root.starts_with(from.as_str()) => format!("{to}{}", &root[from.len()..]),
         _ => root.to_string(),
     }
 }
 
-fn norm(p: &str) -> String {
+pub fn norm(p: &str) -> String {
     p.replace('\\', "/").to_lowercase()
 }
 
 /// Dateikennung, um Hardlinks/Bind-Mounts auf dieselbe Datei zu erkennen.
 #[cfg(unix)]
-fn file_id(p: &Path) -> Option<(u64, u64)> {
+pub fn file_id(p: &Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     fs::metadata(p).ok().map(|m| (m.dev(), m.ino()))
 }
 #[cfg(not(unix))]
-fn file_id(_p: &Path) -> Option<(u64, u64)> {
+pub fn file_id(_p: &Path) -> Option<(u64, u64)> {
     None
 }
 
@@ -965,21 +1093,16 @@ impl<'a, 'p> Ctx<'a, 'p> {
          std::cmp::Reverse(r.id.clone()))
     }
 
-    fn write_plan(&mut self, keeper: &Row, kpath: &Path, d: &Row, dpath: &Path, reason: &str) -> Result<(), String> {
-        writeln!(
-            self.plan,
-            "{}\t{}\t{}\t{}\t{}\t{}",
-            esc(&keeper.id),
-            esc(&kpath.to_string_lossy()),
-            esc(&d.id),
-            esc(&dpath.to_string_lossy()),
-            d.size.max(0),
-            esc(reason)
+    fn write_plan(&mut self, keeper: &Row, kpath: &Path, d: &Row, dpath: &Path, reason: &str) -> Result<bool, String> {
+        self.planner.add(
+            self.sh,
+            &keeper.id,
+            &kpath.to_string_lossy(),
+            &d.id,
+            &dpath.to_string_lossy(),
+            d.size,
+            reason,
         )
-        .map_err(|e| format!("Plan-Datei schreiben: {e}"))?;
-        self.planned += 1;
-        self.sh.stats.planned.fetch_add(1, Relaxed);
-        Ok(())
     }
 
     fn group(&mut self, g: Vec<Row>) -> Result<(), String> {
@@ -1101,6 +1224,9 @@ impl<'a, 'p> Ctx<'a, 'p> {
                     d.path
                 ));
             }
+            if !self.write_plan(&keeper, &kpath, &d, &dpath, &reason)? {
+                continue;
+            }
             sh.stats.duplicates.fetch_add(1, Relaxed);
             if same_format {
                 sh.stats.same_format.fetch_add(1, Relaxed);
@@ -1112,7 +1238,6 @@ impl<'a, 'p> Ctx<'a, 'p> {
                     keeper.path, d.path, d.size as f64 / 1048576.0
                 ));
             }
-            self.write_plan(&keeper, &kpath, &d, &dpath, &reason)?;
         }
         Ok(())
     }
@@ -1120,7 +1245,7 @@ impl<'a, 'p> Ctx<'a, 'p> {
 
 // ── Plan-Datei: TSV mit %-Escaping, damit Tabs/Zeilenumbrueche in Pfaden nichts zerstoeren ──
 
-fn esc(s: &str) -> String {
+pub fn esc(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -1160,6 +1285,7 @@ fn apply(
     w: &mut Connection,
     schema: &Schema,
     settings: &Settings,
+    trash: Option<&Path>,
     plan_path: &Path,
     applied_path: &Path,
 ) -> Result<(), String> {
@@ -1193,11 +1319,11 @@ fn apply(
             reason: unesc(p[5]),
         });
         if batch.len() >= sh.env.batch_size {
-            flush(sh, w, schema, settings, std::mem::take(&mut batch), applied.as_mut())?;
+            flush(sh, w, schema, settings, trash, std::mem::take(&mut batch), applied.as_mut())?;
         }
     }
     if !batch.is_empty() {
-        flush(sh, w, schema, settings, batch, applied.as_mut())?;
+        flush(sh, w, schema, settings, trash, batch, applied.as_mut())?;
     }
     if let Some(a) = applied.as_mut() {
         let _ = a.flush();
@@ -1205,20 +1331,48 @@ fn apply(
     Ok(())
 }
 
+/// Verschiebt eine Datei in den Papierkorb und behaelt dabei ihren Pfad bei,
+/// damit man sie spaeter zuordnen (und zurueckschieben) kann.
+fn to_trash(root: &Path, file: &Path) -> std::io::Result<PathBuf> {
+    let rel = file.to_string_lossy().trim_start_matches('/').replace(':', "_");
+    let mut target = root.join(&rel);
+    if let Some(dir) = target.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let mut n = 1;
+    while target.exists() {
+        let stem = file.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        target = root.join(&rel).with_file_name(format!("{n}-{stem}"));
+        n += 1;
+    }
+    match fs::rename(file, &target) {
+        Ok(()) => Ok(target),
+        // anderes Dateisystem: kopieren und erst danach das Original entfernen
+        Err(e) if e.raw_os_error() == Some(18) => {
+            fs::copy(file, &target)?;
+            fs::remove_file(file)?;
+            Ok(target)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Ein Block = eine ACID-Transaktion. Dateien werden erst NACH dem Commit geloescht.
 /// Scheitert der Block, wird er zurueckgerollt und jeder Eintrag einzeln erneut
 /// versucht – ein defekter Eintrag darf einen Lauf ueber Millionen Titel nicht abbrechen.
+#[allow(clippy::too_many_arguments)]
 fn flush(
     sh: &Shared,
     w: &mut Connection,
     schema: &Schema,
     settings: &Settings,
+    trash: Option<&Path>,
     batch: Vec<PlanRow>,
     applied: Option<&mut BufWriter<fs::File>>,
 ) -> Result<(), String> {
     match commit_batch(sh, w, schema, settings, &batch) {
         Ok(()) => {
-            remove_files(sh, &batch, applied);
+            remove_files(sh, trash, &batch, applied);
             Ok(())
         }
         Err(e) => {
@@ -1226,7 +1380,7 @@ fn flush(
             for one in batch {
                 let single = vec![one.clone()];
                 match commit_batch(sh, w, schema, settings, &single) {
-                    Ok(()) => remove_files(sh, &single, None),
+                    Ok(()) => remove_files(sh, trash, &single, None),
                     Err(e) => {
                         sh.stats.errors.fetch_add(1, Relaxed);
                         sh.log(format!("FEHLER (uebersprungen, nichts geloescht) {}: {e}", one.del_path));
@@ -1259,7 +1413,7 @@ fn commit_batch(
     Ok(())
 }
 
-fn remove_files(sh: &Shared, batch: &[PlanRow], mut applied: Option<&mut BufWriter<fs::File>>) {
+fn remove_files(sh: &Shared, trash: Option<&Path>, batch: &[PlanRow], mut applied: Option<&mut BufWriter<fs::File>>) {
     for p in batch {
         let dpath = Path::new(&p.del_path);
         let kpath = Path::new(&p.keeper_path);
@@ -1279,8 +1433,12 @@ fn remove_files(sh: &Shared, batch: &[PlanRow], mut applied: Option<&mut BufWrit
                 continue;
             }
         }
-        let status = match fs::remove_file(dpath) {
-            Ok(()) => "GELOESCHT",
+        let outcome = match trash {
+            Some(root) => to_trash(root, dpath).map(|_| ()),
+            None => fs::remove_file(dpath),
+        };
+        let status = match outcome {
+            Ok(()) => if trash.is_some() { "VERSCHOBEN" } else { "GELOESCHT" },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => "FEHLTE-SCHON",
             Err(e) => {
                 sh.stats.errors.fetch_add(1, Relaxed);
@@ -1291,7 +1449,7 @@ fn remove_files(sh: &Shared, batch: &[PlanRow], mut applied: Option<&mut BufWrit
                 continue;
             }
         };
-        if status == "GELOESCHT" {
+        if status == "GELOESCHT" || status == "VERSCHOBEN" {
             sh.stats.deleted.fetch_add(1, Relaxed);
             sh.stats.bytes_freed.fetch_add(p.size.max(0) as u64, Relaxed);
         }
@@ -1511,6 +1669,13 @@ fn refresh_playlists(tx: &rusqlite::Transaction, sc: &Schema, pls: &HashSet<Stri
 mod tests {
     use super::*;
 
+    /// Die aelteren Tests pruefen gezielt die Gruppierung ueber die Navidrome-Datenbank.
+    fn db_mode(env: Env) -> Shared {
+        let sh = Shared::new(env);
+        sh.settings.lock().unwrap().mode = "db".into();
+        sh
+    }
+
     fn tmpdir(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
             "nd-dedupe-test-{tag}-{}-{}",
@@ -1604,6 +1769,7 @@ mod tests {
         let env = Env {
             db_path: db.to_string_lossy().to_string(),
             backup_dir: cfg.join("backups"),
+            trash_dir: cfg.join("trash"),
             config_dir: cfg.clone(),
             path_map: None,
             keep_exts: vec!["flac".into()],
@@ -1667,7 +1833,7 @@ mod tests {
     fn copy_suffix_duplicates_are_found_and_original_kept() {
         let (env, music, _cfg) = fixture();
         add_copy_pair(&env, &music);
-        let sh = Shared::new(env);
+        let sh = db_mode(env);
         run(&sh, true);
         assert_eq!(sh.stats.errors.load(Relaxed), 0);
         assert!(music.join("g3.flac").exists(), "Original mit den besseren Tags bleibt");
@@ -1679,7 +1845,7 @@ mod tests {
     fn copy_suffix_detection_can_be_disabled() {
         let (env, music, _cfg) = fixture();
         add_copy_pair(&env, &music);
-        let sh = Shared::new(env);
+        let sh = db_mode(env);
         sh.settings.lock().unwrap().strip_copy_suffix = false;
         run(&sh, true);
         assert!(music.join("g3 (1).flac").exists(), "ohne Normalisierung bleibt die Kopie liegen");
@@ -1690,7 +1856,7 @@ mod tests {
     fn tag_loss_can_block_the_deletion() {
         let (env, music, _cfg) = fixture();
         add_copy_pair(&env, &music);
-        let sh = Shared::new(env);
+        let sh = db_mode(env);
         sh.settings.lock().unwrap().skip_on_tag_loss = true;
         run(&sh, true);
         assert!(music.join("g3 (1).flac").exists(), "Tag-Verlust verhindert das Loeschen");
@@ -1708,7 +1874,7 @@ mod tests {
             let c = Connection::open(&env.db_path).unwrap();
             c.execute("UPDATE media_file SET size=99999, bit_rate=1200 WHERE id='flacCopy'", []).unwrap();
         }
-        let sh = Shared::new(env);
+        let sh = db_mode(env);
         run(&sh, true);
         assert!(music.join("g3.flac").exists(), "besser getaggtes Original bleibt");
         assert!(!music.join("g3 (1).flac").exists());
@@ -1724,11 +1890,150 @@ mod tests {
             let c = Connection::open(&env.db_path).unwrap();
             c.execute("UPDATE media_file SET bit_depth=24 WHERE id='flacCopy'", []).unwrap();
         }
-        let sh = Shared::new(env);
+        let sh = db_mode(env);
         run(&sh, true);
         assert!(music.join("g3 (1).flac").exists(), "24-bit-Datei bleibt");
         assert!(!music.join("g3.flac").exists());
         assert!(sh.stats.tags_lost.load(Relaxed) >= 1, "Genre/Liedtext-Verlust gemeldet");
+    }
+
+    // ───────── Inhaltsbasierte Suche (vollstaendiger Bibliotheks-Scan) ─────────
+
+    fn content_mode(env: Env) -> Shared {
+        let sh = Shared::new(env);
+        let mut st = sh.settings.lock().unwrap();
+        st.mode = "content".into();
+        drop(st);
+        sh
+    }
+
+    /// Legt zwei FLAC-Dateien mit identischem Audio an, die Navidrome niemals
+    /// zusammen gruppieren wuerde: anderes Album, anderer Titel, anderer Ordner.
+    fn content_fixture() -> (Env, PathBuf, PathBuf) {
+        let (env, music, cfg) = fixture();
+        fs::create_dir_all(music.join("Alben/Nachtflug")).unwrap();
+        fs::create_dir_all(music.join("Downloads")).unwrap();
+        let md5 = [0x7au8; 16];
+        fs::write(music.join("Alben/Nachtflug/01 Lied.flac"), crate::audio::flac_bytes(md5, 44100, 16, 2, 441000, 400)).unwrap();
+        fs::write(music.join("Downloads/irgendwas.flac"), crate::audio::flac_bytes(md5, 44100, 16, 2, 441000, 900)).unwrap();
+
+        let c = Connection::open(&env.db_path).unwrap();
+        let ins = "INSERT INTO media_file (id, library_id, path, title, album, album_id, artist_id, disc_number, \
+                   order_title, suffix, size, duration, bit_rate, comment, track_number, sample_rate, bit_depth, \
+                   channels, mbz_recording_id, tags, missing, genre, lyrics) \
+                   VALUES (?1, 1, ?2, ?3, ?4, ?5, 'art1', 1, ?6, 'flac', ?7, 10.0, 900, '', 1, 44100, 16, 2, '', '{}', 0, ?8, ?9)";
+        c.execute(ins, params!["album1", "Alben/Nachtflug/01 Lied.flac", "Lied", "Nachtflug", "albN", "lied", 450, "Rock", "text"]).unwrap();
+        c.execute(ins, params!["dl1", "Downloads/irgendwas.flac", "irgendwas", "Unbekannt", "albU", "irgendwas", 950, Option::<String>::None, Option::<String>::None]).unwrap();
+        // Favorit und Playlist-Eintrag haengen an der Datei, die weichen soll
+        c.execute("INSERT INTO annotation (user_id,item_id,item_type,play_count,rating,starred,starred_at) \
+                   VALUES ('u1','dl1','media_file',11,4,1,'2025-01-01')", []).unwrap();
+        c.execute("INSERT INTO playlist_tracks (id, playlist_id, media_file_id) VALUES (9,'pl1','dl1')", []).unwrap();
+        (env, music, cfg)
+    }
+
+    #[test]
+    fn inhaltssuche_findet_identische_flacs_ueber_alben_hinweg() {
+        let (env, music, _cfg) = content_fixture();
+        let db = env.db_path.clone();
+        let sh = content_mode(env);
+        run(&sh, true);
+
+        assert_eq!(sh.stats.errors.load(Relaxed), 0, "ohne Fehler");
+        assert_eq!(sh.stats.exact.load(Relaxed), 1, "ueber die FLAC-Pruefsumme erkannt");
+        assert!(music.join("Alben/Nachtflug/01 Lied.flac").exists(), "besser getaggte Datei bleibt");
+        assert!(!music.join("Downloads/irgendwas.flac").exists(), "die Kopie im Download-Ordner geht");
+
+        let c = Connection::open(&db).unwrap();
+        let one = |sql: &str| -> i64 { c.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(one("SELECT starred FROM annotation WHERE user_id='u1' AND item_id='album1'"), 1,
+                   "Favorit wandert auf die behaltene Datei");
+        assert_eq!(one("SELECT play_count FROM annotation WHERE user_id='u1' AND item_id='album1'"), 11);
+        assert_eq!(one("SELECT count(*) FROM playlist_tracks WHERE media_file_id='dl1'"), 0, "keine toten Playlist-Verweise");
+        assert_eq!(one("SELECT count(*) FROM playlist_tracks WHERE media_file_id='album1'"), 1,
+                   "Playlist zeigt jetzt auf die behaltene Datei");
+    }
+
+    #[test]
+    fn datenbankmodus_findet_diese_faelle_nicht() {
+        // Gegenprobe: ueber Album und Titel gruppiert, bleiben beide Dateien liegen.
+        let (env, music, _cfg) = content_fixture();
+        let sh = db_mode(env);
+        run(&sh, true);
+        assert!(music.join("Downloads/irgendwas.flac").exists(),
+                "anderes Album, anderer Titel – die Datenbanksuche kann das nicht sehen");
+    }
+
+    #[test]
+    fn inhaltssuche_erkennt_dateien_ohne_navidrome_eintrag() {
+        let (env, music, _cfg) = content_fixture();
+        // dieselbe Musik noch einmal, aber Navidrome kennt die Datei nicht
+        fs::write(music.join("Downloads/unbekannt.flac"), crate::audio::flac_bytes([0x7a; 16], 44100, 16, 2, 441000, 50)).unwrap();
+        let sh = content_mode(env);
+        run(&sh, true);
+        assert!(sh.stats.unknown.load(Relaxed) >= 1, "nicht indizierte Datei gemeldet");
+        assert!(!music.join("Downloads/unbekannt.flac").exists(), "unbekannte Kopie wird entfernt");
+        assert!(music.join("Alben/Nachtflug/01 Lied.flac").exists(), "die Navidrome bekannte Datei bleibt");
+    }
+
+    #[test]
+    fn papierkorb_verschiebt_statt_zu_loeschen() {
+        let (env, music, _cfg) = content_fixture();
+        let trash = env.trash_dir.clone();
+        let sh = content_mode(env);
+        sh.settings.lock().unwrap().use_trash = true;
+        run(&sh, true);
+        assert!(!music.join("Downloads/irgendwas.flac").exists(), "aus der Bibliothek verschwunden");
+        let found = walk_find(&trash, "irgendwas.flac");
+        assert!(found, "liegt im Papierkorb unter {}", trash.display());
+        assert_eq!(sh.stats.deleted.load(Relaxed), 1);
+    }
+
+    fn walk_find(dir: &Path, name: &str) -> bool {
+        let rd = match fs::read_dir(dir) { Ok(x) => x, Err(_) => return false };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if walk_find(&p, name) { return true; }
+            } else if p.file_name().map(|n| n == name).unwrap_or(false) {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn bytevergleich_verhindert_falsche_treffer() {
+        let (env, music, _cfg) = fixture();
+        fs::create_dir_all(music.join("Rest")).unwrap();
+        // gleiche Laenge, aber ein Byte unterschiedlich – darf nichts loeschen
+        fs::write(music.join("Rest/a.mp3"), vec![b'M'; 4000]).unwrap();
+        let mut other = vec![b'M'; 4000];
+        other[3000] = b'Z';
+        fs::write(music.join("Rest/b.mp3"), other).unwrap();
+        let sh = content_mode(env);
+        run(&sh, true);
+        assert!(music.join("Rest/a.mp3").exists());
+        assert!(music.join("Rest/b.mp3").exists(), "unterschiedliches Audio bleibt unangetastet");
+    }
+
+    #[test]
+    fn identische_mp3s_mit_anderen_tags_werden_erkannt() {
+        let (env, music, _cfg) = fixture();
+        fs::create_dir_all(music.join("Rest")).unwrap();
+        let audio = vec![b'M'; 4000];
+        let mut a = b"ID3\x04\x00\x00\x00\x00\x00\x14".to_vec();
+        a.extend(std::iter::repeat(b'X').take(20));
+        a.extend_from_slice(&audio);
+        let mut b = b"ID3\x04\x00\x00\x00\x00\x00\x28".to_vec();
+        b.extend(std::iter::repeat(b'Y').take(40));
+        b.extend_from_slice(&audio);
+        fs::write(music.join("Rest/mit-tags.mp3"), &a).unwrap();
+        fs::write(music.join("Rest/mehr-tags.mp3"), &b).unwrap();
+        let sh = content_mode(env);
+        run(&sh, true);
+        assert_eq!(sh.stats.errors.load(Relaxed), 0);
+        let left = ["Rest/mit-tags.mp3", "Rest/mehr-tags.mp3"].iter().filter(|p| music.join(p).exists()).count();
+        assert_eq!(left, 1, "von zwei inhaltsgleichen MP3s bleibt genau eine");
     }
 
     #[test]
@@ -1742,7 +2047,7 @@ mod tests {
     #[test]
     fn dry_run_changes_nothing() {
         let (env, music, _cfg) = fixture();
-        let sh = Shared::new(env);
+        let sh = db_mode(env);
         run(&sh, false);
         assert_eq!(sh.stats.errors.load(Relaxed), 0, "Dry-Run ohne Fehler");
         assert_eq!(sh.stats.duplicates.load(Relaxed), 2, "mp3 + schlechtere flac erkannt");
@@ -1757,7 +2062,7 @@ mod tests {
     fn execute_keeps_favourites_playlists_and_history() {
         let (env, music, _cfg) = fixture();
         let db = env.db_path.clone();
-        let sh = Shared::new(env);
+        let sh = db_mode(env);
         run(&sh, true);
         assert_eq!(sh.stats.errors.load(Relaxed), 0, "Execute ohne Fehler");
         assert_eq!(sh.stats.deleted.load(Relaxed), 2, "zwei Dateien geloescht");
@@ -1816,7 +2121,7 @@ mod tests {
     #[test]
     fn protected_and_limits_are_respected() {
         let (env, music, _cfg) = fixture();
-        let sh = Shared::new(env);
+        let sh = db_mode(env);
         {
             let mut s = sh.settings.lock().unwrap();
             s.keywords = vec!["song one".into()]; // trifft Gruppe 1 ueber den Titel
@@ -1835,7 +2140,7 @@ mod tests {
             let c = Connection::open(&env.db_path).unwrap();
             c.execute("UPDATE media_file SET duration=300.0 WHERE id='mp3a'", []).unwrap();
         }
-        let sh = Shared::new(env);
+        let sh = db_mode(env);
         run(&sh, true);
         assert!(music.join("g1.mp3").exists(), "abweichende Laenge -> nicht geloescht");
         assert!(sh.stats.mismatch.load(Relaxed) >= 1);
@@ -1850,7 +2155,7 @@ mod tests {
             c.execute("UPDATE media_file SET mbz_recording_id='aaa' WHERE id='flacLo'", []).unwrap();
             c.execute("UPDATE media_file SET mbz_recording_id='bbb' WHERE id='flacHi'", []).unwrap();
         }
-        let sh = Shared::new(env);
+        let sh = db_mode(env);
         run(&sh, true);
         assert!(music.join("g2-lo.flac").exists(), "andere Recording-ID -> nicht geloescht");
         assert!(!music.join("g1.mp3").exists(), "Gruppe 1 bleibt davon unberuehrt");
@@ -1859,7 +2164,7 @@ mod tests {
     #[test]
     fn flac_dedupe_can_be_disabled() {
         let (env, music, _cfg) = fixture();
-        let sh = Shared::new(env);
+        let sh = db_mode(env);
         sh.settings.lock().unwrap().dedupe_flac = false;
         run(&sh, true);
         assert!(music.join("g2-lo.flac").exists(), "ohne FLAC-Bereinigung bleiben beide FLACs");
@@ -1873,7 +2178,7 @@ mod tests {
         let mut env = fixture().0;
         env.db_path = cfg.join("gibtsnicht.db").to_string_lossy().to_string();
         let path = env.db_path.clone();
-        let sh = Shared::new(env);
+        let sh = db_mode(env);
         run(&sh, false);
         assert!(sh.stats.errors.load(Relaxed) > 0, "Fehler gemeldet");
         assert!(!Path::new(&path).exists(), "es wird keine leere DB angelegt");

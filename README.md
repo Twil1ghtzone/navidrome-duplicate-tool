@@ -15,6 +15,38 @@ In Dockge genuegt **Aktualisieren** (pull + Neuerstellung). Einmalig noetig: Auf
 Package settings -> Change visibility* das Paket auf **Public** stellen, sonst kann der Server es nicht ohne Login ziehen.
 Ohne Registry geht auch der Build direkt aus GitHub (siehe Kommentar in der Compose-Datei, `pull_policy: build`).
 
+## Zwei Suchverfahren
+In der UI unter **Suchverfahren** waehlbar, Standard ist "beides".
+
+### 1. Dateiinhalt (vollstaendiger Bibliotheks-Scan)
+Das Tool laeuft selbst durch die Bibliotheksordner – welche das sind, holt es aus Navidromes
+`library`-Tabelle – und erkennt Duplikate am Audio selbst, nicht an den Tags. Damit findet es auch,
+was eine Suche ueber Album und Titel prinzipiell nicht finden kann:
+
+* identische Dateien in verschiedenen Alben oder Ordnern,
+* Kopien mit voellig anderen Tags,
+* Dateien, die Navidrome noch gar nicht eingelesen hat (werden als `NICHT IN NAVIDROME` gemeldet).
+
+Fuer **FLAC** ist das sowohl exakt als auch guenstig: der STREAMINFO-Block jeder FLAC-Datei enthaelt eine
+MD5-Pruefsumme des **unkomprimierten** Audios. Zwei FLACs mit derselben Pruefsumme enthalten garantiert
+dasselbe Audio – unabhaengig von Tags, Kompressionsstufe und Dateigroesse. Dafuer werden rund 50 Byte pro
+Datei gelesen; es wird nichts dekodiert und nichts durchgehasht.
+
+Fuer andere Formate wird der reine Audiobereich bestimmt (ID3v2, ID3v1 und APE-Tags werden uebersprungen,
+zwei MP3s mit unterschiedlichen Tags gelten also als gleich). Gehasht wird nur bei gleicher Audio-Laenge,
+und vor dem Loeschen wird der Bereich zusaetzlich **Byte fuer Byte verglichen** (abschaltbar).
+
+Zwischenspeicher ist eine temporaere SQLite-Datei in `/config`, die nach dem Lauf geloescht wird.
+Der Arbeitsspeicher bleibt dadurch konstant; plane je nach Bibliotheksgroesse etwas Platz dafuer ein.
+
+### 2. Navidrome-Datenbank
+Das bisherige Verfahren: Gruppierung nach `album_id` + Disc + Titel. Es ist schnell, ruehrt das
+Dateisystem nicht an und findet als Einziges **formatuebergreifende** Duplikate (MP3 neben FLAC),
+weil dort die Dateien naturgemaess nicht byteweise gleich sind.
+
+Beide Verfahren schreiben in denselben Plan. Eine Datei, die das erste Verfahren schon zum Loeschen
+vorgemerkt hat, wird vom zweiten nicht noch einmal angefasst – und nie als "zu behalten" eingetragen.
+
 ## Ablauf: zwei Phasen
 1. **Planen** (nur lesend): `media_file` wird sortiert gestreamt, Gruppen gebildet, alle Schutzregeln geprueft und jede
    geplante Loeschung in eine Plan-/Report-Datei unter `/config/reports` geschrieben. Der Speicherbedarf bleibt konstant,
@@ -68,6 +100,9 @@ Gruppe stattdessen uebersprungen. Das Tool schreibt selbst keine Tags in Audioda
 - **Sicherheitssperre:** "Ausfuehren" ist erst nach einem vollstaendigen Dry-Run (letzte 7 Tage) moeglich (`REQUIRE_DRYRUN=false` schaltet das ab) und verlangt die Eingabe von LOESCHEN.
 - **Limit pro Lauf** (z. B. erst 50 Duplikate testen), Backup vor jedem Execute (`VACUUM INTO`), pro Block eine ACID-Transaktion,
   Dateien werden erst nach dem Commit geloescht, Graceful Shutdown beendet immer erst den aktuellen Block.
+- **Papierkorb statt Loeschen** (Option): Dateien wandern mit ihrem Pfad nach `/trash/<Zeitstempel>/...`
+  statt entfernt zu werden. Liegt der Papierkorb auf demselben Dateisystem, ist das ein Verschieben
+  ohne Kopieraufwand. Zurueckholen ist damit jederzeit moeglich.
 - Ein fehlerhafter Eintrag bricht keinen Lauf ab: der Block wird zurueckgerollt und jeder Eintrag einzeln erneut versucht,
   der problematische wird uebersprungen und protokolliert.
 - Navidrome-Eintraege der geloeschten Dateien werden als `missing` markiert (`DELETE_ROWS=true` loescht sie). Danach in Navidrome einen Scan starten.
@@ -81,9 +116,11 @@ Gruppe stattdessen uebersprungen. Das Tool schreibt selbst keine Tags in Audioda
 ## Umgebungsvariablen (alle optional ausser Pfaden)
 `UI_USER` (admin), `UI_PASSWORD`, `NAVIDROME_DB` (/data/navidrome.db), `PATH_MAP` (`/navidrome-pfad:/container-pfad`), `KEEP_EXTS` (flac),
 `DELETE_EXTS` (mp3), `DEDUPE_SAME_EXTS` (flac, `none` = aus), `DURATION_TOLERANCE` (3), `BATCH_SIZE` (200), `BACKUP_KEEP` (3),
-`MATCH_MODE` (`album` | `artist_title`), `DELETE_ROWS` (false), `REQUIRE_DRYRUN` (true), `LOG_KEEP` (30).
+`MATCH_MODE` (`album` | `artist_title`), `DELETE_ROWS` (false), `REQUIRE_DRYRUN` (true), `LOG_KEEP` (30),
+`TRASH_DIR` (/trash).
 In der UI einstellbar: Toleranz, Limit pro Lauf, Exclude-Ordner, Schutz-Begriffe, Bereinigung gleicher Formate,
-Kopie-Erkennung, Tag-Verlust-Sperre, Playlist-Verhalten, MusicBrainz-Pruefung und Tracknummer-Pruefung.
+Kopie-Erkennung, Tag-Verlust-Sperre, Playlist-Verhalten, MusicBrainz-Pruefung, Tracknummer-Pruefung,
+Suchverfahren, Byte-Vergleich, Meldung nicht indizierter Dateien und Papierkorb.
 
 ## Oberflaeche
 Die laufende Programmversion steht neben dem Namen im Seitenkopf und im Browser-Tab-Titel.
@@ -112,7 +149,7 @@ Fuer ein integriertes Gefuehl eignet sich ein Reverse-Proxy, der Navidrome unter
 z. B. `/dedupe/` ausliefert.
 
 ## Entwicklung
-`cargo test` startet die Integrationstests. Sie bauen eine Navidrome-aehnliche Datenbank samt echten Dateien auf und
+`cargo test` startet die Tests (aktuell 26). Sie bauen eine Navidrome-aehnliche Datenbank samt echten Dateien auf und
 pruefen Dry-Run, Execute, Favoriten-/Playlist-/Lesezeichen-/Historien-Uebernahme, Schutzregeln und Qualitaetsauswahl.
 
 Hinweise: DB-Verzeichnis auf lokalem Dateisystem (kein NFS/SMB, wegen WAL). Die UI hat kein TLS: nur im LAN oder hinter Reverse-Proxy betreiben.

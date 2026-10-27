@@ -1,3 +1,5 @@
+mod audio;
+mod content;
 mod engine;
 
 use axum::{
@@ -167,6 +169,10 @@ async fn set_cfg(State(app): State<App>, Json(mut s): Json<Settings>) -> impl In
     }
     for v in s.excludes.iter_mut().chain(s.keywords.iter_mut()) {
         *v = v.trim().to_string();
+    }
+    s.mode = s.mode.trim().to_lowercase();
+    if !["db", "content", "both"].contains(&s.mode.as_str()) {
+        return (StatusCode::BAD_REQUEST, "Unbekanntes Suchverfahren").into_response();
     }
     if !(0.0..=60.0).contains(&s.duration_tol) {
         return (StatusCode::BAD_REQUEST, "Laengen-Toleranz muss zwischen 0 und 60 Sekunden liegen").into_response();
