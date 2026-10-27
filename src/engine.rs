@@ -1,13 +1,27 @@
-//! Dedupe-Engine: streamt `media_file` sortiert aus der Navidrome-SQLite-DB,
-//! bildet Gruppen, überträgt Annotationen und löscht Dateien blockweise in Transaktionen.
+//! Dedupe-Engine für Navidrome.
+//!
+//! Ablauf in zwei Phasen, damit auch Bibliotheken mit Millionen Titeln
+//! mit konstantem Speicher und ohne dauerhaft offene Lese-Transaktion laufen:
+//!
+//! 1. **Planen** (nur lesend): `media_file` wird sortiert gestreamt, Gruppen
+//!    werden gebildet, Schutzregeln geprüft und jede geplante Löschung in eine
+//!    Plan-Datei (= Report) geschrieben. Die Lese-Transaktion ist pro Block kurz.
+//! 2. **Anwenden** (nur im Execute-Modus): die Plan-Datei wird blockweise
+//!    abgearbeitet. Pro Block eine SQLite-Transaktion, in der alle
+//!    nutzerbezogenen Daten (Favoriten, Bewertungen, Wiedergaben, Lesezeichen,
+//!    Playlists, Scrobbles, Warteschlangen, Shares) auf die behaltene Datei
+//!    übertragen werden. Dateien werden erst NACH dem Commit gelöscht.
+//!
+//! Das Schema wird zur Laufzeit per `PRAGMA table_info` ermittelt, damit das
+//! Tool über verschiedene Navidrome-Versionen hinweg funktioniert.
 
+use base64::Engine as _;
 use rusqlite::{params, Connection, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use base64::Engine as _;
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Mutex;
@@ -48,7 +62,7 @@ fn list(k: &str, d: &str) -> Vec<String> {
     var(k, d)
         .split(',')
         .map(|s| s.trim().trim_start_matches('.').to_lowercase())
-        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric()))
+        .filter(|s| !s.is_empty() && s != "none" && s.chars().all(|c| c.is_ascii_alphanumeric()))
         .collect()
 }
 
@@ -115,11 +129,26 @@ impl Env {
 pub struct Settings {
     pub excludes: Vec<String>,
     pub keywords: Vec<String>,
-    /// 0 = unbegrenzt; sonst Lauf stoppt nach so vielen erkannten Duplikaten
+    /// 0 = unbegrenzt; sonst stoppt der Lauf nach so vielen erkannten Duplikaten
     pub max_delete: u64,
-    /// doppelte FLACs (DEDUPE_SAME_EXTS) ebenfalls bereinigen
+    /// doppelte Dateien gleichen Formats (DEDUPE_SAME_EXTS, z. B. FLAC) ebenfalls bereinigen
     pub dedupe_flac: bool,
     pub duration_tol: f64,
+    /// Playlist-Eintraege werden 1:1 auf die behaltene Datei umgebogen – auch wenn
+    /// diese dadurch doppelt in der Playlist steht. Garantiert, dass die Playlist
+    /// weder kuerzer wird noch Positionen verschiebt.
+    pub playlist_keep_duplicates: bool,
+    /// Haben beide Dateien eine MusicBrainz-Recording-ID und sind diese verschieden,
+    /// gilt das als "nicht dasselbe Stueck" und es wird nichts geloescht.
+    pub require_mbz_match: bool,
+    /// Bei gleichem Format muss die Tracknummer uebereinstimmen.
+    pub require_same_track: bool,
+    /// Titel wie "Song (1)", "Song (2)", "Song - Copy" werden auf "Song" normalisiert,
+    /// damit solche Kopien ueberhaupt als Duplikat erkannt werden.
+    pub strip_copy_suffix: bool,
+    /// Haette die zu loeschende Datei Tag-Felder, die der behaltenen fehlen,
+    /// wird die Gruppe uebersprungen statt die Tags zu verlieren.
+    pub skip_on_tag_loss: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -130,6 +159,11 @@ impl Default for Settings {
             max_delete: 0,
             dedupe_flac: true,
             duration_tol: 3.0,
+            playlist_keep_duplicates: true,
+            require_mbz_match: true,
+            require_same_track: true,
+            strip_copy_suffix: true,
+            skip_on_tag_loss: false,
         }
     }
 }
@@ -142,12 +176,16 @@ pub struct Stats {
     pub scanned: AtomicU64,
     pub candidates: AtomicU64,
     pub duplicates: AtomicU64,
+    pub same_format: AtomicU64,
+    pub planned: AtomicU64,
+    pub tags_lost: AtomicU64,
     pub protected: AtomicU64,
     pub excluded: AtomicU64,
     pub mismatch: AtomicU64,
     pub deleted: AtomicU64,
     pub bytes_freed: AtomicU64,
     pub annotations: AtomicU64,
+    pub playlists: AtomicU64,
     pub errors: AtomicU64,
 }
 
@@ -158,8 +196,16 @@ pub struct Shared {
     pub running: AtomicBool,
     pub stop: AtomicBool,
     pub shutdown: AtomicBool,
+    /// Lauf-Limit erreicht – der Plan ist vollstaendig und darf angewendet werden
+    pub limit: AtomicBool,
     pub execute: AtomicBool,
     pub phase: Mutex<String>,
+    /// Unix-Sekunden des Laufbeginns (0 = kein Lauf) – fuer Rate und Restzeit
+    pub started_ts: AtomicU64,
+    /// Unix-Sekunden des Laufendes (0 = laeuft noch) – friert die Laufzeit nach dem Ende ein
+    pub ended_ts: AtomicU64,
+    /// zwischengespeicherte Warnungen: (Zeitstempel, Texte)
+    pub warn_cache: Mutex<(i64, Vec<String>)>,
     pub log: Mutex<(u64, VecDeque<(u64, String)>)>,
     pub logfile: Mutex<Option<fs::File>>,
 }
@@ -174,8 +220,12 @@ impl Shared {
             running: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
+            limit: AtomicBool::new(false),
             execute: AtomicBool::new(false),
             phase: Mutex::new("bereit".into()),
+            started_ts: AtomicU64::new(0),
+            ended_ts: AtomicU64::new(0),
+            warn_cache: Mutex::new((0, vec![])),
             log: Mutex::new((0, VecDeque::new())),
             logfile: Mutex::new(None),
         }
@@ -199,9 +249,12 @@ impl Shared {
         json!({
             "total": st.total.load(Relaxed), "scanned": st.scanned.load(Relaxed),
             "candidates": st.candidates.load(Relaxed), "duplicates": st.duplicates.load(Relaxed),
+            "same_format": st.same_format.load(Relaxed), "planned": st.planned.load(Relaxed),
+            "tags_lost": st.tags_lost.load(Relaxed),
             "protected": st.protected.load(Relaxed), "excluded": st.excluded.load(Relaxed),
             "mismatch": st.mismatch.load(Relaxed), "deleted": st.deleted.load(Relaxed),
             "bytes_freed": st.bytes_freed.load(Relaxed), "annotations": st.annotations.load(Relaxed),
+            "playlists": st.playlists.load(Relaxed),
             "errors": st.errors.load(Relaxed)
         })
     }
@@ -210,13 +263,19 @@ impl Shared {
     }
     fn reset_stats(&self) {
         let s = &self.stats;
-        for a in [&s.total, &s.scanned, &s.candidates, &s.duplicates, &s.protected, &s.excluded,
-                  &s.mismatch, &s.deleted, &s.bytes_freed, &s.annotations, &s.errors] {
+        for a in [&s.total, &s.scanned, &s.candidates, &s.duplicates, &s.same_format, &s.planned,
+                  &s.tags_lost, &s.protected, &s.excluded, &s.mismatch, &s.deleted, &s.bytes_freed,
+                  &s.annotations, &s.playlists, &s.errors] {
             a.store(0, Relaxed);
         }
     }
+    /// Abbruch durch Nutzer oder Signal – dann wird NICHTS mehr angewendet.
     fn halt(&self) -> bool {
         self.stop.load(Relaxed) || self.shutdown.load(Relaxed)
+    }
+    /// Scan-Ende: Abbruch oder Lauf-Limit.
+    fn scan_done(&self) -> bool {
+        self.halt() || self.limit.load(Relaxed)
     }
 }
 
@@ -227,13 +286,183 @@ fn load_settings(env: &Env) -> Settings {
     fs::read_to_string(settings_path(env)).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_else(|| {
         let mut s = Settings::default();
         s.duration_tol = env.duration_tol;
-        s.dedupe_flac = !env.same_exts.iter().any(|e| e == "none");
+        s.dedupe_flac = !env.same_exts.is_empty();
         s
     })
 }
 pub fn save_settings(env: &Env, s: &Settings) -> std::io::Result<()> {
     fs::create_dir_all(&env.config_dir)?;
     fs::write(settings_path(env), serde_json::to_string_pretty(s).unwrap())
+}
+
+// ───────────────────────── Schema-Erkennung ─────────────────────────
+
+fn cols(c: &Connection, table: &str) -> Vec<String> {
+    let mut st = match c.prepare(&format!("PRAGMA table_info(\"{}\")", table.replace('"', ""))) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    st.query_map([], |r| r.get::<_, String>(1))
+        .map(|it| it.filter_map(|x| x.ok()).collect())
+        .unwrap_or_default()
+}
+
+/// Tag-Felder, deren Vorhandensein pro Datei als Flag abgefragt wird.
+/// (Flag, Spalte, Anzeigename, numerisch)
+const TAG_FIELDS: &[(char, &str, &str, bool)] = &[
+    ('A', "album_artist", "Album-Interpret", false),
+    ('r', "artist", "Interpret", false),
+    ('b', "album", "Album", false),
+    ('t', "title", "Titel", false),
+    ('n', "track_number", "Tracknummer", true),
+    ('d', "disc_number", "Disc-Nummer", true),
+    ('y', "year", "Jahr", true),
+    ('D', "date", "Datum", false),
+    ('g', "genre", "Genre", false),
+    ('c', "comment", "Kommentar", false),
+    ('l', "lyrics", "Liedtext", false),
+    ('m', "mbz_recording_id", "MusicBrainz-Recording", false),
+    ('M', "mbz_album_id", "MusicBrainz-Album", false),
+    ('k', "catalog_num", "Katalognummer", false),
+    ('p', "bpm", "BPM", true),
+    ('v', "has_cover_art", "Cover", true),
+    ('s', "sort_title", "Sortiertitel", false),
+    ('x', "explicit_status", "Explicit-Kennzeichen", false),
+    ('R', "rg_track_gain", "ReplayGain", true),
+    ('T', "tags", "weitere Tags", false),
+];
+
+fn tag_label(flag: char) -> &'static str {
+    TAG_FIELDS.iter().find(|(f, ..)| *f == flag).map(|(_, _, l, _)| *l).unwrap_or("?")
+}
+
+/// Welche Tabellen/Spalten hat diese Navidrome-Datenbank?
+pub struct Schema {
+    mf: HashSet<String>,
+    ann: HashSet<String>,
+    playlist: HashSet<String>,
+    /// Lesezeichen-Spalten ausser dem Schluessel (user_id, item_id, item_type)
+    bookmark: Vec<String>,
+    tables: HashSet<String>,
+}
+
+impl Schema {
+    fn load(c: &Connection) -> Result<Schema, String> {
+        let mut st = c
+            .prepare("SELECT name FROM sqlite_master WHERE type IN ('table','view')")
+            .map_err(|e| e.to_string())?;
+        let tables: HashSet<String> = st
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .filter_map(|x| x.ok())
+            .collect();
+        for t in ["media_file", "annotation", "library"] {
+            if !tables.contains(t) {
+                return Err(format!(
+                    "Das ist keine gueltige Navidrome-Datenbank (Tabelle '{t}' fehlt) – Volume fuer /data pruefen"
+                ));
+            }
+        }
+        let key = ["user_id", "item_id", "item_type"];
+        Ok(Schema {
+            mf: cols(c, "media_file").into_iter().collect(),
+            ann: cols(c, "annotation").into_iter().collect(),
+            playlist: cols(c, "playlist").into_iter().collect(),
+            bookmark: cols(c, "bookmark").into_iter().filter(|x| !key.contains(&x.as_str())).collect(),
+            tables,
+        })
+    }
+    fn mf(&self, c: &str) -> bool {
+        self.mf.contains(c)
+    }
+    fn table(&self, t: &str) -> bool {
+        self.tables.contains(t)
+    }
+    /// Spaltenausdruck fuer das SELECT: existiert die Spalte nicht, liefert `fallback`.
+    fn expr(&self, col: &str, fallback: &str) -> String {
+        if self.mf(col) { col.to_string() } else { fallback.to_string() }
+    }
+    /// Ein kompakter SQL-Ausdruck, der pro Zeile eine Zeichenkette mit einem Zeichen
+    /// je Tag-Feld liefert ("-" = leer). So kostet die Tag-Pruefung nur ~20 Byte pro Titel,
+    /// statt alle Tag-Spalten zu uebertragen.
+    fn tag_flags_expr(&self) -> String {
+        let parts: Vec<String> = TAG_FIELDS
+            .iter()
+            .filter(|(_, col, _, _)| self.mf(col))
+            .map(|(flag, col, _, numeric)| {
+                if *numeric {
+                    format!("CASE WHEN COALESCE({col},0)<>0 THEN '{flag}' ELSE '-' END")
+                } else if *col == "tags" {
+                    format!("CASE WHEN COALESCE({col},'') NOT IN ('','{{}}') THEN '{flag}' ELSE '-' END")
+                } else {
+                    format!("CASE WHEN COALESCE({col},'')<>'' THEN '{flag}' ELSE '-' END")
+                }
+            })
+            .collect();
+        if parts.is_empty() { "''".to_string() } else { parts.join(" || ") }
+    }
+}
+
+// ── Titel-Normalisierung: "Song (1)", "Song (2)", "Song - Copy" sind dasselbe Stueck ──
+
+/// Entfernt einen angehaengten Zaehler in Klammern, z. B. "song (1)" -> "song".
+fn strip_counter(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let close = match b.last()? {
+        b')' => b'(',
+        b']' => b'[',
+        b'}' => b'{',
+        _ => return None,
+    };
+    let mut i = b.len() - 1;
+    let mut digits = 0usize;
+    while i > 0 {
+        i -= 1;
+        if b[i].is_ascii_digit() {
+            digits += 1;
+        } else {
+            break;
+        }
+    }
+    if digits == 0 || b[i] != close {
+        return None;
+    }
+    Some(s[..i].trim_end().to_string())
+}
+
+const COPY_SUFFIXES: &[&str] = &[
+    " - copy", " copy", " - kopie", " kopie", " - copia", " copia", " - duplicate", " duplicate", " dup",
+];
+
+/// Gruppierschluessel aus einem Titel. `strip=false` gibt den Titel unveraendert (nur getrimmt) zurueck.
+fn norm_title(t: &str, strip: bool) -> String {
+    let mut s = t.trim().to_lowercase();
+    if !strip {
+        return s;
+    }
+    loop {
+        let before = s.len();
+        if let Some(x) = strip_counter(s.trim_end()) {
+            s = x;
+        }
+        for suf in COPY_SUFFIXES {
+            if s.ends_with(suf) {
+                s.truncate(s.len() - suf.len());
+            }
+        }
+        s = s.trim_end().trim_end_matches(['-', '_', '.']).trim_end().to_string();
+        if s.len() == before {
+            break;
+        }
+    }
+    s
+}
+
+/// Sieht der Dateiname nach einer Kopie aus ("track (1).flac")?
+fn is_copy_name(path: &str) -> bool {
+    let stem = Path::new(path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let stem = stem.trim().to_lowercase();
+    !stem.is_empty() && norm_title(&stem, true) != stem
 }
 
 // ───────────────────────── Datenmodell ─────────────────────────
@@ -249,32 +478,59 @@ struct Row {
     size: i64,
     duration: f64,
     bit_rate: i64,
+    sample_rate: i64,
+    bit_depth: i64,
+    channels: i64,
+    mbz: String,
     comment: String,
+    tags: String,
+    tag_flags: String,
     track: i64,
 }
 
-fn s(r: &rusqlite::Row, i: usize) -> rusqlite::Result<String> {
-    Ok(r.get::<_, Option<String>>(i)?.unwrap_or_default())
-}
-fn n(r: &rusqlite::Row, i: usize) -> rusqlite::Result<i64> {
-    Ok(r.get::<_, Option<i64>>(i)?.unwrap_or(0))
-}
-fn f(r: &rusqlite::Row, i: usize) -> rusqlite::Result<f64> {
-    Ok(r.get::<_, Option<f64>>(i)?.unwrap_or(0.0))
+impl Row {
+    /// Anzahl gesetzter Tag-Felder.
+    fn tag_score(&self) -> i64 {
+        self.tag_flags.chars().filter(|c| *c != '-').count() as i64
+    }
+    /// Tag-Felder, die diese Datei hat und `other` fehlen.
+    fn tags_missing_in(&self, other: &Row) -> Vec<char> {
+        let have: Vec<char> = other.tag_flags.chars().filter(|c| *c != '-').collect();
+        self.tag_flags.chars().filter(|c| *c != '-' && !have.contains(c)).collect()
+    }
 }
 
-struct Pending {
-    keeper: Row,
-    dels: Vec<(Row, PathBuf)>,
+/// Eine geplante Loeschung (Zeile der Plan-Datei).
+#[derive(Clone)]
+struct PlanRow {
+    keeper_id: String,
+    keeper_path: String,
+    del_id: String,
+    del_path: String,
+    size: i64,
+    reason: String,
+}
+
+fn s(r: &rusqlite::Row, i: usize) -> String {
+    r.get::<_, Option<String>>(i).ok().flatten().unwrap_or_default()
+}
+fn n(r: &rusqlite::Row, i: usize) -> i64 {
+    r.get::<_, Option<i64>>(i).ok().flatten().unwrap_or(0)
+}
+fn f(r: &rusqlite::Row, i: usize) -> f64 {
+    r.get::<_, Option<f64>>(i).ok().flatten().unwrap_or(0.0)
 }
 
 // ───────────────────────── Einstieg ─────────────────────────
 
 pub fn run(sh: &Shared, execute: bool) {
     sh.stop.store(false, Relaxed);
+    sh.limit.store(false, Relaxed);
     sh.execute.store(execute, Relaxed);
     sh.reset_stats();
     let started = chrono::Local::now();
+    sh.started_ts.store(started.timestamp().max(0) as u64, Relaxed);
+    sh.ended_ts.store(0, Relaxed);
     let mode = if execute { "execute" } else { "dry-run" };
     let logname = format!("{}-{mode}.log", started.format("%Y%m%d-%H%M%S"));
     let ldir = sh.env.config_dir.join("logs");
@@ -283,6 +539,7 @@ pub fn run(sh: &Shared, execute: bool) {
     sh.log(format!("=== START ({}) ===", if execute { "EXECUTE – echte Loeschung" } else { "DRY-RUN – es wird nichts veraendert" }));
     let (result, completed) = match run_inner(sh, execute) {
         Ok(()) if sh.halt() => ("gestoppt", false),
+        Ok(()) if sh.limit.load(Relaxed) => ("limit", false),
         Ok(()) => ("fertig", true),
         Err(e) => {
             sh.stats.errors.fetch_add(1, Relaxed);
@@ -293,6 +550,7 @@ pub fn run(sh: &Shared, execute: bool) {
     sh.phase(result);
     sh.log(format!("=== ENDE: {result} ==="));
     let ended = chrono::Local::now();
+    sh.ended_ts.store(ended.timestamp().max(0) as u64, Relaxed);
     add_history(
         &sh.env,
         json!({
@@ -303,7 +561,7 @@ pub fn run(sh: &Shared, execute: bool) {
     );
     *sh.logfile.lock().unwrap() = None;
     rotate(&ldir, sh.env.log_keep);
-    rotate(&sh.env.config_dir.join("reports"), sh.env.log_keep);
+    rotate(&sh.env.config_dir.join("reports"), sh.env.log_keep * 2);
     sh.running.store(false, Relaxed);
 }
 
@@ -367,7 +625,7 @@ pub fn manual_backup(sh: &Shared) -> Result<String, String> {
     r.map(|p| p.display().to_string())
 }
 
-/// Alle Logs + Reports + Verlauf + Einstellungen als ZIP (temporaere Datei wird sofort ausgehaengt).
+/// Alle Logs + Reports + Verlauf als ZIP (temporaere Datei wird sofort ausgehaengt).
 pub fn build_zip(sh: &Shared) -> std::io::Result<fs::File> {
     use std::io::{Seek, SeekFrom};
     use zip::write::SimpleFileOptions;
@@ -402,7 +660,7 @@ pub fn build_zip(sh: &Shared) -> std::io::Result<fs::File> {
             }
         }
     }
-    for n in ["history.json"] {
+    for n in ["history.json", "settings.json"] {
         if let Ok(mut f) = fs::File::open(env.config_dir.join(n)) {
             zw.start_file(n, opt)?;
             std::io::copy(&mut f, &mut zw)?;
@@ -414,8 +672,11 @@ pub fn build_zip(sh: &Shared) -> std::io::Result<fs::File> {
 }
 
 fn open(env: &Env, query_only: bool) -> Result<Connection, String> {
-    let c = Connection::open_with_flags(&env.db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)
-        .map_err(|e| format!("DB oeffnen ({}): {e} – Pfad/Volume pruefen, es wird absichtlich KEINE neue DB angelegt", env.db_path))?;
+    let c = Connection::open_with_flags(
+        &env.db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("DB oeffnen ({}): {e} – Pfad/Volume pruefen, es wird absichtlich KEINE neue DB angelegt", env.db_path))?;
     c.busy_timeout(std::time::Duration::from_secs(60)).map_err(|e| e.to_string())?;
     if query_only {
         c.execute_batch("PRAGMA query_only=ON; PRAGMA cache_size=-65536;").map_err(|e| e.to_string())?;
@@ -423,127 +684,6 @@ fn open(env: &Env, query_only: bool) -> Result<Connection, String> {
         c.execute_batch("PRAGMA foreign_keys=ON;").map_err(|e| e.to_string())?;
     }
     Ok(c)
-}
-
-fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
-    let env = &sh.env;
-    let settings = sh.settings.lock().unwrap().clone();
-    let reader = open(env, true)?;
-
-    let mut libs: HashMap<i64, String> = HashMap::new();
-    {
-        let mut st = reader.prepare("SELECT id, path FROM library").map_err(|e| format!("Das ist keine gueltige Navidrome-Datenbank (Tabelle 'library' fehlt): {e} – Volume fuer /data pruefen"))?;
-        let it = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))).map_err(|e| e.to_string())?;
-        for x in it {
-            let (id, p) = x.map_err(|e| e.to_string())?;
-            let mapped = map_root(env, &p);
-            if !Path::new(&mapped).is_dir() {
-                return Err(format!("Bibliothekspfad '{mapped}' (Navidrome: '{p}') existiert in diesem Container nicht – /music-Volume bzw. PATH_MAP pruefen"));
-            }
-            sh.log(format!("Bibliothek {id}: {p}"));
-            libs.insert(id, p);
-        }
-    }
-    let has_rated_at = {
-        let mut st = reader.prepare("PRAGMA table_info(annotation)").map_err(|e| e.to_string())?;
-        let cols: Vec<String> = st.query_map([], |r| r.get::<_, String>(1)).map_err(|e| e.to_string())?.filter_map(|x| x.ok()).collect();
-        cols.iter().any(|c| c == "rated_at")
-    };
-    let tags_ok = reader.prepare("SELECT CAST(tags AS TEXT) FROM media_file WHERE id=?1").is_ok();
-
-    // Writer + Backup nur im Execute-Modus
-    let mut writer = None;
-    if execute {
-        let w = open(env, false)?;
-        sh.phase("Backup");
-        let bk = backup(sh, &w)?;
-        sh.log(format!("Backup erstellt: {}", bk.display()));
-        writer = Some(w);
-    }
-
-    // Report-Datei (Audit-Trail)
-    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    let rdir = env.config_dir.join("reports");
-    let _ = fs::create_dir_all(&rdir);
-    let rpath = rdir.join(format!("{ts}-{}.tsv", if execute { "execute" } else { "dryrun" }));
-    let report = fs::File::create(&rpath).ok().map(BufWriter::new);
-    sh.log(format!("Report: {}", rpath.display()));
-
-    let same_exts: Vec<String> = if settings.dedupe_flac { env.same_exts.clone() } else { vec![] };
-    let ext_sql = |v: &Vec<String>| v.iter().map(|e| format!("'{e}'")).collect::<Vec<_>>().join(",");
-    let mut union: Vec<String> = env.keep_exts.iter().chain(env.delete_exts.iter()).chain(same_exts.iter()).cloned().collect();
-    union.sort();
-    union.dedup();
-    let all_exts = ext_sql(&union);
-    if env.keep_exts.is_empty() || env.delete_exts.is_empty() {
-        return Err("KEEP_EXTS/DELETE_EXTS leer".into());
-    }
-
-    sh.phase("zaehle Titel");
-    let total: i64 = reader
-        .query_row(&format!("SELECT count(*) FROM media_file WHERE missing=0 AND lower(suffix) IN ({all_exts})"), [], |r| r.get(0))
-        .map_err(|e| e.to_string())?;
-    sh.stats.total.store(total as u64, Relaxed);
-    sh.log(format!("{total} relevante Dateien ({all_exts})"));
-
-    let order = match env.match_mode {
-        MatchMode::Album => "album_id, disc_number, order_title",
-        MatchMode::ArtistTitle => "artist_id, order_title",
-    };
-    let sql = format!(
-        "SELECT id, library_id, path, title, album, album_id, artist_id, disc_number, order_title, suffix, size, duration, bit_rate, comment, track_number \
-         FROM media_file WHERE missing=0 AND lower(suffix) IN ({all_exts}) ORDER BY {order}"
-    );
-
-    let mut ctx = Ctx { sh, env, same_exts, settings, libs, reader: &reader, tags_ok, has_rated_at, writer, batch: vec![], report, execute };
-    sh.phase(if execute { "scanne + loesche" } else { "scanne (Dry-Run)" });
-
-    let mut stmt = reader.prepare(&sql).map_err(|e| e.to_string())?;
-    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
-    let mut key = String::new();
-    let mut group: Vec<Row> = vec![];
-
-    while let Some(r) = rows.next().map_err(|e| e.to_string())? {
-        if sh.halt() {
-            break;
-        }
-        let row = Row {
-            id: s(r, 0).map_err(|e| e.to_string())?,
-            library_id: n(r, 1).map_err(|e| e.to_string())?,
-            path: s(r, 2).map_err(|e| e.to_string())?,
-            title: s(r, 3).map_err(|e| e.to_string())?,
-            album: s(r, 4).map_err(|e| e.to_string())?,
-            suffix: s(r, 9).map_err(|e| e.to_string())?.to_lowercase(),
-            size: n(r, 10).map_err(|e| e.to_string())?,
-            duration: f(r, 11).map_err(|e| e.to_string())?,
-            bit_rate: n(r, 12).map_err(|e| e.to_string())?,
-            comment: s(r, 13).map_err(|e| e.to_string())?,
-            track: n(r, 14).map_err(|e| e.to_string())?,
-        };
-        let (a, b, c, d) = (s(r, 5).unwrap_or_default(), s(r, 6).unwrap_or_default(), n(r, 7).unwrap_or(0), s(r, 8).unwrap_or_default());
-        let k = if d.is_empty() {
-            format!("\u{0}{}", row.id) // ohne Titel nie gruppieren
-        } else if env.match_mode == MatchMode::Album {
-            format!("{a}\u{1}{c}\u{1}{d}")
-        } else {
-            format!("{b}\u{1}{d}")
-        };
-        sh.stats.scanned.fetch_add(1, Relaxed);
-        if k != key {
-            ctx.group(std::mem::take(&mut group))?;
-            key = k;
-        }
-        group.push(row);
-    }
-    if !sh.halt() {
-        ctx.group(group)?;
-    }
-    ctx.flush()?; // laufenden Block immer sauber abschliessen
-    if let Some(r) = ctx.report.as_mut() {
-        let _ = r.flush();
-    }
-    drop(rows);
-    Ok(())
 }
 
 fn backup(sh: &Shared, w: &Connection) -> Result<PathBuf, String> {
@@ -569,21 +709,199 @@ fn backup(sh: &Shared, w: &Connection) -> Result<PathBuf, String> {
     Ok(target)
 }
 
-// ───────────────────────── Gruppenlogik ─────────────────────────
+// ───────────────────────── Lauf ─────────────────────────
 
-struct Ctx<'a> {
+fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
+    let env = &sh.env;
+    let settings = sh.settings.lock().unwrap().clone();
+    if env.keep_exts.is_empty() {
+        return Err("KEEP_EXTS ist leer – ohne zu behaltendes Format kann nichts entschieden werden".into());
+    }
+    let same_exts: Vec<String> = if settings.dedupe_flac { env.same_exts.clone() } else { vec![] };
+    if env.delete_exts.is_empty() && same_exts.is_empty() {
+        return Err("Weder DELETE_EXTS noch die Bereinigung gleicher Formate ist aktiv – es gaebe nichts zu loeschen".into());
+    }
+
+    // ── Phase 1: planen (nur lesend) ──
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let rdir = env.config_dir.join("reports");
+    fs::create_dir_all(&rdir).map_err(|e| format!("Report-Ordner {}: {e}", rdir.display()))?;
+    let plan_path = rdir.join(format!("{ts}-{}-plan.tsv", if execute { "execute" } else { "dryrun" }));
+
+    let planned = {
+        let reader = open(env, true)?;
+        let schema = Schema::load(&reader)?;
+        let libs = libraries(sh, &reader)?;
+        sh.log(format!(
+            "Schema: rated_at={} bookmark={} playqueue={} scrobbles={} scrobble_buffer={} share={} playlists={}",
+            schema.ann.contains("rated_at"), schema.table("bookmark"), schema.table("playqueue"),
+            schema.table("scrobbles"), schema.table("scrobble_buffer"), schema.table("share"),
+            schema.table("playlist_tracks")
+        ));
+        sh.log(format!("Report/Plan: {}", plan_path.display()));
+        let plan = fs::File::create(&plan_path).map_err(|e| format!("Plan-Datei: {e}"))?;
+        let mut plan = BufWriter::new(plan);
+        writeln!(plan, "#keeper_id\tkeeper_path\tdel_id\tdel_path\tdel_size\treason").map_err(|e| e.to_string())?;
+        let n = scan(sh, &reader, &schema, &settings, &libs, &same_exts, &mut plan)?;
+        plan.flush().map_err(|e| e.to_string())?;
+        n
+    }; // Reader hier geschlossen: ab jetzt blockiert keine Lese-Transaktion den WAL-Checkpoint
+
+    sh.log(format!("Plan fertig: {planned} Loeschungen vorgemerkt"));
+    if !execute {
+        return Ok(());
+    }
+    if sh.halt() {
+        sh.log("Abbruch angefordert – es wird nichts geloescht");
+        return Ok(());
+    }
+    if planned == 0 {
+        return Ok(());
+    }
+
+    // ── Phase 2: anwenden ──
+    let mut w = open(env, false)?;
+    let schema = Schema::load(&w)?;
+    sh.phase("Backup");
+    let bk = backup(sh, &w)?;
+    sh.log(format!("Backup erstellt: {}", bk.display()));
+    sh.phase("uebertrage + loesche");
+    let applied = rdir.join(format!("{ts}-execute-applied.tsv"));
+    apply(sh, &mut w, &schema, &settings, &plan_path, &applied)
+}
+
+fn libraries(sh: &Shared, reader: &Connection) -> Result<HashMap<i64, String>, String> {
+    let mut libs: HashMap<i64, String> = HashMap::new();
+    let mut st = reader
+        .prepare("SELECT id, path FROM library")
+        .map_err(|e| format!("Tabelle 'library' nicht lesbar: {e} – Volume fuer /data pruefen"))?;
+    let it = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))).map_err(|e| e.to_string())?;
+    for x in it {
+        let (id, p) = x.map_err(|e| e.to_string())?;
+        let mapped = map_root(&sh.env, &p);
+        if !Path::new(&mapped).is_dir() {
+            return Err(format!(
+                "Bibliothekspfad '{mapped}' (Navidrome: '{p}') existiert in diesem Container nicht – /music-Volume bzw. PATH_MAP pruefen"
+            ));
+        }
+        sh.log(format!("Bibliothek {id}: {p}"));
+        libs.insert(id, p);
+    }
+    if libs.is_empty() {
+        return Err("Keine Bibliothek in der Datenbank gefunden".into());
+    }
+    Ok(libs)
+}
+
+// ───────────────────────── Phase 1: planen ─────────────────────────
+
+fn scan(
+    sh: &Shared,
+    reader: &Connection,
+    schema: &Schema,
+    settings: &Settings,
+    libs: &HashMap<i64, String>,
+    same_exts: &[String],
+    plan: &mut BufWriter<fs::File>,
+) -> Result<u64, String> {
+    let env = &sh.env;
+    let ext_sql = |v: &[String]| v.iter().map(|e| format!("'{e}'")).collect::<Vec<_>>().join(",");
+    let mut union: Vec<String> = env.keep_exts.iter().chain(env.delete_exts.iter()).chain(same_exts.iter()).cloned().collect();
+    union.sort();
+    union.dedup();
+    let all_exts = ext_sql(&union);
+
+    let missing = if schema.mf("missing") { "missing=0 AND " } else { "" };
+    sh.phase("zaehle Titel");
+    let total: i64 = reader
+        .query_row(&format!("SELECT count(*) FROM media_file WHERE {missing}lower(suffix) IN ({all_exts})"), [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    sh.stats.total.store(total as u64, Relaxed);
+    sh.log(format!("{total} relevante Dateien ({all_exts})"));
+
+    // Sortier-/Gruppierschluessel: identischer Ausdruck in SELECT und ORDER BY
+    let ot = schema.expr("order_title", "lower(title)");
+    let disc = schema.expr("disc_number", "0");
+    let order = match env.match_mode {
+        MatchMode::Album => format!("album_id, {disc}, {ot}"),
+        MatchMode::ArtistTitle => format!("artist_id, {ot}"),
+    };
+    let sql = format!(
+        "SELECT id, library_id, path, title, album, album_id, artist_id, {disc}, {ot}, suffix, size, duration, bit_rate, \
+                {comment}, {track}, {srate}, {depth}, {chan}, {mbz}, {tags}, {flags} \
+         FROM media_file WHERE {missing}lower(suffix) IN ({all_exts}) ORDER BY {order}",
+        comment = schema.expr("comment", "''"),
+        track = schema.expr("track_number", "0"),
+        srate = schema.expr("sample_rate", "0"),
+        depth = schema.expr("bit_depth", "0"),
+        chan = schema.expr("channels", "0"),
+        mbz = schema.expr("mbz_recording_id", "''"),
+        tags = if schema.mf("tags") { "CAST(tags AS TEXT)" } else { "''" },
+        flags = schema.tag_flags_expr(),
+    );
+
+    let mut ctx = Ctx { sh, env, same_exts: same_exts.to_vec(), settings: settings.clone(), libs: libs.clone(), plan, planned: 0 };
+    sh.phase("scanne und plane");
+
+    let mut stmt = reader.prepare(&sql).map_err(|e| format!("Abfrage vorbereiten: {e}"))?;
+    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+    let mut key = String::new();
+    let mut group: Vec<Row> = vec![];
+
+    while let Some(r) = rows.next().map_err(|e| e.to_string())? {
+        if sh.scan_done() {
+            break;
+        }
+        let row = Row {
+            id: s(r, 0),
+            library_id: n(r, 1),
+            path: s(r, 2),
+            title: s(r, 3),
+            album: s(r, 4),
+            suffix: s(r, 9).to_lowercase(),
+            size: n(r, 10),
+            duration: f(r, 11),
+            bit_rate: n(r, 12),
+            comment: s(r, 13),
+            track: n(r, 14),
+            sample_rate: n(r, 15),
+            bit_depth: n(r, 16),
+            channels: n(r, 17),
+            mbz: s(r, 18),
+            tags: s(r, 19),
+            tag_flags: s(r, 20),
+        };
+        let (album_id, artist_id, disc_v, raw_title) = (s(r, 5), s(r, 6), n(r, 7), s(r, 8));
+        // "Song (1)" und "Song" landen damit in derselben Gruppe
+        let title_key = norm_title(&raw_title, settings.strip_copy_suffix);
+        let k = if title_key.is_empty() {
+            format!("\u{0}{}", row.id) // ohne Titel nie gruppieren
+        } else if env.match_mode == MatchMode::Album {
+            format!("{album_id}\u{1}{disc_v}\u{1}{title_key}")
+        } else {
+            format!("{artist_id}\u{1}{title_key}")
+        };
+        sh.stats.scanned.fetch_add(1, Relaxed);
+        if k != key {
+            ctx.group(std::mem::take(&mut group))?;
+            key = k;
+        }
+        group.push(row);
+    }
+    if !sh.scan_done() {
+        ctx.group(group)?;
+    }
+    Ok(ctx.planned)
+}
+
+struct Ctx<'a, 'p> {
     sh: &'a Shared,
     env: &'a Env,
     same_exts: Vec<String>,
     settings: Settings,
     libs: HashMap<i64, String>,
-    reader: &'a Connection,
-    tags_ok: bool,
-    has_rated_at: bool,
-    writer: Option<Connection>,
-    batch: Vec<Pending>,
-    report: Option<BufWriter<fs::File>>,
-    execute: bool,
+    plan: &'p mut BufWriter<fs::File>,
+    planned: u64,
 }
 
 fn map_root(env: &Env, root: &str) -> String {
@@ -597,7 +915,18 @@ fn norm(p: &str) -> String {
     p.replace('\\', "/").to_lowercase()
 }
 
-impl<'a> Ctx<'a> {
+/// Dateikennung, um Hardlinks/Bind-Mounts auf dieselbe Datei zu erkennen.
+#[cfg(unix)]
+fn file_id(p: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(p).ok().map(|m| (m.dev(), m.ino()))
+}
+#[cfg(not(unix))]
+fn file_id(_p: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+impl<'a, 'p> Ctx<'a, 'p> {
     fn full(&self, r: &Row) -> PathBuf {
         let root = self.libs.get(&r.library_id).cloned().unwrap_or_default();
         Path::new(&map_root(self.env, &root)).join(&r.path)
@@ -613,62 +942,82 @@ impl<'a> Ctx<'a> {
     }
 
     fn is_protected(&self, r: &Row, full: &Path) -> bool {
-        let mut hay = format!("{}\n{}\n{}\n{}", r.title, r.album, r.comment, full.to_string_lossy()).to_lowercase();
-        if self.tags_ok {
-            if let Ok(mut st) = self.reader.prepare_cached("SELECT CAST(tags AS TEXT) FROM media_file WHERE id=?1") {
-                if let Ok(t) = st.query_row([&r.id], |x| x.get::<_, Option<String>>(0)) {
-                    hay.push('\n');
-                    hay.push_str(&t.unwrap_or_default().to_lowercase());
-                }
-            }
-        }
+        let hay = format!("{}\n{}\n{}\n{}\n{}", r.title, r.album, r.comment, r.tags, full.to_string_lossy()).to_lowercase();
         self.settings.keywords.iter().any(|k| {
             let k = k.trim().to_lowercase();
             !k.is_empty() && hay.contains(&k)
         })
     }
 
-    fn rep(&mut self, line: &str) {
-        if let Some(r) = self.report.as_mut() {
-            let _ = writeln!(r, "{line}");
-        }
+    /// Qualitaetsrang: je groesser, desto eher wird die Datei behalten.
+    /// Reihenfolge: Wunschformat, echte Audio-Qualitaet (Bit-Tiefe, Samplerate, Kanaele),
+    /// Tag-Vollstaendigkeit, "keine Kopie"-Dateiname, dann Bitrate und Groesse.
+    /// Bitrate und Groesse sind bei identischem FLAC-Audio bedeutungslos, Tags nicht –
+    /// deshalb stehen die Tags davor.
+    #[allow(clippy::type_complexity)]
+    fn qual(&self, r: &Row) -> (i32, i64, i64, i64, i64, i64, i64, i64, std::cmp::Reverse<String>) {
+        let ext = match self.env.keep_exts.iter().position(|e| e == &r.suffix) {
+            Some(i) => -(i as i32),
+            None => -1000,
+        };
+        let not_a_copy = if is_copy_name(&r.path) { 0 } else { 1 };
+        (ext, r.bit_depth, r.sample_rate, r.channels, r.tag_score(), not_a_copy, r.bit_rate, r.size,
+         std::cmp::Reverse(r.id.clone()))
+    }
+
+    fn write_plan(&mut self, keeper: &Row, kpath: &Path, d: &Row, dpath: &Path, reason: &str) -> Result<(), String> {
+        writeln!(
+            self.plan,
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            esc(&keeper.id),
+            esc(&kpath.to_string_lossy()),
+            esc(&d.id),
+            esc(&dpath.to_string_lossy()),
+            d.size.max(0),
+            esc(reason)
+        )
+        .map_err(|e| format!("Plan-Datei schreiben: {e}"))?;
+        self.planned += 1;
+        self.sh.stats.planned.fetch_add(1, Relaxed);
+        Ok(())
     }
 
     fn group(&mut self, g: Vec<Row>) -> Result<(), String> {
         if g.len() < 2 {
             return Ok(());
         }
-        // Behaltene Datei: bevorzugt aus KEEP_EXTS (z.B. FLAC); gibt es keine, aus den Same-Format-Typen.
-        // Entfernt werden: alle DELETE_EXTS-Dateien (nur wenn eine KEEP-Datei existiert) sowie
-        // weitere Dateien der DEDUPE_SAME_EXTS-Typen (z.B. doppelte FLACs).
-        let rank = |r: &&Row| (r.bit_rate, r.size, std::cmp::Reverse(r.id.clone()));
+        let sh = self.sh;
         let max = self.settings.max_delete;
-        if max > 0 && self.sh.stats.duplicates.load(Relaxed) >= max {
-            if !self.sh.stop.swap(true, Relaxed) {
-                self.sh.log(format!("Limit von {max} Duplikaten erreicht – Lauf wird sauber beendet"));
+        if max > 0 && sh.stats.duplicates.load(Relaxed) >= max {
+            if !sh.limit.swap(true, Relaxed) {
+                sh.log(format!("Limit von {max} Duplikaten erreicht – Scan wird sauber beendet"));
             }
             return Ok(());
         }
+
+        // Behalten wird bevorzugt eine Datei aus KEEP_EXTS (z. B. FLAC); gibt es keine,
+        // die beste Datei aus den Gleich-Format-Typen. Entfernt werden alle DELETE_EXTS-
+        // Dateien (nur wenn eine KEEP-Datei existiert) und weitere Gleich-Format-Dateien.
         let keepers: Vec<&Row> = g.iter().filter(|r| self.env.keep_exts.contains(&r.suffix)).collect();
-        let keeper_row: &Row = match keepers.iter().copied().max_by_key(rank) {
+        let keeper_row: &Row = match keepers.iter().copied().max_by_key(|r| self.qual(r)) {
             Some(k) => k,
-            None => match g.iter().filter(|r| self.same_exts.contains(&r.suffix)).max_by_key(rank) {
+            None => match g.iter().filter(|r| self.same_exts.contains(&r.suffix)).max_by_key(|r| self.qual(r)) {
                 Some(k) => k,
                 None => return Ok(()),
             },
         };
         let have_keep = !keepers.is_empty();
-        let dels: Vec<&Row> = g
+        let dels: Vec<Row> = g
             .iter()
             .filter(|r| {
                 r.id != keeper_row.id
                     && ((have_keep && self.env.delete_exts.contains(&r.suffix)) || self.same_exts.contains(&r.suffix))
             })
+            .cloned()
             .collect();
         if dels.is_empty() {
             return Ok(());
         }
-        let sh = self.sh;
         sh.stats.candidates.fetch_add(1, Relaxed);
 
         let paths: Vec<PathBuf> = g.iter().map(|r| self.full(r)).collect();
@@ -689,99 +1038,307 @@ impl<'a> Ctx<'a> {
             Ok(m) if m.len() > 0 => {}
             _ => {
                 sh.stats.errors.fetch_add(1, Relaxed);
-                sh.log(format!("SKIP (FLAC fehlt/leer auf Platte): {}", kpath.display()));
+                sh.log(format!("SKIP (zu behaltende Datei fehlt/leer auf Platte): {}", kpath.display()));
                 return Ok(());
             }
         }
+        let kid = file_id(&kpath);
 
-        let mut ok_dels = vec![];
         for d in dels {
             if (d.duration - keeper.duration).abs() > self.settings.duration_tol {
                 sh.stats.mismatch.fetch_add(1, Relaxed);
                 sh.log(format!("SKIP (Laenge weicht ab {:.1}s vs {:.1}s): {}", d.duration, keeper.duration, d.path));
                 continue;
             }
-            let dpath = self.full(d);
+            if self.settings.require_mbz_match
+                && !d.mbz.trim().is_empty()
+                && !keeper.mbz.trim().is_empty()
+                && d.mbz.trim() != keeper.mbz.trim()
+            {
+                sh.stats.mismatch.fetch_add(1, Relaxed);
+                sh.log(format!("SKIP (andere MusicBrainz-Recording-ID): {}", d.path));
+                continue;
+            }
+            let dpath = self.full(&d);
             if dpath == kpath {
                 continue; // dieselbe physische Datei – niemals loeschen
             }
-            if d.suffix == keeper.suffix && d.track != keeper.track {
+            if kid.is_some() && kid == file_id(&dpath) {
+                sh.stats.mismatch.fetch_add(1, Relaxed);
+                sh.log(format!("SKIP (Hardlink auf dieselbe Datei): {}", dpath.display()));
+                continue;
+            }
+            let same_format = d.suffix == keeper.suffix;
+            if same_format && self.settings.require_same_track && d.track != keeper.track {
                 sh.stats.mismatch.fetch_add(1, Relaxed);
                 sh.log(format!("SKIP (Tracknummer {} vs {} bei gleichem Format): {}", d.track, keeper.track, d.path));
                 continue;
             }
-            ok_dels.push((d.clone(), dpath));
-        }
-        if ok_dels.is_empty() {
-            return Ok(());
-        }
-        sh.stats.duplicates.fetch_add(ok_dels.len() as u64, Relaxed);
-
-        if !self.execute {
-            for (d, _) in &ok_dels {
-                sh.stats.bytes_freed.fetch_add(d.size.max(0) as u64, Relaxed);
-                sh.log(format!("[DRY] behalte {} | loesche {} ({:.1} MB)", keeper.path, d.path, d.size as f64 / 1048576.0));
-                let line = format!("{}\t{}\t{}\t{}", keeper.id, keeper.path, d.id, d.path);
-                self.rep(&line);
-            }
-            return Ok(());
-        }
-        self.batch.push(Pending { keeper, dels: ok_dels });
-        if self.batch.len() >= self.env.batch_size {
-            self.flush()?;
-        }
-        Ok(())
-    }
-
-    /// Ein Block = eine ACID-Transaktion. Dateien werden erst NACH erfolgreichem Commit geloescht.
-    fn flush(&mut self) -> Result<(), String> {
-        if self.batch.is_empty() {
-            return Ok(());
-        }
-        let batch = std::mem::take(&mut self.batch);
-        let sh = self.sh;
-        let w = self.writer.as_mut().ok_or("kein Writer")?;
-        let mut moved = 0u64;
-        {
-            let tx = w.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
-            for p in &batch {
-                for (d, _) in &p.dels {
-                    moved += transfer(&tx, &p.keeper.id, &d.id, self.has_rated_at, self.env.delete_rows)
-                        .map_err(|e| format!("Transaktion zurueckgerollt ({}): {e}", d.path))?;
+            let mut reason = if same_format {
+                format!("gleiches-format:{}", d.suffix)
+            } else {
+                format!("{}->{}", d.suffix, keeper.suffix)
+            };
+            // Tags: haette die zu loeschende Datei Felder, die der behaltenen fehlen?
+            let lost = d.tags_missing_in(&keeper);
+            if !lost.is_empty() {
+                let names: Vec<&str> = lost.iter().copied().map(tag_label).collect();
+                reason.push_str(&format!(";tagverlust={}", lost.iter().collect::<String>()));
+                sh.stats.tags_lost.fetch_add(1, Relaxed);
+                if self.settings.skip_on_tag_loss {
+                    sh.stats.mismatch.fetch_add(1, Relaxed);
+                    sh.log(format!(
+                        "SKIP (Tag-Verlust: {} nur in der Kopie vorhanden): {}",
+                        names.join(", "),
+                        d.path
+                    ));
+                    continue;
                 }
+                sh.log(format!(
+                    "TAG-WARNUNG: {} fehlen der behaltenen Datei {} (aus {})",
+                    names.join(", "),
+                    keeper.path,
+                    d.path
+                ));
             }
-            tx.commit().map_err(|e| format!("Commit fehlgeschlagen: {e}"))?;
-        }
-        sh.stats.annotations.fetch_add(moved, Relaxed);
-        for p in &batch {
-            for (d, full) in &p.dels {
-                match fs::remove_file(full) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        sh.stats.errors.fetch_add(1, Relaxed);
-                        sh.log(format!("FEHLER beim Loeschen {}: {e}", full.display()));
-                        continue;
-                    }
-                }
-                sh.stats.deleted.fetch_add(1, Relaxed);
+            sh.stats.duplicates.fetch_add(1, Relaxed);
+            if same_format {
+                sh.stats.same_format.fetch_add(1, Relaxed);
+            }
+            if !self.sh.execute.load(Relaxed) {
                 sh.stats.bytes_freed.fetch_add(d.size.max(0) as u64, Relaxed);
-                sh.log(format!("GELOESCHT {} (behalten: {})", d.path, p.keeper.path));
-                let line = format!("{}\t{}\t{}\t{}", p.keeper.id, p.keeper.path, d.id, d.path);
-                self.rep(&line);
+                sh.log(format!(
+                    "[PLAN {reason}] behalte {} | loesche {} ({:.1} MB)",
+                    keeper.path, d.path, d.size as f64 / 1048576.0
+                ));
             }
-        }
-        if let Some(r) = self.report.as_mut() {
-            let _ = r.flush();
+            self.write_plan(&keeper, &kpath, &d, &dpath, &reason)?;
         }
         Ok(())
     }
 }
 
-/// Uebertraegt Annotationen (Favorit, Plays, Rating), Playlist-Eintraege und markiert/loescht die MP3-Zeile.
-fn transfer(tx: &rusqlite::Transaction, keeper: &str, del: &str, rated_at: bool, delete_rows: bool) -> rusqlite::Result<u64> {
-    let (rc, rv, ru) = if rated_at {
-        (", rated_at", ", rated_at", ", rated_at = CASE WHEN excluded.rating > COALESCE(rating,0) THEN excluded.rated_at ELSE rated_at END")
+// ── Plan-Datei: TSV mit %-Escaping, damit Tabs/Zeilenumbrueche in Pfaden nichts zerstoeren ──
+
+fn esc(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '%' => o.push_str("%25"),
+            '\t' => o.push_str("%09"),
+            '\n' => o.push_str("%0A"),
+            '\r' => o.push_str("%0D"),
+            _ => o.push(c),
+        }
+    }
+    o
+}
+fn unesc(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut o = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                o.push(v as char);
+                i += 3;
+                continue;
+            }
+        }
+        // mehrbyte-sicher: bis zum naechsten Zeichenanfang kopieren
+        let ch = s[i..].chars().next().unwrap();
+        o.push(ch);
+        i += ch.len_utf8();
+    }
+    o
+}
+
+// ───────────────────────── Phase 2: anwenden ─────────────────────────
+
+fn apply(
+    sh: &Shared,
+    w: &mut Connection,
+    schema: &Schema,
+    settings: &Settings,
+    plan_path: &Path,
+    applied_path: &Path,
+) -> Result<(), String> {
+    let f = fs::File::open(plan_path).map_err(|e| format!("Plan-Datei lesen: {e}"))?;
+    let mut applied = fs::File::create(applied_path).map(BufWriter::new).ok();
+    if let Some(a) = applied.as_mut() {
+        let _ = writeln!(a, "#status\tkeeper_id\tkeeper_path\tdel_id\tdel_path\tdel_size\treason");
+    }
+    let mut batch: Vec<PlanRow> = Vec::with_capacity(sh.env.batch_size);
+    for line in BufReader::new(f).lines() {
+        if sh.halt() {
+            sh.log("Abbruch – restliche Plan-Eintraege bleiben unangetastet");
+            break;
+        }
+        let line = line.map_err(|e| e.to_string())?;
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let p: Vec<&str> = line.split('\t').collect();
+        if p.len() < 6 {
+            sh.stats.errors.fetch_add(1, Relaxed);
+            sh.log(format!("FEHLER: unlesbare Plan-Zeile: {line}"));
+            continue;
+        }
+        batch.push(PlanRow {
+            keeper_id: unesc(p[0]),
+            keeper_path: unesc(p[1]),
+            del_id: unesc(p[2]),
+            del_path: unesc(p[3]),
+            size: p[4].parse().unwrap_or(0),
+            reason: unesc(p[5]),
+        });
+        if batch.len() >= sh.env.batch_size {
+            flush(sh, w, schema, settings, std::mem::take(&mut batch), applied.as_mut())?;
+        }
+    }
+    if !batch.is_empty() {
+        flush(sh, w, schema, settings, batch, applied.as_mut())?;
+    }
+    if let Some(a) = applied.as_mut() {
+        let _ = a.flush();
+    }
+    Ok(())
+}
+
+/// Ein Block = eine ACID-Transaktion. Dateien werden erst NACH dem Commit geloescht.
+/// Scheitert der Block, wird er zurueckgerollt und jeder Eintrag einzeln erneut
+/// versucht – ein defekter Eintrag darf einen Lauf ueber Millionen Titel nicht abbrechen.
+fn flush(
+    sh: &Shared,
+    w: &mut Connection,
+    schema: &Schema,
+    settings: &Settings,
+    batch: Vec<PlanRow>,
+    applied: Option<&mut BufWriter<fs::File>>,
+) -> Result<(), String> {
+    match commit_batch(sh, w, schema, settings, &batch) {
+        Ok(()) => {
+            remove_files(sh, &batch, applied);
+            Ok(())
+        }
+        Err(e) => {
+            sh.log(format!("Block zurueckgerollt ({e}) – Eintraege werden einzeln geprueft"));
+            for one in batch {
+                let single = vec![one.clone()];
+                match commit_batch(sh, w, schema, settings, &single) {
+                    Ok(()) => remove_files(sh, &single, None),
+                    Err(e) => {
+                        sh.stats.errors.fetch_add(1, Relaxed);
+                        sh.log(format!("FEHLER (uebersprungen, nichts geloescht) {}: {e}", one.del_path));
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn commit_batch(
+    sh: &Shared,
+    w: &mut Connection,
+    schema: &Schema,
+    settings: &Settings,
+    batch: &[PlanRow],
+) -> Result<(), String> {
+    let mut moved = 0u64;
+    let mut playlists: HashSet<String> = HashSet::new();
+    let tx = w.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+    for p in batch {
+        moved += transfer(&tx, schema, settings, &p.keeper_id, &p.del_id, &mut playlists, sh.env.delete_rows)
+            .map_err(|e| format!("{}: {e}", p.del_path))?;
+    }
+    refresh_playlists(&tx, schema, &playlists).map_err(|e| format!("Playlist-Zaehler: {e}"))?;
+    tx.commit().map_err(|e| format!("Commit fehlgeschlagen: {e}"))?;
+    sh.stats.annotations.fetch_add(moved, Relaxed);
+    sh.stats.playlists.fetch_add(playlists.len() as u64, Relaxed);
+    Ok(())
+}
+
+fn remove_files(sh: &Shared, batch: &[PlanRow], mut applied: Option<&mut BufWriter<fs::File>>) {
+    for p in batch {
+        let dpath = Path::new(&p.del_path);
+        let kpath = Path::new(&p.keeper_path);
+        // Letzte Sicherung: die zu behaltende Datei muss existieren und nicht dieselbe sein
+        if dpath == kpath {
+            continue;
+        }
+        match fs::metadata(kpath) {
+            Ok(m) if m.len() > 0 => {}
+            _ => {
+                sh.stats.errors.fetch_add(1, Relaxed);
+                sh.log(format!(
+                    "FEHLER: zu behaltende Datei fehlt kurz vor dem Loeschen, {} bleibt erhalten: {}",
+                    p.del_path,
+                    kpath.display()
+                ));
+                continue;
+            }
+        }
+        let status = match fs::remove_file(dpath) {
+            Ok(()) => "GELOESCHT",
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => "FEHLTE-SCHON",
+            Err(e) => {
+                sh.stats.errors.fetch_add(1, Relaxed);
+                sh.log(format!("FEHLER beim Loeschen {}: {e}", p.del_path));
+                if let Some(a) = applied.as_mut() {
+                    let _ = writeln!(a, "FEHLER\t{}\t{}\t{}\t{}\t{}\t{}", esc(&p.keeper_id), esc(&p.keeper_path), esc(&p.del_id), esc(&p.del_path), p.size, esc(&p.reason));
+                }
+                continue;
+            }
+        };
+        if status == "GELOESCHT" {
+            sh.stats.deleted.fetch_add(1, Relaxed);
+            sh.stats.bytes_freed.fetch_add(p.size.max(0) as u64, Relaxed);
+        }
+        sh.log(format!("{status} {} (behalten: {})", p.del_path, p.keeper_path));
+        if let Some(a) = applied.as_mut() {
+            let _ = writeln!(a, "{status}\t{}\t{}\t{}\t{}\t{}\t{}", esc(&p.keeper_id), esc(&p.keeper_path), esc(&p.del_id), esc(&p.del_path), p.size, esc(&p.reason));
+        }
+    }
+    if let Some(a) = applied.as_mut() {
+        let _ = a.flush();
+    }
+}
+
+// ───────────────────────── Datenuebernahme ─────────────────────────
+
+/// Uebertraegt alles Nutzerbezogene von `del` auf `keeper` und markiert/loescht
+/// danach die Zeile von `del`. Laeuft komplett in der uebergebenen Transaktion –
+/// scheitert ein Schritt, bleibt die Datenbank unveraendert.
+///
+/// Uebernommen werden:
+/// * `annotation`  – Favorit (starred/starred_at), Bewertung (rating/rated_at),
+///                   Wiedergabezaehler (summiert) und letztes Abspieldatum, pro Nutzer
+/// * `bookmark`    – Lesezeichen/Positionen pro Nutzer
+/// * `playlist_tracks` – Playlist-Eintraege inkl. Position
+/// * `scrobbles` / `scrobble_buffer` – Wiedergabe-Historie und offene Scrobbles
+/// * `playqueue.items`, `share.resource_ids` – ID-Listen
+/// * `media_file.average_rating` – wird fuer den Keeper neu berechnet
+fn transfer(
+    tx: &rusqlite::Transaction,
+    sc: &Schema,
+    set: &Settings,
+    keeper: &str,
+    del: &str,
+    playlists: &mut HashSet<String>,
+    delete_rows: bool,
+) -> rusqlite::Result<u64> {
+    if keeper == del || keeper.is_empty() || del.is_empty() {
+        return Ok(0);
+    }
+
+    // ── 1. Annotationen zusammenfuehren (Favorit bleibt Favorit, Plays werden addiert) ──
+    let (rc, rv, ru) = if sc.ann.contains("rated_at") {
+        (
+            ", rated_at",
+            ", rated_at",
+            ", rated_at = CASE WHEN COALESCE(excluded.rating,0) > COALESCE(rating,0) THEN excluded.rated_at ELSE rated_at END",
+        )
     } else {
         ("", "", "")
     };
@@ -799,7 +1356,7 @@ fn transfer(tx: &rusqlite::Transaction, keeper: &str, del: &str, rated_at: bool,
     );
     let moved = tx.execute(&sql, params![keeper, del])? as u64;
 
-    // Verifikation: nichts darf auf der FLAC-ID "schlechter" sein als auf der MP3-ID
+    // Verifikation: auf dem Keeper darf nichts "schlechter" sein als auf der Quelle
     let bad: i64 = tx.query_row(
         "SELECT count(*) FROM annotation a WHERE a.item_id=?2 AND a.item_type='media_file' AND NOT EXISTS ( \
            SELECT 1 FROM annotation k WHERE k.user_id=a.user_id AND k.item_id=?1 AND k.item_type='media_file' \
@@ -810,22 +1367,515 @@ fn transfer(tx: &rusqlite::Transaction, keeper: &str, del: &str, rated_at: bool,
         |r| r.get(0),
     )?;
     if bad != 0 {
-        return Err(rusqlite::Error::StatementChangedRows(bad as usize));
+        return Err(rusqlite::Error::InvalidParameterName(format!(
+            "Favoriten/Bewertungen von {del} wurden nicht vollstaendig auf {keeper} uebernommen ({bad} Nutzer) – Block zurueckgerollt"
+        )));
     }
     tx.execute("DELETE FROM annotation WHERE item_id=?1 AND item_type='media_file'", params![del])?;
 
-    // Playlists: Eintrag auf FLAC umbiegen (ohne Doppelungen), Rest entfernen
-    tx.execute(
-        "UPDATE playlist_tracks SET media_file_id=?1 WHERE media_file_id=?2 \
-         AND playlist_id NOT IN (SELECT playlist_id FROM playlist_tracks WHERE media_file_id=?1)",
-        params![keeper, del],
-    )?;
-    tx.execute("DELETE FROM playlist_tracks WHERE media_file_id=?1", params![del])?;
+    // ── 2. Durchschnittsbewertung des Keepers nachziehen (Navidrome haelt sie zwischengespeichert) ──
+    if sc.mf("average_rating") {
+        tx.execute(
+            "UPDATE media_file SET average_rating = COALESCE((SELECT round(avg(rating),2) FROM annotation \
+             WHERE item_id=?1 AND item_type='media_file' AND rating>0), 0) WHERE id=?1",
+            params![keeper],
+        )?;
+    }
 
+    // ── 3. Lesezeichen ──
+    if sc.table("bookmark") && !sc.bookmark.is_empty() {
+        let c = sc.bookmark.join(", ");
+        tx.execute(
+            &format!(
+                "INSERT OR IGNORE INTO bookmark (user_id, item_id, item_type, {c}) \
+                 SELECT user_id, ?1, 'media_file', {c} FROM bookmark WHERE item_id=?2 AND item_type='media_file'"
+            ),
+            params![keeper, del],
+        )?;
+        tx.execute("DELETE FROM bookmark WHERE item_id=?1 AND item_type='media_file'", params![del])?;
+    }
+
+    // ── 4. Playlists ──
+    if sc.table("playlist_tracks") {
+        {
+            let mut st = tx.prepare_cached("SELECT DISTINCT playlist_id FROM playlist_tracks WHERE media_file_id=?1")?;
+            let it = st.query_map(params![del], |r| r.get::<_, String>(0))?;
+            for p in it {
+                playlists.insert(p?);
+            }
+        }
+        if set.playlist_keep_duplicates {
+            // Position und Anzahl bleiben erhalten – der Titel verschwindet nie aus der Playlist,
+            // selbst wenn die behaltene Datei dadurch doppelt vorkommt.
+            tx.execute("UPDATE playlist_tracks SET media_file_id=?1 WHERE media_file_id=?2", params![keeper, del])?;
+        } else {
+            tx.execute(
+                "UPDATE playlist_tracks SET media_file_id=?1 WHERE media_file_id=?2 \
+                 AND playlist_id NOT IN (SELECT playlist_id FROM playlist_tracks WHERE media_file_id=?1)",
+                params![keeper, del],
+            )?;
+            tx.execute("DELETE FROM playlist_tracks WHERE media_file_id=?1", params![del])?;
+        }
+    }
+
+    // ── 5. Wiedergabe-Historie ──
+    if sc.table("scrobbles") {
+        tx.execute("UPDATE scrobbles SET media_file_id=?1 WHERE media_file_id=?2", params![keeper, del])?;
+    }
+    if sc.table("scrobble_buffer") {
+        tx.execute("UPDATE OR IGNORE scrobble_buffer SET media_file_id=?1 WHERE media_file_id=?2", params![keeper, del])?;
+        tx.execute("DELETE FROM scrobble_buffer WHERE media_file_id=?1", params![del])?;
+    }
+
+    // ── 6. ID-Listen (Warteschlangen, Shares) ──
+    if sc.table("playqueue") {
+        replace_in_list(tx, "playqueue", "items", keeper, del)?;
+    }
+    if sc.table("share") {
+        replace_in_list(tx, "share", "resource_ids", keeper, del)?;
+    }
+
+    // ── 7. Abschlusspruefung: nichts darf mehr auf die Quelle zeigen ──
+    let mut checks: Vec<String> = vec![
+        "(SELECT count(*) FROM annotation WHERE item_id=?1 AND item_type='media_file')".into(),
+    ];
+    if sc.table("bookmark") {
+        checks.push("(SELECT count(*) FROM bookmark WHERE item_id=?1 AND item_type='media_file')".into());
+    }
+    if sc.table("playlist_tracks") {
+        checks.push("(SELECT count(*) FROM playlist_tracks WHERE media_file_id=?1)".into());
+    }
+    let left: i64 = tx.query_row(&format!("SELECT {}", checks.join(" + ")), params![del], |r| r.get(0))?;
+    if left != 0 {
+        return Err(rusqlite::Error::InvalidParameterName(format!(
+            "{left} Verweise auf {del} konnten nicht umgehaengt werden – Block zurueckgerollt"
+        )));
+    }
+
+    // ── 8. Quellzeile markieren oder entfernen ──
     if delete_rows {
         tx.execute("DELETE FROM media_file WHERE id=?1", params![del])?;
-    } else {
+    } else if sc.mf("missing") {
         tx.execute("UPDATE media_file SET missing=1 WHERE id=?1", params![del])?;
+    } else {
+        tx.execute("DELETE FROM media_file WHERE id=?1", params![del])?;
     }
     Ok(moved)
+}
+
+/// Ersetzt eine ID in einer komma-separierten ID-Liste (`playqueue.items`, `share.resource_ids`).
+/// Zweimal ausgefuehrt, damit auch direkt benachbarte Vorkommen erfasst werden.
+fn replace_in_list(tx: &rusqlite::Transaction, table: &str, col: &str, keeper: &str, del: &str) -> rusqlite::Result<()> {
+    if !cols(tx, table).iter().any(|c| c == col) {
+        return Ok(());
+    }
+    let repl = format!("replace(','||{col}||',', ','||?2||',', ','||?1||',')");
+    let sql = format!(
+        "UPDATE {table} SET {col} = substr({repl}, 2, length({repl})-2) \
+         WHERE {col} IS NOT NULL AND instr(','||{col}||',', ','||?2||',') > 0"
+    );
+    for _ in 0..2 {
+        tx.execute(&sql, params![keeper, del])?;
+    }
+    Ok(())
+}
+
+/// Playlist-Kennzahlen genau so neu berechnen wie Navidrome selbst (refreshCounters).
+fn refresh_playlists(tx: &rusqlite::Transaction, sc: &Schema, pls: &HashSet<String>) -> rusqlite::Result<()> {
+    if pls.is_empty() || !sc.table("playlist") || !sc.table("playlist_tracks") {
+        return Ok(());
+    }
+    let mut sets: Vec<&str> = vec![];
+    if sc.playlist.contains("duration") {
+        sets.push("duration = (SELECT COALESCE(SUM(m.duration),0) FROM playlist_tracks t JOIN media_file m ON m.id=t.media_file_id WHERE t.playlist_id=?1)");
+    }
+    if sc.playlist.contains("size") {
+        sets.push("size = (SELECT COALESCE(SUM(m.size),0) FROM playlist_tracks t JOIN media_file m ON m.id=t.media_file_id WHERE t.playlist_id=?1)");
+    }
+    if sc.playlist.contains("song_count") {
+        sets.push("song_count = (SELECT COUNT(*) FROM playlist_tracks t JOIN media_file m ON m.id=t.media_file_id WHERE t.playlist_id=?1)");
+    }
+    if sets.is_empty() {
+        return Ok(());
+    }
+    let sql = format!("UPDATE playlist SET {} WHERE id=?1", sets.join(", "));
+    for p in pls {
+        tx.execute(&sql, params![p])?;
+    }
+    Ok(())
+}
+
+// ───────────────────────── Tests ─────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "nd-dedupe-test-{tag}-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    const SCHEMA: &str = r#"
+    CREATE TABLE library (id integer primary key, path varchar not null);
+    CREATE TABLE media_file (
+        id varchar primary key, library_id integer not null, path varchar not null,
+        title varchar, album varchar, album_id varchar, artist_id varchar,
+        disc_number integer, order_title varchar, suffix varchar, size integer,
+        duration real, bit_rate integer, comment varchar, track_number integer,
+        sample_rate integer, bit_depth integer, channels integer,
+        mbz_recording_id varchar, tags varchar, missing bool default 0,
+        album_artist varchar, genre varchar, lyrics varchar, year integer, has_cover_art bool default 0,
+        average_rating real not null default 0);
+    CREATE TABLE annotation (
+        user_id varchar not null, item_id varchar not null, item_type varchar not null,
+        play_count integer default 0, play_date datetime, rating integer default 0,
+        starred bool default 0 not null, starred_at datetime, rated_at datetime,
+        unique (user_id, item_id, item_type));
+    CREATE TABLE playlist (id varchar primary key, name varchar, duration real default 0,
+        size integer default 0, song_count integer default 0);
+    CREATE TABLE playlist_tracks (id integer default 0 not null, playlist_id varchar not null,
+        media_file_id varchar not null);
+    CREATE UNIQUE INDEX playlist_tracks_pos ON playlist_tracks (playlist_id, id);
+    CREATE TABLE bookmark (user_id varchar not null, item_id varchar not null,
+        item_type varchar not null, comment varchar, position integer, changed_by varchar,
+        created_at datetime, updated_at datetime, unique (user_id, item_id, item_type));
+    CREATE TABLE playqueue (id varchar not null, user_id varchar not null, current integer default 0,
+        position real, changed_by varchar, items varchar, created_at datetime, updated_at datetime);
+    CREATE TABLE scrobbles (media_file_id varchar not null, user_id varchar not null,
+        submission_time integer not null);
+    CREATE TABLE scrobble_buffer (user_id varchar not null, service varchar not null,
+        media_file_id varchar not null, play_time datetime not null, enqueue_time datetime,
+        id varchar not null default '', unique (user_id, service, media_file_id, play_time));
+    CREATE TABLE share (id varchar primary key, resource_ids varchar not null, user_id varchar);
+    "#;
+
+    /// Legt eine Navidrome-aehnliche DB samt Musikdateien an.
+    /// Gruppe 1: mp3 + flac (mp3 muss weichen). Gruppe 2: zwei flac (die schlechtere muss weichen).
+    fn fixture() -> (Env, PathBuf, PathBuf) {
+        let music = tmpdir("music");
+        let cfg = tmpdir("cfg");
+        for (name, bytes) in [("g1.mp3", 300usize), ("g1.flac", 900), ("g2-lo.flac", 500), ("g2-hi.flac", 1500)] {
+            fs::write(music.join(name), vec![b'x'; bytes]).unwrap();
+        }
+        let db = cfg.join("navidrome.db");
+        let c = Connection::open(&db).unwrap();
+        c.execute_batch(SCHEMA).unwrap();
+        c.execute("INSERT INTO library (id, path) VALUES (1, ?1)", params![music.to_string_lossy()]).unwrap();
+        let ins = "INSERT INTO media_file (id, library_id, path, title, album, album_id, artist_id, disc_number, \
+                   order_title, suffix, size, duration, bit_rate, comment, track_number, sample_rate, bit_depth, \
+                   channels, mbz_recording_id, tags, missing) \
+                   VALUES (?1, 1, ?2, ?3, 'Album', ?4, 'art1', 1, ?5, ?6, ?7, ?8, ?9, '', ?10, 44100, ?11, 2, '', '{}', 0)";
+        // Gruppe 1
+        c.execute(ins, params!["mp3a", "g1.mp3", "Song One", "alb1", "song one", "mp3", 300, 180.0, 320, 1, 0]).unwrap();
+        c.execute(ins, params!["flacA", "g1.flac", "Song One", "alb1", "song one", "flac", 900, 180.4, 900, 1, 16]).unwrap();
+        // Gruppe 2: gleiche Datei zweimal als FLAC, einmal in besserer Qualitaet
+        c.execute(ins, params!["flacLo", "g2-lo.flac", "Song Two", "alb1", "song two", "flac", 500, 200.0, 700, 2, 16]).unwrap();
+        c.execute(ins, params!["flacHi", "g2-hi.flac", "Song Two", "alb1", "song two", "flac", 1500, 200.0, 1100, 2, 24]).unwrap();
+
+        // Nutzerdaten ausschliesslich auf den Dateien, die geloescht werden
+        c.execute("INSERT INTO annotation (user_id, item_id, item_type, play_count, play_date, rating, starred, starred_at) \
+                   VALUES ('u1','mp3a','media_file',7,'2024-01-01 10:00:00',5,1,'2024-01-01 09:00:00')", []).unwrap();
+        c.execute("INSERT INTO annotation (user_id, item_id, item_type, play_count, play_date, rating, starred, starred_at) \
+                   VALUES ('u1','flacA','media_file',2,'2023-01-01 10:00:00',0,0,NULL)", []).unwrap();
+        c.execute("INSERT INTO annotation (user_id, item_id, item_type, play_count, rating, starred) \
+                   VALUES ('u2','mp3a','media_file',1,4,0)", []).unwrap();
+        c.execute("INSERT INTO annotation (user_id, item_id, item_type, play_count, rating, starred) \
+                   VALUES ('u1','flacLo','media_file',3,3,1)", []).unwrap();
+
+        c.execute("INSERT INTO playlist (id, name) VALUES ('pl1','Favoriten')", []).unwrap();
+        for (pos, mf) in [(1, "mp3a"), (2, "flacA"), (3, "flacLo")] {
+            c.execute("INSERT INTO playlist_tracks (id, playlist_id, media_file_id) VALUES (?1,'pl1',?2)", params![pos, mf]).unwrap();
+        }
+        c.execute("UPDATE playlist SET song_count=3, duration=580.4, size=1700 WHERE id='pl1'", []).unwrap();
+
+        c.execute("INSERT INTO bookmark (user_id,item_id,item_type,comment,position) VALUES ('u1','mp3a','media_file','spaeter',42)", []).unwrap();
+        c.execute("INSERT INTO playqueue (id,user_id,current,items) VALUES ('q1','u1',0,'mp3a,flacLo,other')", []).unwrap();
+        c.execute("INSERT INTO scrobbles (media_file_id,user_id,submission_time) VALUES ('mp3a','u1',111)", []).unwrap();
+        c.execute("INSERT INTO scrobble_buffer (user_id,service,media_file_id,play_time) VALUES ('u1','lfm','mp3a','2024-01-01')", []).unwrap();
+        c.execute("INSERT INTO share (id,resource_ids,user_id) VALUES ('s1','mp3a,flacA','u1')", []).unwrap();
+        drop(c);
+
+        let env = Env {
+            db_path: db.to_string_lossy().to_string(),
+            backup_dir: cfg.join("backups"),
+            config_dir: cfg.clone(),
+            path_map: None,
+            keep_exts: vec!["flac".into()],
+            delete_exts: vec!["mp3".into()],
+            same_exts: vec!["flac".into()],
+            duration_tol: 3.0,
+            batch_size: 2,
+            backup_keep: 2,
+            match_mode: MatchMode::Album,
+            delete_rows: false,
+            ui_user: "admin".into(),
+            ui_pass: "x".into(),
+            generated_pass: false,
+            require_dryrun: false,
+            log_keep: 5,
+        };
+        (env, music, cfg)
+    }
+
+    /// Haengt ein Paar "g3.flac" / "g3 (1).flac" an die Fixture an.
+    /// Das Original hat Genre und Liedtext, die Kopie nur einen Kommentar –
+    /// so laesst sich Kopie-Erkennung und Tag-Warnung zusammen pruefen.
+    fn add_copy_pair(env: &Env, music: &Path) {
+        fs::write(music.join("g3.flac"), vec![b'x'; 800]).unwrap();
+        fs::write(music.join("g3 (1).flac"), vec![b'x'; 800]).unwrap();
+        let c = Connection::open(&env.db_path).unwrap();
+        let ins = "INSERT INTO media_file (id, library_id, path, title, album, album_id, artist_id, disc_number, \
+                   order_title, suffix, size, duration, bit_rate, comment, track_number, sample_rate, bit_depth, \
+                   channels, mbz_recording_id, tags, missing, genre, lyrics) \
+                   VALUES (?1, 1, ?2, ?3, 'Album', 'alb1', 'art1', 1, ?4, 'flac', 800, 240.0, 800, ?5, 3, 44100, 16, 2, '', '{}', 0, ?6, ?7)";
+        c.execute(ins, params!["flacOrig", "g3.flac", "Song Three", "song three", "", "Rock", "la la"]).unwrap();
+        c.execute(ins, params!["flacCopy", "g3 (1).flac", "Song Three (1)", "song three (1)", "aus dem Netz", Option::<String>::None, Option::<String>::None]).unwrap();
+    }
+
+    #[test]
+    fn title_normalisation() {
+        for (raw, want) in [
+            ("Song (1)", "song"),
+            ("Song (12)", "song"),
+            ("Song [2]", "song"),
+            ("Song - Copy", "song"),
+            ("Song Kopie", "song"),
+            ("Song (1) (2)", "song"),
+            ("Song", "song"),
+            // echte Klammer-Zusaetze duerfen nicht verschwinden
+            ("Song (Live)", "song (live)"),
+            ("Song (Remix 2)", "song (remix 2)"),
+            ("Nocturne No. 2", "nocturne no. 2"),
+        ] {
+            assert_eq!(norm_title(raw, true), want, "norm_title({raw:?})");
+        }
+        // abgeschaltet bleibt der Titel unveraendert
+        assert_eq!(norm_title("Song (1)", false), "song (1)");
+        assert!(is_copy_name("/musik/track (1).flac"));
+        assert!(is_copy_name("/musik/track - Copy.flac"));
+        assert!(!is_copy_name("/musik/track.flac"));
+        assert!(!is_copy_name("/musik/track (Live).flac"));
+    }
+
+    #[test]
+    fn copy_suffix_duplicates_are_found_and_original_kept() {
+        let (env, music, _cfg) = fixture();
+        add_copy_pair(&env, &music);
+        let sh = Shared::new(env);
+        run(&sh, true);
+        assert_eq!(sh.stats.errors.load(Relaxed), 0);
+        assert!(music.join("g3.flac").exists(), "Original mit den besseren Tags bleibt");
+        assert!(!music.join("g3 (1).flac").exists(), "die (1)-Kopie wird geloescht");
+        assert_eq!(sh.stats.tags_lost.load(Relaxed), 1, "Kommentar nur in der Kopie -> Warnung");
+    }
+
+    #[test]
+    fn copy_suffix_detection_can_be_disabled() {
+        let (env, music, _cfg) = fixture();
+        add_copy_pair(&env, &music);
+        let sh = Shared::new(env);
+        sh.settings.lock().unwrap().strip_copy_suffix = false;
+        run(&sh, true);
+        assert!(music.join("g3 (1).flac").exists(), "ohne Normalisierung bleibt die Kopie liegen");
+        assert_eq!(sh.stats.tags_lost.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn tag_loss_can_block_the_deletion() {
+        let (env, music, _cfg) = fixture();
+        add_copy_pair(&env, &music);
+        let sh = Shared::new(env);
+        sh.settings.lock().unwrap().skip_on_tag_loss = true;
+        run(&sh, true);
+        assert!(music.join("g3 (1).flac").exists(), "Tag-Verlust verhindert das Loeschen");
+        assert_eq!(sh.stats.tags_lost.load(Relaxed), 1);
+        assert!(!music.join("g1.mp3").exists(), "andere Gruppen laufen normal weiter");
+    }
+
+    #[test]
+    fn better_tags_win_when_audio_quality_is_equal() {
+        let (env, music, _cfg) = fixture();
+        add_copy_pair(&env, &music);
+        // Die Kopie ist groesser und hat die hoehere Bitrate - trotzdem muss das
+        // besser getaggte Original gewinnen, weil Tags vor Bitrate/Groesse zaehlen.
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("UPDATE media_file SET size=99999, bit_rate=1200 WHERE id='flacCopy'", []).unwrap();
+        }
+        let sh = Shared::new(env);
+        run(&sh, true);
+        assert!(music.join("g3.flac").exists(), "besser getaggtes Original bleibt");
+        assert!(!music.join("g3 (1).flac").exists());
+    }
+
+    #[test]
+    fn audio_quality_still_beats_tags() {
+        let (env, music, _cfg) = fixture();
+        add_copy_pair(&env, &music);
+        // Die Kopie ist 24 bit - echte Audio-Qualitaet schlaegt die Tags,
+        // der Tag-Verlust wird aber protokolliert.
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("UPDATE media_file SET bit_depth=24 WHERE id='flacCopy'", []).unwrap();
+        }
+        let sh = Shared::new(env);
+        run(&sh, true);
+        assert!(music.join("g3 (1).flac").exists(), "24-bit-Datei bleibt");
+        assert!(!music.join("g3.flac").exists());
+        assert!(sh.stats.tags_lost.load(Relaxed) >= 1, "Genre/Liedtext-Verlust gemeldet");
+    }
+
+    #[test]
+    fn escaping_roundtrip() {
+        for s in ["", "normal/pfad.flac", "mit\ttab", "zeile\numbruch", "100%\tcool", "Ümläüte – ok"] {
+            assert_eq!(unesc(&esc(s)), s, "roundtrip fuer {s:?}");
+        }
+        assert!(!esc("a\tb").contains('\t'));
+    }
+
+    #[test]
+    fn dry_run_changes_nothing() {
+        let (env, music, _cfg) = fixture();
+        let sh = Shared::new(env);
+        run(&sh, false);
+        assert_eq!(sh.stats.errors.load(Relaxed), 0, "Dry-Run ohne Fehler");
+        assert_eq!(sh.stats.duplicates.load(Relaxed), 2, "mp3 + schlechtere flac erkannt");
+        assert_eq!(sh.stats.same_format.load(Relaxed), 1, "eine FLAC-FLAC-Dublette");
+        assert_eq!(sh.stats.deleted.load(Relaxed), 0, "Dry-Run loescht nichts");
+        for f in ["g1.mp3", "g1.flac", "g2-lo.flac", "g2-hi.flac"] {
+            assert!(music.join(f).exists(), "{f} muss nach Dry-Run noch da sein");
+        }
+    }
+
+    #[test]
+    fn execute_keeps_favourites_playlists_and_history() {
+        let (env, music, _cfg) = fixture();
+        let db = env.db_path.clone();
+        let sh = Shared::new(env);
+        run(&sh, true);
+        assert_eq!(sh.stats.errors.load(Relaxed), 0, "Execute ohne Fehler");
+        assert_eq!(sh.stats.deleted.load(Relaxed), 2, "zwei Dateien geloescht");
+
+        // Dateien: die jeweils beste bleibt
+        assert!(!music.join("g1.mp3").exists(), "mp3 geloescht");
+        assert!(music.join("g1.flac").exists(), "flac behalten");
+        assert!(!music.join("g2-lo.flac").exists(), "schlechtere flac geloescht");
+        assert!(music.join("g2-hi.flac").exists(), "bessere flac behalten");
+
+        let c = Connection::open(&db).unwrap();
+        let one = |sql: &str| -> i64 { c.query_row(sql, [], |r| r.get(0)).unwrap() };
+        let txt = |sql: &str| -> String { c.query_row(sql, [], |r| r.get::<_, Option<String>>(0)).unwrap().unwrap_or_default() };
+
+        // Favorit, Bewertung und Wiedergaben von u1 sind auf der FLAC gelandet
+        assert_eq!(one("SELECT starred FROM annotation WHERE user_id='u1' AND item_id='flacA'"), 1, "Favorit erhalten");
+        assert_eq!(one("SELECT rating FROM annotation WHERE user_id='u1' AND item_id='flacA'"), 5, "Bewertung erhalten");
+        assert_eq!(one("SELECT play_count FROM annotation WHERE user_id='u1' AND item_id='flacA'"), 9, "Plays addiert (7+2)");
+        assert_eq!(
+            txt("SELECT play_date FROM annotation WHERE user_id='u1' AND item_id='flacA'"),
+            "2024-01-01 10:00:00",
+            "neueres Abspieldatum gewinnt"
+        );
+        // Zweiter Nutzer bekommt eine neue Zeile
+        assert_eq!(one("SELECT rating FROM annotation WHERE user_id='u2' AND item_id='flacA'"), 4, "Bewertung von u2 uebernommen");
+        // FLAC-FLAC: Favorit wandert auf die bessere Datei
+        assert_eq!(one("SELECT starred FROM annotation WHERE user_id='u1' AND item_id='flacHi'"), 1, "Favorit der FLAC-Dublette erhalten");
+        assert_eq!(one("SELECT rating FROM annotation WHERE user_id='u1' AND item_id='flacHi'"), 3);
+        // Keine Reste auf den geloeschten IDs
+        assert_eq!(one("SELECT count(*) FROM annotation WHERE item_id IN ('mp3a','flacLo')"), 0, "keine Annotation-Reste");
+        // Durchschnittsbewertung nachgezogen
+        assert_eq!(one("SELECT CAST(average_rating*100 AS INTEGER) FROM media_file WHERE id='flacA'"), 450, "avg(5,4)=4.5");
+
+        // Playlist: gleich viele Einträge, keiner zeigt mehr auf eine geloeschte Datei
+        assert_eq!(one("SELECT count(*) FROM playlist_tracks WHERE playlist_id='pl1'"), 3, "Playlist bleibt gleich lang");
+        assert_eq!(one("SELECT count(*) FROM playlist_tracks WHERE media_file_id IN ('mp3a','flacLo')"), 0, "keine toten Verweise");
+        assert_eq!(one("SELECT media_file_id='flacA' FROM playlist_tracks WHERE playlist_id='pl1' AND id=1"), 1, "Position 1 zeigt auf die FLAC");
+        assert_eq!(one("SELECT song_count FROM playlist WHERE id='pl1'"), 3, "song_count nachgezogen");
+
+        // Lesezeichen, Warteschlange, Historie, Share
+        assert_eq!(one("SELECT position FROM bookmark WHERE user_id='u1' AND item_id='flacA'"), 42, "Lesezeichen uebernommen");
+        assert_eq!(one("SELECT count(*) FROM bookmark WHERE item_id='mp3a'"), 0);
+        assert_eq!(txt("SELECT items FROM playqueue WHERE id='q1'"), "flacA,flacHi,other", "Warteschlange umgeschrieben");
+        assert_eq!(one("SELECT count(*) FROM scrobbles WHERE media_file_id='flacA'"), 1, "Scrobble-Historie uebernommen");
+        assert_eq!(one("SELECT count(*) FROM scrobble_buffer WHERE media_file_id='flacA'"), 1);
+        assert_eq!(txt("SELECT resource_ids FROM share WHERE id='s1'"), "flacA,flacA", "Share zeigt auf die FLAC");
+
+        // Quellzeilen sind als fehlend markiert, nicht geloescht (DELETE_ROWS=false)
+        assert_eq!(one("SELECT missing FROM media_file WHERE id='mp3a'"), 1, "mp3-Zeile als missing markiert");
+        assert_eq!(one("SELECT count(*) FROM media_file WHERE id='flacLo' AND missing=1"), 1);
+
+        // Backup wurde angelegt
+        assert!(!list_backups(&sh.env).is_empty(), "Backup vorhanden");
+    }
+
+    #[test]
+    fn protected_and_limits_are_respected() {
+        let (env, music, _cfg) = fixture();
+        let sh = Shared::new(env);
+        {
+            let mut s = sh.settings.lock().unwrap();
+            s.keywords = vec!["song one".into()]; // trifft Gruppe 1 ueber den Titel
+            s.max_delete = 0;
+        }
+        run(&sh, true);
+        assert_eq!(sh.stats.protected.load(Relaxed), 1, "Gruppe 1 geschuetzt");
+        assert!(music.join("g1.mp3").exists(), "geschuetzte Gruppe bleibt unangetastet");
+        assert_eq!(sh.stats.deleted.load(Relaxed), 1, "nur die FLAC-Dublette geloescht");
+    }
+
+    #[test]
+    fn duration_mismatch_is_skipped() {
+        let (env, music, _cfg) = fixture();
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("UPDATE media_file SET duration=300.0 WHERE id='mp3a'", []).unwrap();
+        }
+        let sh = Shared::new(env);
+        run(&sh, true);
+        assert!(music.join("g1.mp3").exists(), "abweichende Laenge -> nicht geloescht");
+        assert!(sh.stats.mismatch.load(Relaxed) >= 1);
+        assert_eq!(sh.stats.errors.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn different_musicbrainz_ids_are_skipped() {
+        let (env, music, _cfg) = fixture();
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("UPDATE media_file SET mbz_recording_id='aaa' WHERE id='flacLo'", []).unwrap();
+            c.execute("UPDATE media_file SET mbz_recording_id='bbb' WHERE id='flacHi'", []).unwrap();
+        }
+        let sh = Shared::new(env);
+        run(&sh, true);
+        assert!(music.join("g2-lo.flac").exists(), "andere Recording-ID -> nicht geloescht");
+        assert!(!music.join("g1.mp3").exists(), "Gruppe 1 bleibt davon unberuehrt");
+    }
+
+    #[test]
+    fn flac_dedupe_can_be_disabled() {
+        let (env, music, _cfg) = fixture();
+        let sh = Shared::new(env);
+        sh.settings.lock().unwrap().dedupe_flac = false;
+        run(&sh, true);
+        assert!(music.join("g2-lo.flac").exists(), "ohne FLAC-Bereinigung bleiben beide FLACs");
+        assert!(!music.join("g1.mp3").exists(), "mp3 wird trotzdem entfernt");
+        assert_eq!(sh.stats.deleted.load(Relaxed), 1);
+    }
+
+    #[test]
+    fn missing_database_is_reported_and_not_created() {
+        let cfg = tmpdir("nodb");
+        let mut env = fixture().0;
+        env.db_path = cfg.join("gibtsnicht.db").to_string_lossy().to_string();
+        let path = env.db_path.clone();
+        let sh = Shared::new(env);
+        run(&sh, false);
+        assert!(sh.stats.errors.load(Relaxed) > 0, "Fehler gemeldet");
+        assert!(!Path::new(&path).exists(), "es wird keine leere DB angelegt");
+    }
 }
