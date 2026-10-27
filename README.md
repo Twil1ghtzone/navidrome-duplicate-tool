@@ -10,6 +10,18 @@ Favoriten, Bewertungen, Wiedergabezaehler, Lesezeichen, Playlist-Eintraege, Scro
 3. Starten, `http://<server-ip>:8085` oeffnen. Ist `UI_PASSWORD` leer, wird eines erzeugt und im Container-Log angezeigt (gespeichert in `/config/.ui_password`).
 
 ## Updates
+Wenn nach einem Update weiter die alte Oberflaeche erscheint, zuerst pruefen, welche Version der
+**Dienst** meldet – `GET /healthz` antwortet ab v0.3 mit `ok navidrome-dedupe <version>`, davor nur mit `ok`:
+
+```
+curl -s http://<server-ip>:8085/healthz
+```
+
+Meldet der Dienst die neue Version, hing nur der Browser an einer zwischengespeicherten Seite:
+mit Strg+Umschalt+R neu laden. Ab v0.4.1 liefert der Dienst `Cache-Control: no-store`, damit das
+nicht mehr passieren kann. Meldet er die alte Version, lief das Update selbst nicht durch –
+dann `docker compose pull && docker compose up -d --force-recreate`.
+
 Das Image wird bei jedem Push auf `main` automatisch per GitHub Actions gebaut und nach `ghcr.io/twil1ghtzone/navidrome-duplicate-tool:latest` veroeffentlicht.
 In Dockge genuegt **Aktualisieren** (pull + Neuerstellung). Einmalig noetig: Auf GitHub unter *Profil -> Packages -> navidrome-duplicate-tool ->
 Package settings -> Change visibility* das Paket auf **Public** stellen, sonst kann der Server es nicht ohne Login ziehen.

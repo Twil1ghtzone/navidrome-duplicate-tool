@@ -276,6 +276,12 @@ async function poll() {
       v.textContent = "v" + d.version + " – neu laden";
       v.className = "ver old";
       v.onclick = () => location.reload();
+      // deutlich sichtbar, nicht nur als kleines Feld im Kopf
+      const e = document.createElement("div");
+      e.className = "warn";
+      e.textContent = "Diese Seite stammt aus Version " + PAGE_VERSION + ", der Dienst läuft bereits als "
+        + d.version + ". Seite neu laden (Strg+Umschalt+R), um die aktuelle Oberfläche zu bekommen.";
+      $("warnings").prepend(e);
     }
     const st = $("st");
     st.textContent = (d.running ? "läuft · " : "bereit · ") + d.phase + (d.execute ? " · AUSFÜHREN" : " · Dry-Run");
