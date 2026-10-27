@@ -44,6 +44,8 @@ pub struct Env {
     pub keep_exts: Vec<String>,
     pub delete_exts: Vec<String>,
     pub same_exts: Vec<String>,
+    /// Alle Formate, die der Bibliotheks-Scan indexiert (Inhaltssuche gilt fuer alle davon)
+    pub audio_exts: Vec<String>,
     pub duration_tol: f64,
     pub batch_size: usize,
     pub backup_keep: usize,
@@ -63,7 +65,7 @@ fn list(k: &str, d: &str) -> Vec<String> {
     var(k, d)
         .split(',')
         .map(|s| s.trim().trim_start_matches('.').to_lowercase())
-        .filter(|s| !s.is_empty() && s != "none" && s.chars().all(|c| c.is_ascii_alphanumeric()))
+        .filter(|s| !s.is_empty() && s != "none" && (s == "*" || s.chars().all(|c| c.is_ascii_alphanumeric())))
         .collect()
 }
 
@@ -111,7 +113,12 @@ impl Env {
             path_map,
             keep_exts: list("KEEP_EXTS", "flac"),
             delete_exts: list("DELETE_EXTS", "mp3"),
-            same_exts: list("DEDUPE_SAME_EXTS", "flac"),
+            // "*" = jedes Format, das auch sonst betrachtet wird (FLAC/FLAC, MP3/MP3, ...)
+            same_exts: list("DEDUPE_SAME_EXTS", "*"),
+            audio_exts: list(
+                "AUDIO_EXTS",
+                "flac,mp3,m4a,m4b,aac,alac,ogg,oga,opus,wma,wav,aiff,aif,ape,wv,mpc,dsf,dff",
+            ),
             duration_tol: var("DURATION_TOLERANCE", "3").parse().unwrap_or(3.0),
             batch_size: var("BATCH_SIZE", "200").parse().unwrap_or(200).max(1),
             backup_keep: var("BACKUP_KEEP", "3").parse().unwrap_or(3),
@@ -159,6 +166,13 @@ pub struct Settings {
     pub report_unknown: bool,
     /// Geloeschte Dateien in den Papierkorb verschieben statt entfernen.
     pub use_trash: bool,
+    /// Eigene Index-Datenbank fuehren (/config/index.db).
+    pub use_index: bool,
+    /// Unveraenderte Dateien nicht erneut untersuchen, sondern aus dem Index nehmen.
+    pub reuse_index: bool,
+    /// Echter Lauf uebernimmt den Plan des letzten vollstaendigen Dry-Runs,
+    /// statt die Bibliothek noch einmal zu durchsuchen.
+    pub reuse_plan: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -178,6 +192,9 @@ impl Default for Settings {
             verify_bytes: true,
             report_unknown: true,
             use_trash: false,
+            use_index: true,
+            reuse_index: true,
+            reuse_plan: false,
         }
     }
 }
@@ -193,6 +210,7 @@ pub struct Stats {
     pub same_format: AtomicU64,
     pub planned: AtomicU64,
     pub files: AtomicU64,
+    pub reused: AtomicU64,
     pub unknown: AtomicU64,
     pub exact: AtomicU64,
     pub tags_lost: AtomicU64,
@@ -267,7 +285,8 @@ impl Shared {
             "total": st.total.load(Relaxed), "scanned": st.scanned.load(Relaxed),
             "candidates": st.candidates.load(Relaxed), "duplicates": st.duplicates.load(Relaxed),
             "same_format": st.same_format.load(Relaxed), "planned": st.planned.load(Relaxed),
-            "files": st.files.load(Relaxed), "unknown": st.unknown.load(Relaxed),
+            "files": st.files.load(Relaxed), "reused": st.reused.load(Relaxed),
+            "unknown": st.unknown.load(Relaxed),
             "exact": st.exact.load(Relaxed),
             "tags_lost": st.tags_lost.load(Relaxed),
             "protected": st.protected.load(Relaxed), "excluded": st.excluded.load(Relaxed),
@@ -283,7 +302,7 @@ impl Shared {
     fn reset_stats(&self) {
         let s = &self.stats;
         for a in [&s.total, &s.scanned, &s.candidates, &s.duplicates, &s.same_format, &s.planned,
-                  &s.files, &s.unknown, &s.exact,
+                  &s.files, &s.reused, &s.unknown, &s.exact,
                   &s.tags_lost, &s.protected, &s.excluded, &s.mismatch, &s.deleted, &s.bytes_freed,
                   &s.annotations, &s.playlists, &s.errors] {
             a.store(0, Relaxed);
@@ -307,6 +326,7 @@ fn load_settings(env: &Env) -> Settings {
         let mut s = Settings::default();
         s.duration_tol = env.duration_tol;
         s.dedupe_flac = !env.same_exts.is_empty();
+        s.mode = "both".into();
         s
     })
 }
@@ -536,13 +556,21 @@ pub struct Planner {
     plan: BufWriter<fs::File>,
     pub planned: u64,
     doomed: HashSet<String>,
+    /// eigene Verbindung zum Index, damit der laufende Scan nicht blockiert wird
+    idx: Option<(Connection, i64)>,
 }
 
 impl Planner {
     pub fn new(file: fs::File) -> Result<Planner, String> {
         let mut plan = BufWriter::new(file);
         writeln!(plan, "#keeper_id\tkeeper_path\tdel_id\tdel_path\tdel_size\treason").map_err(|e| e.to_string())?;
-        Ok(Planner { plan, planned: 0, doomed: HashSet::new() })
+        Ok(Planner { plan, planned: 0, doomed: HashSet::new(), idx: None })
+    }
+
+    /// Haelt jede geplante Loeschung zusaetzlich im Index fest.
+    pub fn with_index(mut self, c: Connection, run: i64) -> Planner {
+        self.idx = Some((c, run));
+        self
     }
 
     /// Merkt eine Loeschung vor. Gibt false zurueck, wenn sie verworfen wurde.
@@ -574,6 +602,9 @@ impl Planner {
             esc(keeper_id), esc(keeper_path), esc(del_id), esc(del_path), size.max(0), esc(reason)
         )
         .map_err(|e| format!("Plan-Datei schreiben: {e}"))?;
+        if let Some((c, run)) = &self.idx {
+            crate::index::add_plan(c, *run, keeper_id, keeper_path, del_id, del_path, size.max(0), reason)?;
+        }
         self.doomed.insert(del_path.to_string());
         self.planned += 1;
         sh.stats.planned.fetch_add(1, Relaxed);
@@ -802,7 +833,19 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
     if env.keep_exts.is_empty() {
         return Err("KEEP_EXTS ist leer – ohne zu behaltendes Format kann nichts entschieden werden".into());
     }
-    let same_exts: Vec<String> = if settings.dedupe_flac { env.same_exts.clone() } else { vec![] };
+    // Gleiche Formate bereinigen heisst: doppelte FLACs, doppelte MP3s, doppelte M4As ...
+    let same_exts: Vec<String> = if settings.dedupe_flac {
+        if env.same_exts.iter().any(|e| e == "*") {
+            let mut v: Vec<String> = env.keep_exts.iter().chain(env.delete_exts.iter()).cloned().collect();
+            v.sort();
+            v.dedup();
+            v
+        } else {
+            env.same_exts.clone()
+        }
+    } else {
+        vec![]
+    };
     if env.delete_exts.is_empty() && same_exts.is_empty() {
         return Err("Weder DELETE_EXTS noch die Bereinigung gleicher Formate ist aktiv – es gaebe nichts zu loeschen".into());
     }
@@ -820,7 +863,39 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
         _ => (true, true),
     };
 
-    let planned = {
+    let mut idx = if settings.use_index { Some(crate::index::open(env)?) } else { None };
+    let run_id = match &idx {
+        Some(c) => crate::index::start_run(c, &mode, execute)?,
+        None => 0,
+    };
+    // Der echte Lauf darf den Plan des letzten vollstaendigen Dry-Runs uebernehmen.
+    let mut plan_run = run_id;
+    let mut reused_plan = false;
+    if execute && settings.reuse_plan {
+        if let Some(c) = &idx {
+            if let Some((old, started, n)) = crate::index::reusable_plan(c) {
+                sh.log(format!("Uebernehme den Plan des Dry-Runs vom {started} ({n} Eintraege) – es wird nicht neu gesucht"));
+                let rows = crate::index::plan_rows(c, old)?;
+                let mut planner = Planner::new(fs::File::create(&plan_path).map_err(|e| format!("Plan-Datei: {e}"))?)?;
+                for (ki, kp, di, dp, size, reason) in rows {
+                    if !Path::new(&dp).is_file() {
+                        sh.log(format!("SKIP (nicht mehr vorhanden): {dp}"));
+                        continue;
+                    }
+                    planner.add(sh, &ki, &kp, &di, &dp, size, &reason)?;
+                }
+                planner.flush()?;
+                plan_run = old;
+                reused_plan = true;
+            } else {
+                sh.log("Kein uebernehmbarer Dry-Run-Plan im Index – es wird normal gesucht");
+            }
+        }
+    }
+
+    let planned = if reused_plan {
+        sh.stats.planned.load(Relaxed)
+    } else {
         let reader = open(env, true)?;
         let schema = Schema::load(&reader)?;
         let libs = libraries(sh, &reader)?;
@@ -844,9 +919,28 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
         sh.stats.total.store(media_count * phases.max(1), Relaxed);
         sh.log(format!("{media_count} relevante Titel in Navidrome"));
         sh.log(format!("Report/Plan: {}", plan_path.display()));
-        let mut planner = Planner::new(fs::File::create(&plan_path).map_err(|e| format!("Plan-Datei: {e}"))?)?;
+        let planner = Planner::new(fs::File::create(&plan_path).map_err(|e| format!("Plan-Datei: {e}"))?);
+        let mut planner = match (planner, &idx) {
+            (Ok(p), Some(_)) => p.with_index(crate::index::open(env)?, run_id),
+            (Ok(p), None) => p,
+            (Err(e), _) => return Err(e),
+        };
         if do_content && !sh.scan_done() {
-            crate::content::scan(sh, env, &reader, &schema, &settings, &libs, &same_exts, &mut planner)?;
+            match idx.as_mut() {
+                Some(c) => crate::content::scan(sh, env, &reader, &schema, &settings, &libs, c, run_id, &mut planner)?,
+                None => {
+                    // ohne Index arbeitet der Bibliotheks-Scan auf einer Wegwerf-Datenbank
+                    let tmp = env.config_dir.join("scan-tmp.db");
+                    let _ = fs::remove_file(&tmp);
+                    let mut c = crate::index::open_at(&tmp)?;
+                    let r = crate::content::scan(sh, env, &reader, &schema, &settings, &libs, &mut c, run_id, &mut planner);
+                    drop(c);
+                    for suffix in ["", "-wal", "-shm"] {
+                        let _ = fs::remove_file(format!("{}{suffix}", tmp.display()));
+                    }
+                    r?
+                }
+            }
         }
         if do_db && !sh.scan_done() {
             scan(sh, &reader, &schema, &settings, &libs, &same_exts, &mut planner)?;
@@ -855,6 +949,9 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
         planner.planned
     }; // Reader hier geschlossen: ab jetzt blockiert keine Lese-Transaktion den WAL-Checkpoint
 
+    if let Some(c) = &idx {
+        crate::index::end_run(c, run_id, sh.stats.files.load(Relaxed), planned, !sh.scan_done());
+    }
     sh.log(format!("Plan fertig: {planned} Loeschungen vorgemerkt"));
     if !execute {
         return Ok(());
@@ -883,7 +980,7 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
         None
     };
     let applied = rdir.join(format!("{ts}-execute-applied.tsv"));
-    apply(sh, &mut w, &schema, &settings, trash.as_deref(), &plan_path, &applied)
+    apply(sh, &mut w, &schema, &settings, trash.as_deref(), idx.as_ref().map(|c| (c, plan_run)), &plan_path, &applied)
 }
 
 /// Zahl der Titel, die ueberhaupt in Frage kommen – dient als Massstab fuer den Fortschritt.
@@ -1286,6 +1383,7 @@ fn apply(
     schema: &Schema,
     settings: &Settings,
     trash: Option<&Path>,
+    idx: Option<(&Connection, i64)>,
     plan_path: &Path,
     applied_path: &Path,
 ) -> Result<(), String> {
@@ -1319,11 +1417,11 @@ fn apply(
             reason: unesc(p[5]),
         });
         if batch.len() >= sh.env.batch_size {
-            flush(sh, w, schema, settings, trash, std::mem::take(&mut batch), applied.as_mut())?;
+            flush(sh, w, schema, settings, trash, idx, std::mem::take(&mut batch), applied.as_mut())?;
         }
     }
     if !batch.is_empty() {
-        flush(sh, w, schema, settings, trash, batch, applied.as_mut())?;
+        flush(sh, w, schema, settings, trash, idx, batch, applied.as_mut())?;
     }
     if let Some(a) = applied.as_mut() {
         let _ = a.flush();
@@ -1367,12 +1465,13 @@ fn flush(
     schema: &Schema,
     settings: &Settings,
     trash: Option<&Path>,
+    idx: Option<(&Connection, i64)>,
     batch: Vec<PlanRow>,
     applied: Option<&mut BufWriter<fs::File>>,
 ) -> Result<(), String> {
     match commit_batch(sh, w, schema, settings, &batch) {
         Ok(()) => {
-            remove_files(sh, trash, &batch, applied);
+            remove_files(sh, trash, idx, &batch, applied);
             Ok(())
         }
         Err(e) => {
@@ -1380,9 +1479,12 @@ fn flush(
             for one in batch {
                 let single = vec![one.clone()];
                 match commit_batch(sh, w, schema, settings, &single) {
-                    Ok(()) => remove_files(sh, trash, &single, None),
+                    Ok(()) => remove_files(sh, trash, idx, &single, None),
                     Err(e) => {
                         sh.stats.errors.fetch_add(1, Relaxed);
+                        if let Some((c, run)) = idx {
+                            crate::index::set_status(c, run, &one.del_path, "fehler");
+                        }
                         sh.log(format!("FEHLER (uebersprungen, nichts geloescht) {}: {e}", one.del_path));
                     }
                 }
@@ -1413,7 +1515,13 @@ fn commit_batch(
     Ok(())
 }
 
-fn remove_files(sh: &Shared, trash: Option<&Path>, batch: &[PlanRow], mut applied: Option<&mut BufWriter<fs::File>>) {
+fn remove_files(
+    sh: &Shared,
+    trash: Option<&Path>,
+    idx: Option<(&Connection, i64)>,
+    batch: &[PlanRow],
+    mut applied: Option<&mut BufWriter<fs::File>>,
+) {
     for p in batch {
         let dpath = Path::new(&p.del_path);
         let kpath = Path::new(&p.keeper_path);
@@ -1452,6 +1560,18 @@ fn remove_files(sh: &Shared, trash: Option<&Path>, batch: &[PlanRow], mut applie
         if status == "GELOESCHT" || status == "VERSCHOBEN" {
             sh.stats.deleted.fetch_add(1, Relaxed);
             sh.stats.bytes_freed.fetch_add(p.size.max(0) as u64, Relaxed);
+        }
+        if let Some((c, run)) = idx {
+            crate::index::set_status(
+                c,
+                run,
+                &p.del_path,
+                match status {
+                    "GELOESCHT" => "geloescht",
+                    "VERSCHOBEN" => "verschoben",
+                    _ => "fehlte-schon",
+                },
+            );
         }
         sh.log(format!("{status} {} (behalten: {})", p.del_path, p.keeper_path));
         if let Some(a) = applied.as_mut() {
@@ -1774,7 +1894,8 @@ mod tests {
             path_map: None,
             keep_exts: vec!["flac".into()],
             delete_exts: vec!["mp3".into()],
-            same_exts: vec!["flac".into()],
+            same_exts: vec!["flac".into(), "mp3".into()],
+            audio_exts: vec!["flac".into(), "mp3".into()],
             duration_tol: 3.0,
             batch_size: 2,
             backup_keep: 2,
@@ -2034,6 +2155,115 @@ mod tests {
         assert_eq!(sh.stats.errors.load(Relaxed), 0);
         let left = ["Rest/mit-tags.mp3", "Rest/mehr-tags.mp3"].iter().filter(|p| music.join(p).exists()).count();
         assert_eq!(left, 1, "von zwei inhaltsgleichen MP3s bleibt genau eine");
+    }
+
+    // ───────── Index-Datenbank ─────────
+
+    #[test]
+    fn doppelte_mp3s_ohne_flac_werden_bereinigt() {
+        let (env, music, _cfg) = fixture();
+        fs::write(music.join("solo-192.mp3"), vec![b'y'; 400]).unwrap();
+        fs::write(music.join("solo-320.mp3"), vec![b'z'; 900]).unwrap();
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            let ins = "INSERT INTO media_file (id, library_id, path, title, album, album_id, artist_id, disc_number, \
+                       order_title, suffix, size, duration, bit_rate, comment, track_number, sample_rate, bit_depth, \
+                       channels, mbz_recording_id, tags, missing, genre) \
+                       VALUES (?1, 1, ?2, 'Solo', 'Album', 'albS', 'art1', 1, 'solo', 'mp3', ?3, 150.0, ?4, '', 1, 44100, 0, 2, '', '{}', 0, ?5)";
+            c.execute(ins, params!["mp3lo", "solo-192.mp3", 400, 192, Option::<String>::None]).unwrap();
+            c.execute(ins, params!["mp3hi", "solo-320.mp3", 900, 320, "Pop"]).unwrap();
+            c.execute("INSERT INTO annotation (user_id,item_id,item_type,play_count,rating,starred) \
+                       VALUES ('u1','mp3lo','media_file',4,5,1)", []).unwrap();
+        }
+        let sh = db_mode(env);
+        let db = sh.env.db_path.clone();
+        run(&sh, true);
+        assert_eq!(sh.stats.errors.load(Relaxed), 0);
+        assert!(music.join("solo-320.mp3").exists(), "die bessere MP3 bleibt");
+        assert!(!music.join("solo-192.mp3").exists(), "die schlechtere MP3 geht, auch ohne FLAC");
+        let c = Connection::open(&db).unwrap();
+        let starred: i64 = c
+            .query_row("SELECT starred FROM annotation WHERE user_id='u1' AND item_id='mp3hi'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(starred, 1, "Favorit wandert auf die behaltene MP3");
+    }
+
+    #[test]
+    fn index_wird_angelegt_und_beim_zweiten_lauf_genutzt() {
+        let (env, _music, cfg) = content_fixture();
+        let sh = content_mode(env);
+        run(&sh, false);
+        let erster = sh.stats.files.load(Relaxed);
+        assert!(erster > 0, "Dateien im Index erfasst");
+        assert_eq!(sh.stats.reused.load(Relaxed), 0, "beim ersten Lauf gibt es nichts zu uebernehmen");
+        assert!(cfg.join("index.db").is_file(), "Index-Datenbank angelegt");
+
+        run(&sh, false);
+        assert_eq!(sh.stats.files.load(Relaxed), erster, "gleiche Dateizahl");
+        assert_eq!(sh.stats.reused.load(Relaxed), erster, "zweiter Lauf nimmt alles aus dem Index");
+    }
+
+    #[test]
+    fn geaenderte_dateien_werden_neu_eingelesen() {
+        let (env, music, _cfg) = content_fixture();
+        let sh = content_mode(env);
+        run(&sh, false);
+        let n = sh.stats.files.load(Relaxed);
+        // eine Datei austauschen: andere Groesse, andere Zeit
+        fs::write(music.join("Downloads/irgendwas.flac"), crate::audio::flac_bytes([0x99; 16], 44100, 16, 2, 441000, 1234)).unwrap();
+        run(&sh, false);
+        assert_eq!(sh.stats.files.load(Relaxed), n);
+        assert_eq!(sh.stats.reused.load(Relaxed), n - 1, "genau die geaenderte Datei wird neu gelesen");
+    }
+
+    #[test]
+    fn plan_aus_dem_dry_run_wird_uebernommen() {
+        let (env, music, _cfg) = content_fixture();
+        let sh = content_mode(env);
+        run(&sh, false);
+        assert_eq!(sh.stats.planned.load(Relaxed), 1, "ein Duplikat vorgemerkt");
+
+        sh.settings.lock().unwrap().reuse_plan = true;
+        run(&sh, true);
+        assert_eq!(sh.stats.files.load(Relaxed), 0, "der echte Lauf durchsucht nichts mehr");
+        assert_eq!(sh.stats.deleted.load(Relaxed), 1, "er wendet den gespeicherten Plan an");
+        assert!(!music.join("Downloads/irgendwas.flac").exists());
+        assert!(music.join("Alben/Nachtflug/01 Lied.flac").exists());
+    }
+
+    #[test]
+    fn index_laesst_sich_durchsuchen_und_filtern() {
+        let (env, _music, _cfg) = content_fixture();
+        let sh = content_mode(env);
+        run(&sh, false);
+
+        let c = crate::index::open_ro(&sh.env).unwrap();
+        let all = crate::index::search(&c, "", "all", "", 100, 0).unwrap();
+        assert!(all["total"].as_i64().unwrap() >= 2);
+
+        let treffer = crate::index::search(&c, "irgendwas", "all", "", 100, 0).unwrap();
+        assert_eq!(treffer["total"], 1, "Suche nach dem Dateinamen");
+
+        let dups = crate::index::search(&c, "", "dups", "", 100, 0).unwrap();
+        assert_eq!(dups["total"], 2, "beide Seiten des Duplikats");
+
+        let geplant = crate::index::search(&c, "", "planned", "", 100, 0).unwrap();
+        assert_eq!(geplant["total"], 1, "nur die vorgemerkte Datei");
+
+        let s = crate::index::summary(&c).unwrap();
+        assert_eq!(s["duplicates"], 1, "eine ueberzaehlige Kopie");
+        assert!(s["reusable"].is_object(), "der Plan ist uebernehmbar");
+    }
+
+    #[test]
+    fn index_laesst_sich_verwerfen() {
+        let (env, _music, cfg) = content_fixture();
+        let sh = content_mode(env);
+        run(&sh, false);
+        assert!(cfg.join("index.db").is_file());
+        crate::index::reset(&sh.env).unwrap();
+        assert!(!cfg.join("index.db").is_file(), "Index geloescht");
+        assert!(crate::index::open_ro(&sh.env).is_err(), "danach gibt es nichts zu lesen");
     }
 
     #[test]
