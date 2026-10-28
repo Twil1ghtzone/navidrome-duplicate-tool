@@ -10,22 +10,46 @@ Favoriten, Bewertungen, Wiedergabezaehler, Lesezeichen, Playlist-Eintraege, Scro
 3. Starten, `http://<server-ip>:8085` oeffnen. Ist `UI_PASSWORD` leer, wird eines erzeugt und im Container-Log angezeigt (gespeichert in `/config/.ui_password`).
 
 ## Updates
-Wenn nach einem Update weiter die alte Oberflaeche erscheint, zuerst pruefen, welche Version der
-**Dienst** meldet – `GET /healthz` antwortet ab v0.3 mit `ok navidrome-dedupe <version>`, davor nur mit `ok`:
+Das Image wird bei jedem Push auf `main` automatisch gebaut und nach
+`ghcr.io/twil1ghtzone/navidrome-duplicate-tool` veroeffentlicht – als `latest`, als Versions-Tag
+(z. B. `v0.6.3`) und als Commit-Tag. In Dockge genuegt **Aktualisieren**.
+
+Die mitgelieferte Compose enthaelt `pull_policy: always`. Ohne das kann ein alter lokaler Stand mit
+demselben Tag `latest` liegen bleiben, und der Container startet weiter mit der alten Version, obwohl
+laengst eine neue veroeffentlicht ist. Genau das ist der haeufigste Grund fuer "aktualisiert, aber
+nichts aendert sich".
+
+### Wenn nach dem Update die alte Version laeuft
+Drei Befehle, die die Ursache eindeutig eingrenzen:
 
 ```
 curl -s http://<server-ip>:8085/healthz
+docker ps --filter name=navidrome-dedupe --format '{{.Image}}'
+docker logs navidrome-dedupe 2>&1 | head -3
 ```
 
-Meldet der Dienst die neue Version, hing nur der Browser an einer zwischengespeicherten Seite:
-mit Strg+Umschalt+R neu laden. Ab v0.4.1 liefert der Dienst `Cache-Control: no-store`, damit das
-nicht mehr passieren kann. Meldet er die alte Version, lief das Update selbst nicht durch –
-dann `docker compose pull && docker compose up -d --force-recreate`.
+* `/healthz` meldet die Version des **laufenden Dienstes** (ab v0.3; davor nur `ok`).
+  Meldet es die neue Version, hing nur der Browser an einer zwischengespeicherten Seite:
+  Strg+Umschalt+R. Ab v0.4.1 liefert der Dienst `Cache-Control: no-store`, damit das nicht mehr passiert.
+* Zeigt `docker ps` statt des Image-Namens eine nackte ID wie `e05aa360763e`, laeuft der Container aus
+  einem Image **ohne Tag** – praktisch immer ein lokal gebautes. Dann steht in der Compose ein `build:`
+  statt `image:`, und kein `pull` der Welt aendert daran etwas.
+* Das Container-Log nennt die Version in der ersten Zeile.
 
-Das Image wird bei jedem Push auf `main` automatisch per GitHub Actions gebaut und nach `ghcr.io/twil1ghtzone/navidrome-duplicate-tool:latest` veroeffentlicht.
-In Dockge genuegt **Aktualisieren** (pull + Neuerstellung). Einmalig noetig: Auf GitHub unter *Profil -> Packages -> navidrome-duplicate-tool ->
-Package settings -> Change visibility* das Paket auf **Public** stellen, sonst kann der Server es nicht ohne Login ziehen.
-Ohne Registry geht auch der Build direkt aus GitHub (siehe Kommentar in der Compose-Datei, `pull_policy: build`).
+Erzwingen laesst sich das Update so (im Stack-Ordner):
+
+```
+docker compose down
+docker image rm -f ghcr.io/twil1ghtzone/navidrome-duplicate-tool:latest
+docker compose pull
+docker compose up -d
+```
+
+Den Stack-Ordner verraet der Container selbst:
+
+```
+docker inspect navidrome-dedupe --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}'
+```
 
 ## Eigene Index-Datenbank (`/config/index.db`)
 Der Bibliotheks-Scan schreibt alles, was er herausfindet, in eine eigene SQLite-Datenbank: Pfad, Groesse,
