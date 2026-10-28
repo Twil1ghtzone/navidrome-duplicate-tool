@@ -1,10 +1,14 @@
 services:
   navidrome-dedupe:
-    # Fertiges Image aus GitHub Actions: In Dockge/Portainer reicht "Aktualisieren" (= pull + recreate).
+    # Fertiges Image aus GitHub Actions. In Dockge/Portainer genuegt "Aktualisieren".
     image: ghcr.io/twil1ghtzone/navidrome-duplicate-tool:latest
-    # Alternative ohne Registry (baut bei jedem "up" neu aus GitHub): image-Zeile entfernen und stattdessen
-    # build: https://github.com/Twil1ghtzone/navidrome-duplicate-tool.git#main
-    # pull_policy: build
+    # Bei jedem "up" wird das Image neu gezogen. Ohne diese Zeile kann ein alter
+    # lokaler Stand mit demselben Tag liegen bleiben und der Container startet
+    # weiter mit der alten Version, obwohl laengst eine neue veroeffentlicht ist.
+    # (Nur entfernen, wenn der Server bewusst ohne Internet starten koennen soll.)
+    pull_policy: always
+    # Statt "latest" kann auch fest auf eine Version gezeigt werden, z. B.
+    # image: ghcr.io/twil1ghtzone/navidrome-duplicate-tool:v0.6.3
     container_name: navidrome-dedupe
     restart: unless-stopped
     user: "0:0"                          # wie Navidrome; sonst UID:GID von Navidrome eintragen
