@@ -1,6 +1,6 @@
 [package]
 name = "navidrome-dedupe"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 description = "Web-UI zur sicheren Deduplizierung einer Navidrome-Bibliothek (MP3 neben FLAC und doppelte FLACs) mit vollstaendiger Uebernahme von Favoriten, Playlists und Historie"
 

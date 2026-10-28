@@ -365,7 +365,9 @@ fn store(
 }
 
 /// Holt die Navidrome-Eintraege in den Index – ein sequenzieller Durchlauf
-/// statt einer Pfadsuche pro Datei (auf `media_file.path` gibt es keinen Index).
+/// statt einer Pfadsuche pro Datei. Navidrome hat zwar einen Index auf
+/// `media_file.path`, aber ein Durchlauf ist bei Millionen Titeln guenstiger
+/// als ebenso viele Einzelabfragen ueber zwei Datenbanken hinweg.
 fn load_media_files(sh: &Shared, reader: &Connection, schema: &Schema, idx: &mut Connection) -> Result<(), String> {
     let missing = if schema.mf("missing") { "missing=0 AND " } else { "" };
     let sql = format!(

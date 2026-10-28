@@ -353,29 +353,40 @@ pub fn cols(c: &Connection, table: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Wie wird geprueft, ob ein Tag-Feld gefuellt ist?
+#[derive(PartialEq, Clone, Copy)]
+pub enum Kind {
+    /// Text: alles ausser der leeren Zeichenkette zaehlt
+    Text,
+    /// Zahl: alles ausser 0 zaehlt
+    Num,
+    /// JSON: Navidrome legt leere Felder als '[]' oder '{}' an – die zaehlen nicht
+    Json,
+}
+
 /// Tag-Felder, deren Vorhandensein pro Datei als Flag abgefragt wird.
-/// (Flag, Spalte, Anzeigename, numerisch)
-const TAG_FIELDS: &[(char, &str, &str, bool)] = &[
-    ('A', "album_artist", "Album-Interpret", false),
-    ('r', "artist", "Interpret", false),
-    ('b', "album", "Album", false),
-    ('t', "title", "Titel", false),
-    ('n', "track_number", "Tracknummer", true),
-    ('d', "disc_number", "Disc-Nummer", true),
-    ('y', "year", "Jahr", true),
-    ('D', "date", "Datum", false),
-    ('g', "genre", "Genre", false),
-    ('c', "comment", "Kommentar", false),
-    ('l', "lyrics", "Liedtext", false),
-    ('m', "mbz_recording_id", "MusicBrainz-Recording", false),
-    ('M', "mbz_album_id", "MusicBrainz-Album", false),
-    ('k', "catalog_num", "Katalognummer", false),
-    ('p', "bpm", "BPM", true),
-    ('v', "has_cover_art", "Cover", true),
-    ('s', "sort_title", "Sortiertitel", false),
-    ('x', "explicit_status", "Explicit-Kennzeichen", false),
-    ('R', "rg_track_gain", "ReplayGain", true),
-    ('T', "tags", "weitere Tags", false),
+/// (Flag, Spalte, Anzeigename, Art)
+const TAG_FIELDS: &[(char, &str, &str, Kind)] = &[
+    ('A', "album_artist", "Album-Interpret", Kind::Text),
+    ('r', "artist", "Interpret", Kind::Text),
+    ('b', "album", "Album", Kind::Text),
+    ('t', "title", "Titel", Kind::Text),
+    ('n', "track_number", "Tracknummer", Kind::Num),
+    ('d', "disc_number", "Disc-Nummer", Kind::Num),
+    ('y', "year", "Jahr", Kind::Num),
+    ('D', "date", "Datum", Kind::Text),
+    ('g', "genre", "Genre", Kind::Text),
+    ('c', "comment", "Kommentar", Kind::Text),
+    ('l', "lyrics", "Liedtext", Kind::Json),
+    ('m', "mbz_recording_id", "MusicBrainz-Recording", Kind::Text),
+    ('M', "mbz_album_id", "MusicBrainz-Album", Kind::Text),
+    ('k', "catalog_num", "Katalognummer", Kind::Text),
+    ('p', "bpm", "BPM", Kind::Num),
+    ('v', "has_cover_art", "Cover", Kind::Num),
+    ('s', "sort_title", "Sortiertitel", Kind::Text),
+    ('x', "explicit_status", "Explicit-Kennzeichen", Kind::Text),
+    ('R', "rg_track_gain", "ReplayGain", Kind::Num),
+    ('T', "tags", "weitere Tags", Kind::Json),
 ];
 
 pub fn tag_label(flag: char) -> &'static str {
@@ -435,14 +446,13 @@ impl Schema {
         let parts: Vec<String> = TAG_FIELDS
             .iter()
             .filter(|(_, col, _, _)| self.mf(col))
-            .map(|(flag, col, _, numeric)| {
-                if *numeric {
-                    format!("CASE WHEN COALESCE({col},0)<>0 THEN '{flag}' ELSE '-' END")
-                } else if *col == "tags" {
-                    format!("CASE WHEN COALESCE({col},'') NOT IN ('','{{}}') THEN '{flag}' ELSE '-' END")
-                } else {
-                    format!("CASE WHEN COALESCE({col},'')<>'' THEN '{flag}' ELSE '-' END")
+            .map(|(flag, col, _, kind)| match kind {
+                Kind::Num => format!("CASE WHEN COALESCE({col},0)<>0 THEN '{flag}' ELSE '-' END"),
+                // Navidrome speichert leere JSON-Felder als '[]' bzw. '{{}}' – kein Inhalt
+                Kind::Json => {
+                    format!("CASE WHEN COALESCE({col},'') NOT IN ('','{{}}','[]','null') THEN '{flag}' ELSE '-' END")
                 }
+                Kind::Text => format!("CASE WHEN COALESCE({col},'')<>'' THEN '{flag}' ELSE '-' END"),
             })
             .collect();
         if parts.is_empty() { "''".to_string() } else { parts.join(" || ") }
@@ -1994,39 +2004,195 @@ mod tests {
         p
     }
 
+    /// Aus dem Schema-Dump einer echten Navidrome-Installation uebernommen:
+    /// dieselben Spalten, dieselben Fremdschluessel und vor allem die FTS5-Trigger,
+    /// die bei jedem INSERT, UPDATE und DELETE auf `media_file` mitlaufen.
     const SCHEMA: &str = r#"
-    CREATE TABLE library (id integer primary key, path varchar not null);
+    CREATE TABLE user (
+        id varchar(255) not null primary key,
+        user_name varchar(255) default '' not null unique,
+        name varchar(255) collate NOCASE default '' not null,
+        email varchar(255) default '' not null,
+        password varchar(255) default '' not null,
+        is_admin bool default FALSE not null,
+        created_at datetime not null, updated_at datetime not null);
+    CREATE TABLE library (
+        id integer primary key autoincrement,
+        name text not null unique,
+        path text not null unique,
+        remote_path text null default '',
+        total_songs integer default 0 not null,
+        total_size integer default 0 not null);
     CREATE TABLE media_file (
-        id varchar primary key, library_id integer not null, path varchar not null,
-        title varchar, album varchar, album_id varchar, artist_id varchar,
-        disc_number integer, order_title varchar, suffix varchar, size integer,
-        duration real, bit_rate integer, comment varchar, track_number integer,
-        sample_rate integer, bit_depth integer, channels integer,
-        mbz_recording_id varchar, tags varchar, missing bool default 0,
-        album_artist varchar, genre varchar, lyrics varchar, year integer, has_cover_art bool default 0,
-        average_rating real not null default 0);
+        id varchar(255) not null primary key,
+        path varchar(255) default '' not null,
+        title varchar(255) default '' not null,
+        album varchar(255) default '' not null,
+        artist varchar(255) default '' not null,
+        artist_id varchar(255) default '' not null,
+        album_artist varchar(255) default '' not null,
+        album_id varchar(255) default '' not null,
+        has_cover_art bool default FALSE not null,
+        track_number integer default 0 not null,
+        disc_number integer default 0 not null,
+        year integer default 0 not null,
+        size integer default 0 not null,
+        suffix varchar(255) default '' not null,
+        duration real default 0 not null,
+        bit_rate integer default 0 not null,
+        genre varchar(255) default '' not null,
+        compilation bool default FALSE not null,
+        created_at datetime, updated_at datetime,
+        date varchar(255) default '' not null,
+        sort_album_name varchar collate NOCASE default '' not null,
+        sort_artist_name varchar collate NOCASE default '' not null,
+        sort_album_artist_name varchar collate NOCASE default '' not null,
+        sort_title varchar collate NOCASE default '' not null,
+        disc_subtitle varchar default '' not null,
+        catalog_num varchar default '' not null,
+        comment varchar default '' not null,
+        order_title varchar collate NOCASE default '' not null,
+        order_album_name varchar collate NOCASE default '' not null,
+        order_artist_name varchar collate NOCASE default '' not null,
+        order_album_artist_name varchar collate NOCASE default '' not null,
+        mbz_recording_id varchar default '' not null,
+        mbz_album_id varchar default '' not null,
+        channels integer default 0 not null,
+        lyrics jsonb default '[]' not null,
+        sample_rate integer default 0 not null,
+        library_id integer default 1 not null references library on delete cascade,
+        missing boolean default false not null,
+        tags jsonb default '{}' not null,
+        participants jsonb default '{}' not null,
+        explicit_status varchar default '' not null,
+        rg_track_gain real, rg_track_peak real,
+        average_rating REAL NOT NULL DEFAULT 0,
+        search_participants TEXT NOT NULL DEFAULT '',
+        search_normalized TEXT NOT NULL DEFAULT '',
+        codec VARCHAR(255) DEFAULT '' NOT NULL,
+        bpm integer, bit_depth integer);
+    CREATE INDEX media_file_path ON media_file (path);
     CREATE TABLE annotation (
-        user_id varchar not null, item_id varchar not null, item_type varchar not null,
-        play_count integer default 0, play_date datetime, rating integer default 0,
-        starred bool default 0 not null, starred_at datetime, rated_at datetime,
+        user_id varchar(255) not null REFERENCES user(id) ON DELETE CASCADE ON UPDATE CASCADE,
+        item_id varchar(255) default '' not null,
+        item_type varchar(255) default '' not null,
+        play_count integer default 0,
+        play_date datetime,
+        rating integer default 0,
+        starred bool default FALSE not null,
+        starred_at datetime, rated_at datetime,
         unique (user_id, item_id, item_type));
-    CREATE TABLE playlist (id varchar primary key, name varchar, duration real default 0,
-        size integer default 0, song_count integer default 0, path varchar default '',
-        sync bool default 0);
-    CREATE TABLE playlist_tracks (id integer default 0 not null, playlist_id varchar not null,
-        media_file_id varchar not null);
+    CREATE TABLE playlist (
+        id varchar(255) not null primary key,
+        name varchar(255) collate NOCASE default '' not null,
+        comment varchar(255) default '' not null,
+        duration real default 0 not null,
+        song_count integer default 0 not null,
+        public bool default FALSE not null,
+        created_at datetime, updated_at datetime,
+        path string default '' not null,
+        sync bool default false not null,
+        size integer default 0 not null,
+        rules varchar, evaluated_at datetime,
+        owner_id varchar(255) not null references user on update cascade on delete cascade,
+        average_rating REAL NOT NULL DEFAULT 0,
+        imported_hash varchar default '' not null);
+    CREATE TABLE playlist_tracks (
+        id integer default 0 not null,
+        playlist_id varchar(255) not null references playlist on update cascade on delete cascade,
+        media_file_id varchar(255) not null);
     CREATE UNIQUE INDEX playlist_tracks_pos ON playlist_tracks (playlist_id, id);
-    CREATE TABLE bookmark (user_id varchar not null, item_id varchar not null,
-        item_type varchar not null, comment varchar, position integer, changed_by varchar,
-        created_at datetime, updated_at datetime, unique (user_id, item_id, item_type));
-    CREATE TABLE playqueue (id varchar not null, user_id varchar not null, current integer default 0,
-        position real, changed_by varchar, items varchar, created_at datetime, updated_at datetime);
-    CREATE TABLE scrobbles (media_file_id varchar not null, user_id varchar not null,
-        submission_time integer not null);
-    CREATE TABLE scrobble_buffer (user_id varchar not null, service varchar not null,
-        media_file_id varchar not null, play_time datetime not null, enqueue_time datetime,
-        id varchar not null default '', unique (user_id, service, media_file_id, play_time));
-    CREATE TABLE share (id varchar primary key, resource_ids varchar not null, user_id varchar);
+    CREATE TABLE bookmark (
+        user_id varchar(255) not null references user on update cascade on delete cascade,
+        item_id varchar(255) not null,
+        item_type varchar(255) not null,
+        comment varchar(255), position integer, changed_by varchar(255),
+        created_at datetime, updated_at datetime,
+        constraint bookmark_pk unique (user_id, item_id, item_type));
+    CREATE TABLE playqueue (
+        id varchar(255) not null,
+        user_id varchar(255) not null references user(id) on update cascade on delete cascade,
+        current integer not null default 0,
+        changed_by varchar(255), items varchar(255),
+        created_at datetime, updated_at datetime, position integer);
+    CREATE TABLE scrobbles (
+        id INTEGER PRIMARY KEY,
+        media_file_id VARCHAR(255) NOT NULL REFERENCES media_file(id) ON DELETE CASCADE ON UPDATE CASCADE,
+        user_id VARCHAR(255) NOT NULL REFERENCES user(id) ON DELETE CASCADE ON UPDATE CASCADE,
+        submission_time INTEGER NOT NULL);
+    CREATE TABLE scrobble_buffer (
+        user_id varchar NOT NULL REFERENCES user ON UPDATE CASCADE ON DELETE CASCADE,
+        service varchar NOT NULL,
+        media_file_id varchar NOT NULL REFERENCES media_file ON UPDATE CASCADE ON DELETE CASCADE,
+        play_time datetime NOT NULL,
+        enqueue_time datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        id varchar NOT NULL DEFAULT '',
+        CONSTRAINT scrobble_buffer_pk UNIQUE (user_id, service, media_file_id, play_time));
+    CREATE TABLE share (
+        id varchar(255) not null primary key,
+        expires_at datetime, last_visited_at datetime,
+        resource_ids varchar not null,
+        created_at datetime, updated_at datetime,
+        user_id varchar(255) not null references user on update cascade on delete cascade,
+        downloadable bool not null default false,
+        description varchar not null default '',
+        resource_type varchar not null default '',
+        contents varchar not null default '',
+        format varchar not null default '',
+        max_bit_rate integer not null default 0,
+        visit_count integer not null default 0);
+    CREATE TABLE media_file_tags (
+        media_file_id varchar not null references media_file (id) on delete cascade,
+        tag_id varchar not null,
+        constraint media_file_tags unique (media_file_id, tag_id));
+
+    CREATE VIRTUAL TABLE media_file_fts USING fts5(
+        title, album, artist, album_artist,
+        sort_title, sort_album_name, sort_artist_name, sort_album_artist_name,
+        disc_subtitle, search_participants, search_normalized,
+        content='', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');
+    CREATE TRIGGER media_file_fts_ai AFTER INSERT ON media_file BEGIN
+        INSERT INTO media_file_fts(rowid, title, album, artist, album_artist,
+            sort_title, sort_album_name, sort_artist_name, sort_album_artist_name,
+            disc_subtitle, search_participants, search_normalized)
+        VALUES (NEW.rowid, NEW.title, NEW.album, NEW.artist, NEW.album_artist,
+            NEW.sort_title, NEW.sort_album_name, NEW.sort_artist_name, NEW.sort_album_artist_name,
+            COALESCE(NEW.disc_subtitle, ''), COALESCE(NEW.search_participants, ''),
+            COALESCE(NEW.search_normalized, ''));
+    END;
+    CREATE TRIGGER media_file_fts_ad AFTER DELETE ON media_file BEGIN
+        INSERT INTO media_file_fts(media_file_fts, rowid, title, album, artist, album_artist,
+            sort_title, sort_album_name, sort_artist_name, sort_album_artist_name,
+            disc_subtitle, search_participants, search_normalized)
+        VALUES ('delete', OLD.rowid, OLD.title, OLD.album, OLD.artist, OLD.album_artist,
+            OLD.sort_title, OLD.sort_album_name, OLD.sort_artist_name, OLD.sort_album_artist_name,
+            COALESCE(OLD.disc_subtitle, ''), COALESCE(OLD.search_participants, ''),
+            COALESCE(OLD.search_normalized, ''));
+    END;
+    CREATE TRIGGER media_file_fts_au AFTER UPDATE ON media_file
+    WHEN OLD.title IS NOT NEW.title OR OLD.album IS NOT NEW.album OR OLD.artist IS NOT NEW.artist
+      OR OLD.album_artist IS NOT NEW.album_artist OR OLD.sort_title IS NOT NEW.sort_title
+      OR OLD.sort_album_name IS NOT NEW.sort_album_name OR OLD.sort_artist_name IS NOT NEW.sort_artist_name
+      OR OLD.sort_album_artist_name IS NOT NEW.sort_album_artist_name
+      OR OLD.disc_subtitle IS NOT NEW.disc_subtitle
+      OR OLD.search_participants IS NOT NEW.search_participants
+      OR OLD.search_normalized IS NOT NEW.search_normalized
+    BEGIN
+        INSERT INTO media_file_fts(media_file_fts, rowid, title, album, artist, album_artist,
+            sort_title, sort_album_name, sort_artist_name, sort_album_artist_name,
+            disc_subtitle, search_participants, search_normalized)
+        VALUES ('delete', OLD.rowid, OLD.title, OLD.album, OLD.artist, OLD.album_artist,
+            OLD.sort_title, OLD.sort_album_name, OLD.sort_artist_name, OLD.sort_album_artist_name,
+            COALESCE(OLD.disc_subtitle, ''), COALESCE(OLD.search_participants, ''),
+            COALESCE(OLD.search_normalized, ''));
+        INSERT INTO media_file_fts(rowid, title, album, artist, album_artist,
+            sort_title, sort_album_name, sort_artist_name, sort_album_artist_name,
+            disc_subtitle, search_participants, search_normalized)
+        VALUES (NEW.rowid, NEW.title, NEW.album, NEW.artist, NEW.album_artist,
+            NEW.sort_title, NEW.sort_album_name, NEW.sort_artist_name, NEW.sort_album_artist_name,
+            COALESCE(NEW.disc_subtitle, ''), COALESCE(NEW.search_participants, ''),
+            COALESCE(NEW.search_normalized, ''));
+    END;
     "#;
 
     /// Legt eine Navidrome-aehnliche DB samt Musikdateien an.
@@ -2040,7 +2206,14 @@ mod tests {
         let db = cfg.join("navidrome.db");
         let c = Connection::open(&db).unwrap();
         c.execute_batch(SCHEMA).unwrap();
-        c.execute("INSERT INTO library (id, path) VALUES (1, ?1)", params![music.to_string_lossy()]).unwrap();
+        c.execute("INSERT INTO library (id, name, path) VALUES (1, 'Musik', ?1)", params![music.to_string_lossy()]).unwrap();
+        for u in ["u1", "u2"] {
+            c.execute(
+                "INSERT INTO user (id, user_name, created_at, updated_at) VALUES (?1, ?1, datetime('now'), datetime('now'))",
+                params![u],
+            )
+            .unwrap();
+        }
         let ins = "INSERT INTO media_file (id, library_id, path, title, album, album_id, artist_id, disc_number, \
                    order_title, suffix, size, duration, bit_rate, comment, track_number, sample_rate, bit_depth, \
                    channels, mbz_recording_id, tags, missing) \
@@ -2062,7 +2235,7 @@ mod tests {
         c.execute("INSERT INTO annotation (user_id, item_id, item_type, play_count, rating, starred) \
                    VALUES ('u1','flacLo','media_file',3,3,1)", []).unwrap();
 
-        c.execute("INSERT INTO playlist (id, name) VALUES ('pl1','Favoriten')", []).unwrap();
+        c.execute("INSERT INTO playlist (id, name, owner_id) VALUES ('pl1','Favoriten','u1')", []).unwrap();
         for (pos, mf) in [(1, "mp3a"), (2, "flacA"), (3, "flacLo")] {
             c.execute("INSERT INTO playlist_tracks (id, playlist_id, media_file_id) VALUES (?1,'pl1',?2)", params![pos, mf]).unwrap();
         }
@@ -2110,8 +2283,8 @@ mod tests {
                    order_title, suffix, size, duration, bit_rate, comment, track_number, sample_rate, bit_depth, \
                    channels, mbz_recording_id, tags, missing, genre, lyrics) \
                    VALUES (?1, 1, ?2, ?3, 'Album', 'alb1', 'art1', 1, ?4, 'flac', 800, 240.0, 800, ?5, 3, 44100, 16, 2, '', '{}', 0, ?6, ?7)";
-        c.execute(ins, params!["flacOrig", "g3.flac", "Song Three", "song three", "", "Rock", "la la"]).unwrap();
-        c.execute(ins, params!["flacCopy", "g3 (1).flac", "Song Three (1)", "song three (1)", "aus dem Netz", Option::<String>::None, Option::<String>::None]).unwrap();
+        c.execute(ins, params!["flacOrig", "g3.flac", "Song Three", "song three", "", "Rock", "[{\"value\":\"la la\"}]"]).unwrap();
+        c.execute(ins, params!["flacCopy", "g3 (1).flac", "Song Three (1)", "song three (1)", "aus dem Netz", "", "[]"]).unwrap();
     }
 
     #[test]
@@ -2232,8 +2405,8 @@ mod tests {
                    order_title, suffix, size, duration, bit_rate, comment, track_number, sample_rate, bit_depth, \
                    channels, mbz_recording_id, tags, missing, genre, lyrics) \
                    VALUES (?1, 1, ?2, ?3, ?4, ?5, 'art1', 1, ?6, 'flac', ?7, 10.0, 900, '', 1, 44100, 16, 2, '', '{}', 0, ?8, ?9)";
-        c.execute(ins, params!["album1", "Alben/Nachtflug/01 Lied.flac", "Lied", "Nachtflug", "albN", "lied", 450, "Rock", "text"]).unwrap();
-        c.execute(ins, params!["dl1", "Downloads/irgendwas.flac", "irgendwas", "Unbekannt", "albU", "irgendwas", 950, Option::<String>::None, Option::<String>::None]).unwrap();
+        c.execute(ins, params!["album1", "Alben/Nachtflug/01 Lied.flac", "Lied", "Nachtflug", "albN", "lied", 450, "Rock", "[{\"value\":\"text\"}]"]).unwrap();
+        c.execute(ins, params!["dl1", "Downloads/irgendwas.flac", "irgendwas", "Unbekannt", "albU", "irgendwas", 950, "", "[]"]).unwrap();
         // Favorit und Playlist-Eintrag haengen an der Datei, die weichen soll
         c.execute("INSERT INTO annotation (user_id,item_id,item_type,play_count,rating,starred,starred_at) \
                    VALUES ('u1','dl1','media_file',11,4,1,'2025-01-01')", []).unwrap();
@@ -2359,7 +2532,7 @@ mod tests {
                        order_title, suffix, size, duration, bit_rate, comment, track_number, sample_rate, bit_depth, \
                        channels, mbz_recording_id, tags, missing, genre) \
                        VALUES (?1, 1, ?2, 'Solo', 'Album', 'albS', 'art1', 1, 'solo', 'mp3', ?3, 150.0, ?4, '', 1, 44100, 0, 2, '', '{}', 0, ?5)";
-            c.execute(ins, params!["mp3lo", "solo-192.mp3", 400, 192, Option::<String>::None]).unwrap();
+            c.execute(ins, params!["mp3lo", "solo-192.mp3", 400, 192, ""]).unwrap();
             c.execute(ins, params!["mp3hi", "solo-320.mp3", 900, 320, "Pop"]).unwrap();
             c.execute("INSERT INTO annotation (user_id,item_id,item_type,play_count,rating,starred) \
                        VALUES ('u1','mp3lo','media_file',4,5,1)", []).unwrap();
@@ -2547,6 +2720,71 @@ mod tests {
         run(&sh, true);
         assert_eq!(fs::read_to_string(&m3u).unwrap(), "g1.mp3\n", "selbst gepflegte Playlists bleiben unberuehrt");
         assert_eq!(sh.stats.m3u.load(Relaxed), 0);
+    }
+
+    // ───────── Volltextindex (FTS5) ─────────
+
+    /// Wie viele Eintraege findet Navidromes Suchindex zu diesem Begriff?
+    fn fts_treffer(db: &str, wort: &str) -> i64 {
+        let c = Connection::open(db).unwrap();
+        c.query_row(
+            "SELECT count(*) FROM media_file_fts WHERE media_file_fts MATCH ?1",
+            params![wort],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn markieren_als_fehlend_laesst_den_suchindex_in_ruhe() {
+        let (env, _music, _cfg) = fixture();
+        let db = env.db_path.clone();
+        assert_eq!(fts_treffer(&db, "one"), 2, "mp3 und flac stehen im Suchindex");
+        let sh = db_mode(env);
+        assert!(!sh.env.delete_rows, "Standard ist markieren, nicht loeschen");
+        run(&sh, true);
+        assert_eq!(sh.stats.errors.load(Relaxed), 0);
+        // Der FTS-Trigger haengt an Titel- und Sortierfeldern, nicht an `missing` –
+        // die Zeile bleibt also im Index, so wie Navidrome es auch selbst macht.
+        assert_eq!(fts_treffer(&db, "one"), 2, "Suchindex unveraendert");
+    }
+
+    #[test]
+    fn zeilen_loeschen_raeumt_den_suchindex_mit_auf() {
+        let (mut env, _music, _cfg) = fixture();
+        env.delete_rows = true;
+        let db = env.db_path.clone();
+        assert_eq!(fts_treffer(&db, "one"), 2);
+        let sh = db_mode(env);
+        run(&sh, true);
+        assert_eq!(sh.stats.errors.load(Relaxed), 0);
+
+        let c = Connection::open(&db).unwrap();
+        let weg: i64 = c.query_row("SELECT count(*) FROM media_file WHERE id='mp3a'", [], |r| r.get(0)).unwrap();
+        assert_eq!(weg, 0, "die Zeile ist wirklich geloescht");
+        assert_eq!(fts_treffer(&db, "one"), 1, "der Loesch-Trigger hat den Suchindex nachgezogen");
+        // Fremdschluessel mit ON DELETE CASCADE duerfen nichts mitreissen, was wir
+        // vorher umgehaengt haben
+        let scr: i64 = c.query_row("SELECT count(*) FROM scrobbles WHERE media_file_id='flacA'", [], |r| r.get(0)).unwrap();
+        assert_eq!(scr, 1, "die Historie haengt an der behaltenen Datei und ueberlebt");
+    }
+
+    #[test]
+    fn leere_json_felder_zaehlen_nicht_als_tags() {
+        // Navidrome legt lyrics als '[]' und tags als '{}' an. Das sind leere Felder –
+        // werden sie als vorhanden gezaehlt, waere die Tag-Bewertung fuer jede Datei gleich.
+        let (env, _music, _cfg) = fixture();
+        let c = Connection::open(&env.db_path).unwrap();
+        let schema = Schema::load(&c).unwrap();
+        let sql = format!("SELECT {} FROM media_file WHERE id=?1", schema.tag_flags_expr());
+        let flags = |id: &str| -> String { c.query_row(&sql, params![id], |r| r.get(0)).unwrap() };
+
+        let leer = flags("mp3a");
+        assert!(!leer.contains('l'), "lyrics='[]' zaehlt nicht: {leer}");
+        assert!(!leer.contains('T'), "tags='{{}}' zaehlt nicht: {leer}");
+
+        c.execute("UPDATE media_file SET lyrics='[{\"value\":\"hallo\"}]' WHERE id='mp3a'", []).unwrap();
+        assert!(flags("mp3a").contains('l'), "echter Liedtext zaehlt");
     }
 
     #[test]

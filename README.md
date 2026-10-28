@@ -218,7 +218,12 @@ Fuer ein integriertes Gefuehl eignet sich ein Reverse-Proxy, der Navidrome unter
 z. B. `/dedupe/` ausliefert.
 
 ## Entwicklung
-`cargo test` startet die Tests (aktuell 32). Sie bauen eine Navidrome-aehnliche Datenbank samt echten Dateien auf und
+`cargo test` startet die Tests (aktuell 39). Das Testschema ist aus dem Schema-Dump einer echten
+Navidrome-Installation uebernommen: dieselben Spalten, dieselben Fremdschluessel (mit `PRAGMA foreign_keys=ON`
+scharf geschaltet) und die FTS5-Trigger, die bei jedem INSERT, UPDATE und DELETE auf `media_file` mitlaufen.
+Zwei Tests pruefen den Suchindex ausdruecklich: als fehlend markieren laesst ihn unberuehrt (der Trigger haengt
+an den Titel- und Sortierfeldern, nicht an `missing`), echtes Loeschen der Zeile raeumt ihn ueber den
+Loesch-Trigger mit auf. Sie bauen eine Navidrome-aehnliche Datenbank samt echten Dateien auf und
 pruefen Dry-Run, Execute, Favoriten-/Playlist-/Lesezeichen-/Historien-Uebernahme, Schutzregeln und Qualitaetsauswahl.
 
 Hinweise: DB-Verzeichnis auf lokalem Dateisystem (kein NFS/SMB, wegen WAL). Die UI hat kein TLS: nur im LAN oder hinter Reverse-Proxy betreiben.
