@@ -934,6 +934,9 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
         let phases = do_content as u64 + do_db as u64;
         sh.stats.total.store(media_count * phases.max(1), Relaxed);
         sh.log(format!("{media_count} relevante Titel in Navidrome"));
+        if settings.rewrite_m3u {
+            check_m3u(sh, &reader, &schema);
+        }
         sh.log(format!("Report/Plan: {}", plan_path.display()));
         let planner = Planner::new(fs::File::create(&plan_path).map_err(|e| format!("Plan-Datei: {e}"))?);
         let mut planner = match (planner, &idx) {
@@ -997,6 +1000,54 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
     };
     let applied = rdir.join(format!("{ts}-execute-applied.tsv"));
     apply(sh, &mut w, &schema, &settings, trash.as_deref(), idx.as_ref().map(|c| (c, plan_run)), &plan_path, &applied)
+}
+
+/// Meldet vor dem Lauf, welche eingelesenen Playlist-Dateien angefasst werden
+/// muessten und ob das ueberhaupt geht. Das laeuft auch im Dry-Run – man soll
+/// nicht erst beim echten Loeschen merken, dass eine m3u schreibgeschuetzt ist.
+fn check_m3u(sh: &Shared, reader: &Connection, schema: &Schema) {
+    if !schema.table("playlist") || !schema.playlist.contains("path") {
+        return;
+    }
+    let sync = if schema.playlist.contains("sync") { "COALESCE(sync,0)=1 AND " } else { "" };
+    let sql = format!("SELECT name, path FROM playlist WHERE {sync}COALESCE(path,'') <> ''");
+    let mut st = match reader.prepare(&sql) {
+        Ok(x) => x,
+        Err(_) => return,
+    };
+    let rows = match st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) {
+        Ok(x) => x,
+        Err(_) => return,
+    };
+    let (mut gesamt, mut fehlt, mut schreibgeschuetzt) = (0u32, 0u32, 0u32);
+    for (name, path) in rows.flatten() {
+        gesamt += 1;
+        let p = map_root(&sh.env, &path);
+        let f = Path::new(&p);
+        if !f.is_file() {
+            fehlt += 1;
+            sh.log(format!("PLAYLIST-WARNUNG: Datei zu '{name}' nicht gefunden: {p}"));
+            continue;
+        }
+        // Zum Anhaengen oeffnen aendert nichts, zeigt aber zuverlaessig,
+        // ob wir schreiben duerfen (Rechte, ACLs, read-only gemountet).
+        if fs::OpenOptions::new().append(true).open(f).is_err() {
+            schreibgeschuetzt += 1;
+            sh.log(format!("PLAYLIST-WARNUNG: '{name}' ist nicht schreibbar: {p}"));
+        }
+    }
+    if gesamt == 0 {
+        return;
+    }
+    if fehlt == 0 && schreibgeschuetzt == 0 {
+        sh.log(format!("{gesamt} eingelesene Playlist-Datei(en) gefunden und beschreibbar"));
+    } else {
+        sh.log(format!(
+            "ACHTUNG: von {gesamt} eingelesenen Playlist-Dateien fehlen {fehlt} und sind {schreibgeschuetzt} \
+             schreibgeschuetzt. Navidrome baut diese Playlists beim naechsten Scan aus der Datei neu auf – \
+             dort entfernte Titel fallen dann heraus."
+        ));
+    }
 }
 
 /// Zahl der Titel, die ueberhaupt in Frage kommen – dient als Massstab fuer den Fortschritt.
@@ -2785,6 +2836,62 @@ mod tests {
 
         c.execute("UPDATE media_file SET lyrics='[{\"value\":\"hallo\"}]' WHERE id='mp3a'", []).unwrap();
         assert!(flags("mp3a").contains('l'), "echter Liedtext zaehlt");
+    }
+
+    #[test]
+    fn schreibgeschuetzte_playlist_datei_wird_vorher_gemeldet() {
+        let (env, music, _cfg) = fixture();
+        let gut = music.join("Gut.m3u");
+        let schlecht = music.join("Schreibgeschuetzt.m3u");
+        fs::write(&gut, "g1.mp3\n").unwrap();
+        fs::write(&schlecht, "g1.mp3\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&schlecht, fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("UPDATE playlist SET path=?1, sync=1 WHERE id='pl1'", params![gut.to_string_lossy()]).unwrap();
+            c.execute(
+                "INSERT INTO playlist (id, name, owner_id, path, sync) VALUES ('pl2','Zweite','u1',?1,1)",
+                params![schlecht.to_string_lossy()],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO playlist (id, name, owner_id, path, sync) VALUES ('pl3','Weg','u1','/gibt/es/nicht.m3u',1)",
+                [],
+            )
+            .unwrap();
+        }
+        let sh = db_mode(env);
+        run(&sh, false); // schon der Dry-Run muss warnen
+        let log: String = sh.log.lock().unwrap().1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(log.contains("nicht schreibbar"), "schreibgeschuetzte Datei gemeldet:\n{log}");
+        assert!(log.contains("nicht gefunden"), "fehlende Datei gemeldet:\n{log}");
+        assert!(log.contains("ACHTUNG"), "zusammenfassende Warnung:\n{log}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&schlecht, fs::Permissions::from_mode(0o644));
+        }
+    }
+
+    #[test]
+    fn beschreibbare_playlist_dateien_werden_bestaetigt() {
+        let (env, music, _cfg) = fixture();
+        let m3u = music.join("Ok.m3u");
+        fs::write(&m3u, "g1.mp3\n").unwrap();
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("UPDATE playlist SET path=?1, sync=1 WHERE id='pl1'", params![m3u.to_string_lossy()]).unwrap();
+        }
+        let sh = db_mode(env);
+        run(&sh, false);
+        let log: String = sh.log.lock().unwrap().1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(log.contains("beschreibbar"), "Bestaetigung im Protokoll:\n{log}");
+        assert!(!log.contains("ACHTUNG"), "keine Warnung noetig:\n{log}");
     }
 
     #[test]

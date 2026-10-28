@@ -134,7 +134,9 @@ die Wahrheit, nicht die Datenbank. Beim naechsten Scan wuerde Navidrome die Play
 aufbauen und der Eintrag fiele heraus. Das Tool schreibt deshalb den neuen Pfad in die Playlist-Datei mit
 (abschaltbar). Kommentarzeilen wie `#EXTM3U` und `#EXTINF` bleiben stehen, relative Pfade bleiben relativ,
 und geschrieben wird ueber eine Nachbardatei mit anschliessendem `rename`, damit die Playlist nie halbfertig
-auf der Platte liegt. Laesst sich die Datei nicht schreiben (schreibgeschuetzt gemountet), steht das als Fehler
+auf der Platte liegt. Schon **vor** dem Lauf – also auch im Dry-Run – wird jede eingelesene Playlist-Datei geprueft: gefunden?
+beschreibbar? Das Ergebnis steht als `PLAYLIST-WARNUNG` im Protokoll, bevor irgendetwas geloescht wird.
+Laesst sich die Datei spaeter nicht schreiben, steht das als Fehler
 im Protokoll – die Datenbank ist dann trotzdem korrekt, aber der naechste Navidrome-Scan wuerde den Eintrag
 verlieren. Playlists, die du in Navidrome selbst angelegt hast, haben keine Datei und sind davon nicht betroffen.
 
@@ -218,7 +220,7 @@ Fuer ein integriertes Gefuehl eignet sich ein Reverse-Proxy, der Navidrome unter
 z. B. `/dedupe/` ausliefert.
 
 ## Entwicklung
-`cargo test` startet die Tests (aktuell 39). Das Testschema ist aus dem Schema-Dump einer echten
+`cargo test` startet die Tests (aktuell 41). Das Testschema ist aus dem Schema-Dump einer echten
 Navidrome-Installation uebernommen: dieselben Spalten, dieselben Fremdschluessel (mit `PRAGMA foreign_keys=ON`
 scharf geschaltet) und die FTS5-Trigger, die bei jedem INSERT, UPDATE und DELETE auf `media_file` mitlaufen.
 Zwei Tests pruefen den Suchindex ausdruecklich: als fehlend markieren laesst ihn unberuehrt (der Trigger haengt
