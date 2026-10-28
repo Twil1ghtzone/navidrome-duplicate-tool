@@ -32,23 +32,28 @@ docker logs navidrome-dedupe 2>&1 | head -3
   Meldet es die neue Version, hing nur der Browser an einer zwischengespeicherten Seite:
   Strg+Umschalt+R. Ab v0.4.1 liefert der Dienst `Cache-Control: no-store`, damit das nicht mehr passiert.
 * Zeigt `docker ps` statt des Image-Namens eine nackte ID wie `e05aa360763e`, laeuft der Container aus
-  einem Image **ohne Tag** – praktisch immer ein lokal gebautes. Dann steht in der Compose ein `build:`
-  statt `image:`, und kein `pull` der Welt aendert daran etwas.
+  einem Image **ohne Tag**. Dafuer gibt es zwei Ursachen:
+  1. In der Compose steht `build:` statt `image:` – dann wird lokal gebaut und kein `pull` hilft.
+  2. Haeufiger: der `pull` hat geklappt, das Tag `latest` zeigt laengst auf das neue Image, aber der
+     **Container wurde nie neu erstellt**. Das alte Image verliert dabei sein Tag und laeuft als
+     nackte ID weiter. Genau dagegen hilft `--force-recreate`.
 * Das Container-Log nennt die Version in der ersten Zeile.
 
-Erzwingen laesst sich das Update so (im Stack-Ordner):
+Erzwingen laesst sich das Update so – nur fuer diesen einen Dienst, der Rest des Stacks bleibt unberuehrt:
 
 ```
-docker compose down
-docker image rm -f ghcr.io/twil1ghtzone/navidrome-duplicate-tool:latest
-docker compose pull
-docker compose up -d
+docker compose pull navidrome-dedupe
+docker compose up -d --force-recreate navidrome-dedupe
 ```
 
-Den Stack-Ordner verraet der Container selbst:
+`--force-recreate` ist der entscheidende Teil: ohne ihn laesst Compose einen laufenden Container stehen,
+wenn es die Konfiguration fuer unveraendert haelt – und dann bleibt auch die alte Programmversion stehen.
+
+Den Stack-Ordner verraet der Container selbst. Die Datei heisst je nach Werkzeug `compose.yaml`,
+`compose.yml` oder `docker-compose.yml` – Dockge legt `compose.yaml` an:
 
 ```
-docker inspect navidrome-dedupe --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}'
+docker inspect navidrome-dedupe --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}'
 ```
 
 ## Eigene Index-Datenbank (`/config/index.db`)
