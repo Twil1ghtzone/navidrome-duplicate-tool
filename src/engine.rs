@@ -1695,6 +1695,18 @@ fn collect_m3u(
     Ok(())
 }
 
+/// Zeigen zwei Pfade auf dieselbe Datei? Zuerst der billige Textvergleich,
+/// danach – nur wenn noetig – der echte, der Symlinks und `..` aufloest.
+fn same_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
 /// Schreibt den neuen Pfad in die Playlist-Datei. Zeilen, die nicht passen,
 /// bleiben unveraendert; geschrieben wird ueber eine Nachbardatei und `rename`,
 /// damit die Playlist nie halbfertig auf der Platte liegt.
@@ -1705,11 +1717,24 @@ fn rewrite_m3u(sh: &Shared, fixes: &[M3uFix]) {
     }
     for (file, list) in by_file {
         let path = Path::new(file);
-        let text = match fs::read_to_string(path) {
-            Ok(t) => t,
+        let raw = match fs::read(path) {
+            Ok(b) => b,
             Err(e) => {
                 sh.stats.errors.fetch_add(1, Relaxed);
                 sh.log(format!("FEHLER: Playlist-Datei {file} nicht lesbar: {e}"));
+                continue;
+            }
+        };
+        // .m3u8 ist per Definition UTF-8; eine alte .m3u kann eine andere Kodierung
+        // haben. Dann lieber gar nichts anfassen als die Datei zu zerschiessen.
+        let text = match String::from_utf8(raw) {
+            Ok(t) => t,
+            Err(_) => {
+                sh.stats.errors.fetch_add(1, Relaxed);
+                sh.log(format!(
+                    "FEHLER: Playlist-Datei {file} ist nicht UTF-8 kodiert – sie wird nicht veraendert. \
+                     Bitte den Pfad dort von Hand anpassen oder die Datei als UTF-8 speichern."
+                ));
                 continue;
             }
         };
@@ -1723,7 +1748,7 @@ fn rewrite_m3u(sh: &Shared, fixes: &[M3uFix]) {
                 // m3u darf absolute wie relative Pfade enthalten
                 let abs = if Path::new(t).is_absolute() { PathBuf::from(t) } else { dir.join(t) };
                 for f in &list {
-                    if abs == Path::new(&f.del) {
+                    if same_file(&abs, Path::new(&f.del)) {
                         let keeper = Path::new(&f.keeper);
                         let rel = keeper.strip_prefix(&dir).ok();
                         replaced = Some(match (Path::new(t).is_absolute(), rel) {
@@ -2892,6 +2917,74 @@ mod tests {
         let log: String = sh.log.lock().unwrap().1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
         assert!(log.contains("beschreibbar"), "Bestaetigung im Protokoll:\n{log}");
         assert!(!log.contains("ACHTUNG"), "keine Warnung noetig:\n{log}");
+    }
+
+    #[test]
+    fn playlist_m3u8_im_albumordner_wie_in_der_praxis() {
+        // Nachgebaut nach einer echten Installation: pro Albumordner eine
+        // playlist.m3u8 mit relativen Dateinamen, dazu eine im Wurzelordner
+        // mit absoluten Pfaden.
+        let (env, music, _cfg) = fixture();
+        let album = music.join("Artemas/i like the way you kiss me");
+        fs::create_dir_all(&album).unwrap();
+        fs::write(album.join("01 Kuss.mp3"), vec![b'k'; 300]).unwrap();
+        fs::write(album.join("01 Kuss.flac"), vec![b'K'; 900]).unwrap();
+        let im_album = album.join("playlist.m3u8");
+        fs::write(&im_album, "#EXTM3U\n#EXTINF:200,Kuss\n01 Kuss.mp3\n").unwrap();
+        let wurzel = music.join("playlist.m3u8");
+        fs::write(&wurzel, format!("#EXTM3U\n{}\n", album.join("01 Kuss.mp3").display())).unwrap();
+
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            let ins = "INSERT INTO media_file (id, library_id, path, title, album, album_id, artist_id, disc_number, \
+                       order_title, suffix, size, duration, bit_rate, comment, track_number, sample_rate, bit_depth, \
+                       channels, mbz_recording_id, tags, missing, genre) \
+                       VALUES (?1, 1, ?2, 'Kuss', 'Kuss-EP', 'albK', 'art1', 1, 'kuss', ?3, ?4, 200.0, ?5, '', 1, 44100, ?6, 2, '', '{}', 0, 'Pop')";
+            c.execute(ins, params!["kussmp3", "Artemas/i like the way you kiss me/01 Kuss.mp3", "mp3", 300, 320, 0]).unwrap();
+            c.execute(ins, params!["kussflac", "Artemas/i like the way you kiss me/01 Kuss.flac", "flac", 900, 900, 16]).unwrap();
+            c.execute("INSERT INTO playlist (id,name,owner_id,path,sync) VALUES ('plA','playlist','u1',?1,1)",
+                      params![im_album.to_string_lossy()]).unwrap();
+            c.execute("INSERT INTO playlist (id,name,owner_id,path,sync) VALUES ('plR','playlist','u1',?1,1)",
+                      params![wurzel.to_string_lossy()]).unwrap();
+            c.execute("INSERT INTO playlist_tracks VALUES (1,'plA','kussmp3')", []).unwrap();
+            c.execute("INSERT INTO playlist_tracks VALUES (1,'plR','kussmp3')", []).unwrap();
+        }
+        let sh = db_mode(env);
+        run(&sh, true);
+        assert_eq!(sh.stats.errors.load(Relaxed), 0);
+        assert!(!album.join("01 Kuss.mp3").exists(), "die mp3 ist weg");
+        assert!(album.join("01 Kuss.flac").exists(), "die flac bleibt");
+        assert_eq!(sh.stats.m3u.load(Relaxed), 2, "beide Playlist-Dateien angefasst");
+
+        let a = fs::read_to_string(&im_album).unwrap();
+        assert!(a.lines().any(|l| l.trim() == "01 Kuss.flac"), "relativ bleibt relativ:\n{a}");
+        assert!(a.contains("#EXTINF:200,Kuss"), "Kommentarzeile erhalten:\n{a}");
+
+        let w = fs::read_to_string(&wurzel).unwrap();
+        assert!(w.contains("01 Kuss.flac"), "absoluter Pfad ersetzt:\n{w}");
+        assert!(!w.contains("01 Kuss.mp3"), "alter Pfad weg:\n{w}");
+    }
+
+    #[test]
+    fn playlist_in_fremder_kodierung_bleibt_unangetastet() {
+        let (env, music, _cfg) = fixture();
+        let m3u = music.join("Alt.m3u");
+        // Latin-1: "Grün.mp3" – kein gueltiges UTF-8
+        let mut bytes = b"g1.mp3\nGr".to_vec();
+        bytes.push(0xFC);
+        bytes.extend_from_slice(b"n.mp3\n");
+        fs::write(&m3u, &bytes).unwrap();
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("UPDATE playlist SET path=?1, sync=1 WHERE id='pl1'", params![m3u.to_string_lossy()]).unwrap();
+            c.execute("DELETE FROM playlist_tracks", []).unwrap();
+            c.execute("INSERT INTO playlist_tracks VALUES (1,'pl1','mp3a')", []).unwrap();
+        }
+        let sh = db_mode(env);
+        run(&sh, true);
+        assert_eq!(fs::read(&m3u).unwrap(), bytes, "die Datei wurde nicht angefasst");
+        let log: String = sh.log.lock().unwrap().1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(log.contains("nicht UTF-8"), "deutliche Meldung statt stiller Beschaedigung:\n{log}");
     }
 
     #[test]

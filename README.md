@@ -132,7 +132,10 @@ dann ist das Kuerzerwerden gewollt und die Pruefung entfaellt.)
 **Playlists, die Navidrome aus einer Datei einliest** (`sync`, z. B. m3u), sind ein Sonderfall: dort ist die Datei
 die Wahrheit, nicht die Datenbank. Beim naechsten Scan wuerde Navidrome die Playlist aus der alten Datei neu
 aufbauen und der Eintrag fiele heraus. Das Tool schreibt deshalb den neuen Pfad in die Playlist-Datei mit
-(abschaltbar). Kommentarzeilen wie `#EXTM3U` und `#EXTINF` bleiben stehen, relative Pfade bleiben relativ,
+(abschaltbar). Kommentarzeilen wie `#EXTM3U` und `#EXTINF` bleiben stehen, relative Pfade bleiben relativ
+(passt zu `playlist.m3u8`-Dateien, wie sie viele Downloader je Albumordner anlegen), Symlinks und `..`
+werden beim Vergleich aufgeloest, Dateien in anderer Kodierung als UTF-8 werden gar nicht erst angefasst
+sondern gemeldet,
 und geschrieben wird ueber eine Nachbardatei mit anschliessendem `rename`, damit die Playlist nie halbfertig
 auf der Platte liegt. Schon **vor** dem Lauf – also auch im Dry-Run – wird jede eingelesene Playlist-Datei geprueft: gefunden?
 beschreibbar? Das Ergebnis steht als `PLAYLIST-WARNUNG` im Protokoll, bevor irgendetwas geloescht wird.
@@ -220,7 +223,7 @@ Fuer ein integriertes Gefuehl eignet sich ein Reverse-Proxy, der Navidrome unter
 z. B. `/dedupe/` ausliefert.
 
 ## Entwicklung
-`cargo test` startet die Tests (aktuell 41). Das Testschema ist aus dem Schema-Dump einer echten
+`cargo test` startet die Tests (aktuell 43). Das Testschema ist aus dem Schema-Dump einer echten
 Navidrome-Installation uebernommen: dieselben Spalten, dieselben Fremdschluessel (mit `PRAGMA foreign_keys=ON`
 scharf geschaltet) und die FTS5-Trigger, die bei jedem INSERT, UPDATE und DELETE auf `media_file` mitlaufen.
 Zwei Tests pruefen den Suchindex ausdruecklich: als fehlend markieren laesst ihn unberuehrt (der Trigger haengt
