@@ -232,6 +232,11 @@ hervorgehoben und laedt auf Klick neu. `GET /healthz` antwortet mit `ok navidrom
 `GET /api/status` enthaelt die Version als Feld `version`.
 
 Bewusst schlicht: eine HTML-Seite ohne Framework, ohne Animationen, in Hell und Dunkel.
+Waehrend langer Phasen meldet sich das Protokoll alle zwei Sekunden mit einer Zeile: welcher Ordner gerade
+durchsucht wird, wie viele Dateien erfasst und wie viele davon unveraendert aus dem Index uebernommen wurden.
+Ohne das bliebe es bei einer grossen Bibliothek minutenlang still, obwohl laengst gearbeitet wird.
+Eine Zeile pro Datei waere bei Millionen Titeln unbrauchbar – deshalb der feste Takt statt einer Zaehlgrenze.
+
 Oben eine Statuszeile mit Phase, Fortschritt, Durchsatz in Titeln pro Sekunde, Laufzeit und geschaetzter Restzeit
 (serverseitig berechnet), darunter alle Zaehler als dichte Liste. Das Protokoll zeigt jede Entscheidung mit
 Begruendung, laesst sich nach Text filtern und nach Stufe umschalten (Loeschungen, Uebersprungene,
@@ -252,7 +257,7 @@ Fuer ein integriertes Gefuehl eignet sich ein Reverse-Proxy, der Navidrome unter
 z. B. `/dedupe/` ausliefert.
 
 ## Entwicklung
-`cargo test` startet die Tests (aktuell 43). Das Testschema ist aus dem Schema-Dump einer echten
+`cargo test` startet die Tests (aktuell 44). Das Testschema ist aus dem Schema-Dump einer echten
 Navidrome-Installation uebernommen: dieselben Spalten, dieselben Fremdschluessel (mit `PRAGMA foreign_keys=ON`
 scharf geschaltet) und die FTS5-Trigger, die bei jedem INSERT, UPDATE und DELETE auf `media_file` mitlaufen.
 Zwei Tests pruefen den Suchindex ausdruecklich: als fehlend markieren laesst ihn unberuehrt (der Trigger haengt

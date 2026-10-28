@@ -341,6 +341,26 @@ pub fn save_settings(env: &Env, s: &Settings) -> std::io::Result<()> {
     fs::write(settings_path(env), serde_json::to_string_pretty(s).unwrap())
 }
 
+/// Sorgt dafuer, dass lange Phasen regelmaessig von sich hoeren lassen,
+/// ohne das Protokoll mit einer Zeile pro Datei zu fluten.
+pub struct Takt {
+    last: std::time::Instant,
+    every: std::time::Duration,
+}
+
+impl Takt {
+    pub fn new(secs: u64) -> Takt {
+        Takt { last: std::time::Instant::now(), every: std::time::Duration::from_secs(secs) }
+    }
+    pub fn faellig(&mut self) -> bool {
+        if self.last.elapsed() >= self.every {
+            self.last = std::time::Instant::now();
+            return true;
+        }
+        false
+    }
+}
+
 // ───────────────────────── Schema-Erkennung ─────────────────────────
 
 pub fn cols(c: &Connection, table: &str) -> Vec<String> {
@@ -1140,10 +1160,18 @@ fn scan(
     let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
     let mut key = String::new();
     let mut group: Vec<Row> = vec![];
+    let mut takt = Takt::new(2);
 
     while let Some(r) = rows.next().map_err(|e| e.to_string())? {
         if sh.scan_done() {
             break;
+        }
+        if takt.faellig() {
+            sh.log(format!(
+                "… {} Titel in der Navidrome-Datenbank geprueft, {} Duplikate gefunden",
+                sh.stats.scanned.load(Relaxed),
+                sh.stats.duplicates.load(Relaxed)
+            ));
         }
         let row = Row {
             id: s(r, 0),
@@ -2985,6 +3013,15 @@ mod tests {
         assert_eq!(fs::read(&m3u).unwrap(), bytes, "die Datei wurde nicht angefasst");
         let log: String = sh.log.lock().unwrap().1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
         assert!(log.contains("nicht UTF-8"), "deutliche Meldung statt stiller Beschaedigung:\n{log}");
+    }
+
+    #[test]
+    fn taktgeber_meldet_sich_nur_in_abstaenden() {
+        let mut t = Takt::new(0);
+        assert!(t.faellig(), "ohne Wartezeit sofort faellig");
+        let mut t = Takt::new(3600);
+        assert!(!t.faellig(), "frisch angelegt ist noch nichts faellig");
+        assert!(!t.faellig(), "und bleibt es auch");
     }
 
     #[test]

@@ -16,7 +16,7 @@
 use crate::audio;
 use crate::engine::{
     file_id, is_copy_name, map_root, norm, tag_label, tag_score, tags_missing, Env, Planner, Schema,
-    Settings, Shared,
+    Settings, Shared, Takt,
 };
 use crate::index;
 use rusqlite::{params, Connection};
@@ -161,6 +161,8 @@ pub fn scan(
     let mut rows = st.query([]).map_err(|e| e.to_string())?;
     let mut key = String::new();
     let mut group: Vec<Cand> = vec![];
+    let mut takt = Takt::new(2);
+    let mut gruppen = 0u64;
     while let Some(r) = rows.next().map_err(|e| e.to_string())? {
         if sh.scan_done() {
             break;
@@ -181,6 +183,10 @@ pub fn scan(
         if k != key {
             handle(sh, settings, &key, std::mem::take(&mut group), planner)?;
             key = k;
+            gruppen += 1;
+            if takt.faellig() {
+                sh.log(format!("… {gruppen} Gruppen gleicher Dateien geprueft"));
+            }
         }
         group.push(c);
     }
@@ -207,11 +213,14 @@ fn walk(
     let mut stack = vec![base.to_path_buf()];
     let mut seen_dirs: HashSet<(u64, u64)> = HashSet::new();
     let mut batch: Vec<Found> = Vec::with_capacity(1024);
+    let mut takt = Takt::new(2);
+    let mut ordner = 0u64;
 
     while let Some(dir) = stack.pop() {
         if sh.scan_done() {
             break;
         }
+        ordner += 1;
         // Symlink-Schleifen abfangen
         if let Some(id) = file_id(&dir) {
             if !seen_dirs.insert(id) {
@@ -276,12 +285,27 @@ fn walk(
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| abs.clone());
             batch.push(Found { abs, rel, ext, size: md.len() as i64, mtime });
+            // Alle zwei Sekunden eine Zeile: wo sind wir gerade, und wie weit?
+            // Die Pruefung haengt an der Datei, nicht am Ordner – sonst bliebe es
+            // still, solange ein einzelner riesiger Ordner abgearbeitet wird.
+            if takt.faellig() {
+                let kurz = dir.strip_prefix(base).unwrap_or(&dir).to_string_lossy().to_string();
+                sh.log(format!(
+                    "scanne … {} ({} Ordner, {} Dateien, davon {} unveraendert aus dem Index)",
+                    if kurz.is_empty() { "Hauptordner".into() } else { kurz },
+                    ordner,
+                    sh.stats.files.load(Relaxed),
+                    sh.stats.reused.load(Relaxed)
+                ));
+            }
             if batch.len() >= 1000 {
                 store(sh, settings, idx, run, lib, &mut batch)?;
             }
         }
     }
-    store(sh, settings, idx, run, lib, &mut batch)
+    store(sh, settings, idx, run, lib, &mut batch)?;
+    sh.log(format!("Bibliothek {lib}: {ordner} Ordner durchlaufen"));
+    Ok(())
 }
 
 /// Legt einen Stapel gefundener Dateien im Index ab. Unveraenderte Dateien
@@ -389,6 +413,7 @@ fn load_media_files(sh: &Shared, reader: &Connection, schema: &Schema, idx: &mut
 
     idx.execute("DELETE FROM nd", []).map_err(|e| e.to_string())?;
     let mut n = 0u64;
+    let mut takt = Takt::new(2);
     let mut tx = idx.transaction().map_err(|e| e.to_string())?;
     while let Some(r) = rows.next().map_err(|e| e.to_string())? {
         {
@@ -409,6 +434,9 @@ fn load_media_files(sh: &Shared, reader: &Connection, schema: &Schema, idx: &mut
         if n % 50_000 == 0 {
             tx.commit().map_err(|e| e.to_string())?;
             tx = idx.transaction().map_err(|e| e.to_string())?;
+        }
+        if takt.faellig() {
+            sh.log(format!("… {n} Navidrome-Eintraege eingelesen"));
         }
     }
     tx.commit().map_err(|e| e.to_string())?;
