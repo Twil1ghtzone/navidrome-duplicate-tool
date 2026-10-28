@@ -170,6 +170,10 @@ pub struct Settings {
     pub use_index: bool,
     /// Unveraenderte Dateien nicht erneut untersuchen, sondern aus dem Index nehmen.
     pub reuse_index: bool,
+    /// In Playlist-Dateien (m3u), die Navidrome einliest, den Pfad mitschreiben.
+    /// Sonst baut Navidrome die Playlist beim naechsten Scan aus der Datei neu auf
+    /// und der Eintrag faellt heraus, weil die alte Datei nicht mehr existiert.
+    pub rewrite_m3u: bool,
     /// Echter Lauf uebernimmt den Plan des letzten vollstaendigen Dry-Runs,
     /// statt die Bibliothek noch einmal zu durchsuchen.
     pub reuse_plan: bool,
@@ -195,6 +199,7 @@ impl Default for Settings {
             use_index: true,
             reuse_index: true,
             reuse_plan: false,
+            rewrite_m3u: true,
         }
     }
 }
@@ -221,6 +226,7 @@ pub struct Stats {
     pub bytes_freed: AtomicU64,
     pub annotations: AtomicU64,
     pub playlists: AtomicU64,
+    pub m3u: AtomicU64,
     pub errors: AtomicU64,
 }
 
@@ -292,7 +298,7 @@ impl Shared {
             "protected": st.protected.load(Relaxed), "excluded": st.excluded.load(Relaxed),
             "mismatch": st.mismatch.load(Relaxed), "deleted": st.deleted.load(Relaxed),
             "bytes_freed": st.bytes_freed.load(Relaxed), "annotations": st.annotations.load(Relaxed),
-            "playlists": st.playlists.load(Relaxed),
+            "playlists": st.playlists.load(Relaxed), "m3u": st.m3u.load(Relaxed),
             "errors": st.errors.load(Relaxed)
         })
     }
@@ -304,7 +310,7 @@ impl Shared {
         for a in [&s.total, &s.scanned, &s.candidates, &s.duplicates, &s.same_format, &s.planned,
                   &s.files, &s.reused, &s.unknown, &s.exact,
                   &s.tags_lost, &s.protected, &s.excluded, &s.mismatch, &s.deleted, &s.bytes_freed,
-                  &s.annotations, &s.playlists, &s.errors] {
+                  &s.annotations, &s.playlists, &s.m3u, &s.errors] {
             a.store(0, Relaxed);
         }
     }
@@ -1469,8 +1475,10 @@ fn flush(
     batch: Vec<PlanRow>,
     applied: Option<&mut BufWriter<fs::File>>,
 ) -> Result<(), String> {
-    match commit_batch(sh, w, schema, settings, &batch) {
+    let mut m3u: Vec<M3uFix> = vec![];
+    match commit_batch(sh, w, schema, settings, &batch, &mut m3u) {
         Ok(()) => {
+            rewrite_m3u(sh, &m3u);
             remove_files(sh, trash, idx, &batch, applied);
             Ok(())
         }
@@ -1478,8 +1486,12 @@ fn flush(
             sh.log(format!("Block zurueckgerollt ({e}) – Eintraege werden einzeln geprueft"));
             for one in batch {
                 let single = vec![one.clone()];
-                match commit_batch(sh, w, schema, settings, &single) {
-                    Ok(()) => remove_files(sh, trash, idx, &single, None),
+                let mut m1: Vec<M3uFix> = vec![];
+                match commit_batch(sh, w, schema, settings, &single, &mut m1) {
+                    Ok(()) => {
+                        rewrite_m3u(sh, &m1);
+                        remove_files(sh, trash, idx, &single, None)
+                    }
                     Err(e) => {
                         sh.stats.errors.fetch_add(1, Relaxed);
                         if let Some((c, run)) = idx {
@@ -1494,25 +1506,201 @@ fn flush(
     }
 }
 
+/// Eine Playlist-Datei, in der ein Pfad ersetzt werden muss.
+pub struct M3uFix {
+    pub file: String,
+    pub del: String,
+    pub keeper: String,
+}
+
 fn commit_batch(
     sh: &Shared,
     w: &mut Connection,
     schema: &Schema,
     settings: &Settings,
     batch: &[PlanRow],
+    m3u: &mut Vec<M3uFix>,
 ) -> Result<(), String> {
     let mut moved = 0u64;
     let mut playlists: HashSet<String> = HashSet::new();
     let tx = w.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+
+    for p in batch {
+        // Muss VOR dem Umhaengen passieren – danach steht die alte ID nirgends mehr.
+        if settings.rewrite_m3u {
+            collect_m3u(&tx, schema, sh, p, m3u)?;
+        }
+        note_playlists(&tx, schema, &p.del_id, &mut playlists)?;
+    }
+    // Zustand vor der Aenderung festhalten. Nur wenn Doppelte erhalten bleiben
+    // sollen, darf eine Playlist hinterher nicht kuerzer sein – beim bewussten
+    // Zusammenfassen ist das Kuerzerwerden ja gerade gewollt.
+    let before = if settings.playlist_keep_duplicates {
+        playlist_lengths(&tx, schema, &playlists)?
+    } else {
+        HashMap::new()
+    };
+
     for p in batch {
         moved += transfer(&tx, schema, settings, &p.keeper_id, &p.del_id, &mut playlists, sh.env.delete_rows)
             .map_err(|e| format!("{}: {e}", p.del_path))?;
     }
     refresh_playlists(&tx, schema, &playlists).map_err(|e| format!("Playlist-Zaehler: {e}"))?;
+
+    // Sicherheitsgurt: war eine Playlist vorher laenger, wird der Block verworfen.
+    let after = playlist_lengths(&tx, schema, &playlists)?;
+    for (id, n) in &before {
+        let now = after.get(id).copied().unwrap_or(0);
+        if now < *n {
+            return Err(format!(
+                "Playlist {id} haette von {n} auf {now} Eintraege verloren – Block zurueckgerollt, nichts geloescht"
+            ));
+        }
+    }
+
     tx.commit().map_err(|e| format!("Commit fehlgeschlagen: {e}"))?;
     sh.stats.annotations.fetch_add(moved, Relaxed);
     sh.stats.playlists.fetch_add(playlists.len() as u64, Relaxed);
     Ok(())
+}
+
+/// Playlists, in denen diese Datei vorkommt, fuer die Laengenpruefung vormerken.
+fn note_playlists(
+    tx: &rusqlite::Transaction,
+    schema: &Schema,
+    del_id: &str,
+    out: &mut HashSet<String>,
+) -> Result<(), String> {
+    if !schema.table("playlist_tracks") || del_id.is_empty() {
+        return Ok(());
+    }
+    let mut st = tx
+        .prepare_cached("SELECT DISTINCT playlist_id FROM playlist_tracks WHERE media_file_id=?1")
+        .map_err(|e| e.to_string())?;
+    let it = st.query_map(params![del_id], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?;
+    for p in it.flatten() {
+        out.insert(p);
+    }
+    Ok(())
+}
+
+/// Wie viele aufloesbare Eintraege hat jede dieser Playlists gerade?
+fn playlist_lengths(
+    tx: &rusqlite::Transaction,
+    schema: &Schema,
+    ids: &HashSet<String>,
+) -> Result<HashMap<String, i64>, String> {
+    let mut out = HashMap::new();
+    if ids.is_empty() || !schema.table("playlist_tracks") {
+        return Ok(out);
+    }
+    let mut st = tx
+        .prepare_cached(
+            "SELECT count(*) FROM playlist_tracks t JOIN media_file m ON m.id = t.media_file_id WHERE t.playlist_id=?1",
+        )
+        .map_err(|e| e.to_string())?;
+    for id in ids {
+        let n: i64 = st.query_row(params![id], |r| r.get(0)).map_err(|e| e.to_string())?;
+        out.insert(id.clone(), n);
+    }
+    Ok(out)
+}
+
+/// Sucht die von Navidrome eingelesenen Playlist-Dateien, in denen diese Datei steht.
+fn collect_m3u(
+    tx: &rusqlite::Transaction,
+    schema: &Schema,
+    sh: &Shared,
+    p: &PlanRow,
+    out: &mut Vec<M3uFix>,
+) -> Result<(), String> {
+    if !schema.table("playlist") || !schema.table("playlist_tracks") || p.del_id.is_empty() {
+        return Ok(());
+    }
+    if !schema.playlist.contains("path") {
+        return Ok(());
+    }
+    let sync = if schema.playlist.contains("sync") { "COALESCE(pl.sync,0)=1 AND " } else { "" };
+    let sql = format!(
+        "SELECT DISTINCT pl.path FROM playlist pl JOIN playlist_tracks t ON t.playlist_id = pl.id \
+         WHERE t.media_file_id = ?1 AND {sync}COALESCE(pl.path,'') <> ''"
+    );
+    let mut st = tx.prepare_cached(&sql).map_err(|e| e.to_string())?;
+    let it = st.query_map(params![p.del_id], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?;
+    for f in it.flatten() {
+        let mapped = map_root(&sh.env, &f);
+        out.push(M3uFix { file: mapped, del: p.del_path.clone(), keeper: p.keeper_path.clone() });
+    }
+    Ok(())
+}
+
+/// Schreibt den neuen Pfad in die Playlist-Datei. Zeilen, die nicht passen,
+/// bleiben unveraendert; geschrieben wird ueber eine Nachbardatei und `rename`,
+/// damit die Playlist nie halbfertig auf der Platte liegt.
+fn rewrite_m3u(sh: &Shared, fixes: &[M3uFix]) {
+    let mut by_file: HashMap<&str, Vec<&M3uFix>> = HashMap::new();
+    for f in fixes {
+        by_file.entry(f.file.as_str()).or_default().push(f);
+    }
+    for (file, list) in by_file {
+        let path = Path::new(file);
+        let text = match fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                sh.stats.errors.fetch_add(1, Relaxed);
+                sh.log(format!("FEHLER: Playlist-Datei {file} nicht lesbar: {e}"));
+                continue;
+            }
+        };
+        let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let mut changed = 0usize;
+        let mut out = String::with_capacity(text.len());
+        for line in text.lines() {
+            let t = line.trim();
+            let mut replaced: Option<String> = None;
+            if !t.is_empty() && !t.starts_with('#') {
+                // m3u darf absolute wie relative Pfade enthalten
+                let abs = if Path::new(t).is_absolute() { PathBuf::from(t) } else { dir.join(t) };
+                for f in &list {
+                    if abs == Path::new(&f.del) {
+                        let keeper = Path::new(&f.keeper);
+                        let rel = keeper.strip_prefix(&dir).ok();
+                        replaced = Some(match (Path::new(t).is_absolute(), rel) {
+                            (false, Some(r)) => r.to_string_lossy().to_string(),
+                            _ => f.keeper.clone(),
+                        });
+                        break;
+                    }
+                }
+            }
+            match replaced {
+                Some(neu) => {
+                    out.push_str(&neu);
+                    changed += 1;
+                }
+                None => out.push_str(line),
+            }
+            out.push('\n');
+        }
+        if changed == 0 {
+            continue;
+        }
+        let tmp = path.with_extension("ndtmp");
+        let ok = fs::write(&tmp, out.as_bytes()).and_then(|()| fs::rename(&tmp, path));
+        match ok {
+            Ok(()) => {
+                sh.stats.m3u.fetch_add(1, Relaxed);
+                sh.log(format!("PLAYLIST-DATEI aktualisiert ({changed} Zeile(n)): {file}"));
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                sh.stats.errors.fetch_add(1, Relaxed);
+                sh.log(format!(
+                    "FEHLER: Playlist-Datei {file} nicht schreibbar: {e} – Navidrome baut sie beim naechsten Scan aus der alten Datei neu auf"
+                ));
+            }
+        }
+    }
 }
 
 fn remove_files(
@@ -1823,7 +2011,8 @@ mod tests {
         starred bool default 0 not null, starred_at datetime, rated_at datetime,
         unique (user_id, item_id, item_type));
     CREATE TABLE playlist (id varchar primary key, name varchar, duration real default 0,
-        size integer default 0, song_count integer default 0);
+        size integer default 0, song_count integer default 0, path varchar default '',
+        sync bool default 0);
     CREATE TABLE playlist_tracks (id integer default 0 not null, playlist_id varchar not null,
         media_file_id varchar not null);
     CREATE UNIQUE INDEX playlist_tracks_pos ON playlist_tracks (playlist_id, id);
@@ -2264,6 +2453,100 @@ mod tests {
         crate::index::reset(&sh.env).unwrap();
         assert!(!cfg.join("index.db").is_file(), "Index geloescht");
         assert!(crate::index::open_ro(&sh.env).is_err(), "danach gibt es nichts zu lesen");
+    }
+
+    // ───────── Playlists ─────────
+
+    #[test]
+    fn playlist_wird_nie_kuerzer_auch_wenn_beide_seiten_drin_stehen() {
+        let (env, _music, _cfg) = fixture();
+        {
+            // mp3 UND flac stehen in derselben Playlist
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("DELETE FROM playlist_tracks", []).unwrap();
+            c.execute("INSERT INTO playlist_tracks VALUES (1,'pl1','mp3a')", []).unwrap();
+            c.execute("INSERT INTO playlist_tracks VALUES (2,'pl1','flacA')", []).unwrap();
+            c.execute("UPDATE playlist SET song_count=2 WHERE id='pl1'", []).unwrap();
+        }
+        let sh = db_mode(env);
+        let db = sh.env.db_path.clone();
+        run(&sh, true);
+        assert_eq!(sh.stats.errors.load(Relaxed), 0);
+        let c = Connection::open(&db).unwrap();
+        let n: i64 = c.query_row("SELECT count(*) FROM playlist_tracks WHERE playlist_id='pl1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2, "die Playlist behaelt beide Plaetze");
+        let auf_keeper: i64 = c
+            .query_row("SELECT count(*) FROM playlist_tracks WHERE playlist_id='pl1' AND media_file_id='flacA'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(auf_keeper, 2, "beide zeigen jetzt auf die behaltene Datei");
+        let cnt: i64 = c.query_row("SELECT song_count FROM playlist WHERE id='pl1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(cnt, 2, "song_count stimmt weiterhin");
+    }
+
+    #[test]
+    fn zusammenfassen_darf_die_playlist_kuerzen() {
+        let (env, _music, _cfg) = fixture();
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("DELETE FROM playlist_tracks", []).unwrap();
+            c.execute("INSERT INTO playlist_tracks VALUES (1,'pl1','mp3a')", []).unwrap();
+            c.execute("INSERT INTO playlist_tracks VALUES (2,'pl1','flacA')", []).unwrap();
+        }
+        let sh = db_mode(env);
+        let db = sh.env.db_path.clone();
+        sh.settings.lock().unwrap().playlist_keep_duplicates = false;
+        run(&sh, true);
+        assert_eq!(sh.stats.errors.load(Relaxed), 0);
+        let c = Connection::open(&db).unwrap();
+        let n: i64 = c.query_row("SELECT count(*) FROM playlist_tracks WHERE playlist_id='pl1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "hier ist das Kuerzen ausdruecklich gewollt");
+    }
+
+    #[test]
+    fn eingelesene_playlist_datei_wird_mitgeschrieben() {
+        let (env, music, _cfg) = fixture();
+        let m3u = music.join("Mix.m3u");
+        // Navidrome-Playlists aus Dateien enthalten oft relative Pfade und Kommentarzeilen
+        fs::write(
+            &m3u,
+            format!("#EXTM3U\n#EXTINF:180,Song One\ng1.mp3\n{}\n", music.join("g2-hi.flac").display()),
+        )
+        .unwrap();
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("DELETE FROM playlist_tracks", []).unwrap();
+            c.execute("INSERT INTO playlist_tracks VALUES (1,'pl1','mp3a')", []).unwrap();
+            c.execute(
+                "UPDATE playlist SET path=?1, sync=1, song_count=1 WHERE id='pl1'",
+                params![m3u.to_string_lossy()],
+            )
+            .unwrap();
+        }
+        let sh = db_mode(env);
+        run(&sh, true);
+        assert_eq!(sh.stats.errors.load(Relaxed), 0);
+        assert_eq!(sh.stats.m3u.load(Relaxed), 1, "eine Playlist-Datei angefasst");
+
+        let text = fs::read_to_string(&m3u).unwrap();
+        assert!(text.contains("g1.flac"), "der neue Pfad steht in der Datei:\n{text}");
+        assert!(!text.contains("g1.mp3"), "der alte Pfad ist weg:\n{text}");
+        assert!(text.contains("#EXTM3U") && text.contains("#EXTINF"), "Kommentarzeilen bleiben erhalten");
+        assert!(text.lines().any(|l| l.trim() == "g1.flac"), "relativ bleibt relativ");
+    }
+
+    #[test]
+    fn playlist_datei_ohne_sync_wird_nicht_angefasst() {
+        let (env, music, _cfg) = fixture();
+        let m3u = music.join("Hand.m3u");
+        fs::write(&m3u, "g1.mp3\n").unwrap();
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("UPDATE playlist SET path=?1, sync=0 WHERE id='pl1'", params![m3u.to_string_lossy()]).unwrap();
+        }
+        let sh = db_mode(env);
+        run(&sh, true);
+        assert_eq!(fs::read_to_string(&m3u).unwrap(), "g1.mp3\n", "selbst gepflegte Playlists bleiben unberuehrt");
+        assert_eq!(sh.stats.m3u.load(Relaxed), 0);
     }
 
     #[test]

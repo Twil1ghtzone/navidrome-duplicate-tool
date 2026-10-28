@@ -142,6 +142,7 @@
     <div><span>Speicher</span><b id="freed">0 B</b></div>
     <div><span>Favoriten/Statistiken übertragen</span><b id="annotations">0</b></div>
     <div><span>Playlists aktualisiert</span><b id="playlists">0</b></div>
+    <div><span>Playlist-Dateien geschrieben</span><b id="m3u">0</b></div>
     <div><span>Tag-Warnungen</span><b id="tags_lost">0</b></div>
     <div><span>geschützt (Instrumental u.&nbsp;ä.)</span><b id="protected">0</b></div>
     <div><span>ausgeschlossene Ordner</span><b id="excluded">0</b></div>
@@ -197,6 +198,7 @@
       <label class="chk"><input type="checkbox" id="verify_bytes"> Treffer ohne FLAC-Prüfsumme vor dem Löschen Byte für Byte vergleichen</label>
       <label class="chk"><input type="checkbox" id="report_unknown"> Dateien auflisten, die Navidrome nicht kennt</label>
       <label class="chk"><input type="checkbox" id="use_trash"> in den Papierkorb verschieben statt löschen (Ordner /trash)</label>
+      <label class="chk"><input type="checkbox" id="rewrite_m3u"> Pfad in eingelesenen Playlist-Dateien (m3u) mitschreiben</label>
       <label class="chk"><input type="checkbox" id="use_index"> eigenen Index führen (/config/index.db)</label>
       <label class="chk"><input type="checkbox" id="reuse_index"> unveränderte Dateien nicht erneut einlesen (schnelle Folgeläufe)</label>
       <label class="chk"><input type="checkbox" id="reuse_plan"> beim Ausführen den Plan des letzten Dry-Runs übernehmen, statt neu zu suchen</label>
@@ -250,7 +252,7 @@
 "use strict";
 const $ = id => document.getElementById(id);
 const NUMS = ["scanned","files","unknown","candidates","duplicates","same_format","exact","planned",
-              "deleted","annotations","playlists","tags_lost","protected","excluded","mismatch","errors"];
+              "deleted","annotations","playlists","m3u","tags_lost","protected","excluded","mismatch","errors"];
 const MAXLINES = 800;
 let since = 0, running = false, idleTicks = 0, last = {};
 const PAGE_VERSION = "{{VERSION}}";
@@ -392,7 +394,7 @@ async function stopRun() { await press($("stop"), "stoppt …", () => api("/api/
 /* Einstellungen */
 const FLAGS = ["dedupe_flac","strip_copy_suffix","skip_on_tag_loss","require_mbz_match","require_same_track",
                "playlist_keep_duplicates","verify_bytes","report_unknown","use_trash",
-               "use_index","reuse_index","reuse_plan"];
+               "use_index","reuse_index","reuse_plan","rewrite_m3u"];
 const lines = t => t.split("\n").map(x => x.trim()).filter(Boolean);
 async function loadCfg() {
   const c = await (await api("/api/config")).json();

@@ -122,6 +122,22 @@ Navidrome-Versionen hinweg funktioniert (vorhandene Tabellen/Spalten werden genu
 Am Ende jeder Transaktion wird geprueft, dass kein `annotation`-, `bookmark`- oder `playlist_tracks`-Eintrag mehr auf die
 geloeschte Datei zeigt. Schlaegt die Pruefung fehl, wird der Block zurueckgerollt und keine Datei angefasst.
 
+### Playlists im Besonderen
+Eintraege werden **umgebogen, nie geloescht** – auch dann nicht, wenn die behaltene Datei dadurch doppelt in der
+Playlist steht. Position und Laenge bleiben also erhalten. Zusaetzlich zaehlt jede Transaktion die aufloesbaren
+Eintraege jeder betroffenen Playlist vor und nach der Aenderung: waere eine Playlist kuerzer geworden, wird der
+Block verworfen und keine Datei angefasst. (Wer Doppelungen lieber zusammenfassen moechte, schaltet die Option ab –
+dann ist das Kuerzerwerden gewollt und die Pruefung entfaellt.)
+
+**Playlists, die Navidrome aus einer Datei einliest** (`sync`, z. B. m3u), sind ein Sonderfall: dort ist die Datei
+die Wahrheit, nicht die Datenbank. Beim naechsten Scan wuerde Navidrome die Playlist aus der alten Datei neu
+aufbauen und der Eintrag fiele heraus. Das Tool schreibt deshalb den neuen Pfad in die Playlist-Datei mit
+(abschaltbar). Kommentarzeilen wie `#EXTM3U` und `#EXTINF` bleiben stehen, relative Pfade bleiben relativ,
+und geschrieben wird ueber eine Nachbardatei mit anschliessendem `rename`, damit die Playlist nie halbfertig
+auf der Platte liegt. Laesst sich die Datei nicht schreiben (schreibgeschuetzt gemountet), steht das als Fehler
+im Protokoll – die Datenbank ist dann trotzdem korrekt, aber der naechste Navidrome-Scan wuerde den Eintrag
+verlieren. Playlists, die du in Navidrome selbst angelegt hast, haben keine Datei und sind davon nicht betroffen.
+
 ## Duplikat-Logik und Schutzmechanismen
 - Gruppierung nach `album_id + Disc + Titel` (`MATCH_MODE=artist_title` gruppiert albumuebergreifend).
 - **Kopien mit Zaehler im Namen** wie `Song (1)`, `Song (2)`, `Song [3]`, `Song - Copy`, `Song Kopie` werden auf
