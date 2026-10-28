@@ -1,29 +1,31 @@
 //! Inhaltsbasierte Duplikatsuche ueber einen vollstaendigen Bibliotheks-Scan.
 //!
 //! Dieses Verfahren verlaesst sich nicht auf Navidromes Gruppierung nach Album und
-//! Titel. Es laeuft stattdessen selbst durch die Bibliotheksordner – welche das sind,
-//! holt es aus Navidromes `library`-Tabelle – und erkennt Duplikate am Audio selbst.
+//! Titel. Es laeuft selbst durch die Bibliotheksordner – welche das sind, holt es
+//! aus Navidromes `library`-Tabelle – und erkennt Duplikate am Audio selbst.
 //! Damit findet es auch:
 //!
 //! * identische Dateien in verschiedenen Alben oder Ordnern,
 //! * Kopien mit voellig anderen Tags (Navidrome gruppiert sie nie zusammen),
+//! * doppelte MP3s, M4As und alles andere, nicht nur FLAC,
 //! * Dateien, die Navidrome noch gar nicht eingelesen hat.
 //!
-//! Zwischenspeicher ist eine temporaere SQLite-Datei. So bleibt der Arbeitsspeicher
-//! konstant, und das Sortieren von Millionen Eintraegen uebernimmt SQLite.
+//! Alles Gefundene landet im Index (`/config/index.db`). Beim naechsten Lauf
+//! genuegt fuer eine unveraenderte Datei ein `stat` statt sie zu oeffnen.
 
 use crate::audio;
 use crate::engine::{
-    file_id, is_copy_name, map_root, norm, tag_label, tag_score, tags_missing, Env, Planner,
-    Schema, Settings, Shared,
+    file_id, is_copy_name, map_root, norm, tag_label, tag_score, tags_missing, Env, Planner, Schema,
+    Settings, Shared,
 };
+use crate::index;
 use rusqlite::{params, Connection};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
 
-/// Eine Datei aus dem Bibliotheks-Scan, angereichert um das, was Navidrome ueber sie weiss.
+/// Eine Datei aus dem Index, angereichert um das, was Navidrome ueber sie weiss.
 #[derive(Clone)]
 struct Cand {
     abs: String,
@@ -58,14 +60,13 @@ impl Cand {
     }
 }
 
-fn tmp_db_path(env: &Env) -> PathBuf {
-    env.config_dir.join("scan-index.db")
-}
-
-fn drop_tmp(p: &Path) {
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = fs::remove_file(format!("{}{suffix}", p.display()));
-    }
+/// Eine im Verzeichnisdurchlauf gefundene Datei, bevor sie untersucht wurde.
+struct Found {
+    abs: String,
+    rel: String,
+    ext: String,
+    size: i64,
+    mtime: i64,
 }
 
 /// Hauptablauf des Inhalts-Scans.
@@ -77,81 +78,70 @@ pub fn scan(
     schema: &Schema,
     settings: &Settings,
     libs: &HashMap<i64, String>,
-    same_exts: &[String],
+    idx: &mut Connection,
+    run: i64,
     planner: &mut Planner,
 ) -> Result<(), String> {
-    let mut exts: Vec<String> = env
-        .keep_exts
-        .iter()
-        .chain(env.delete_exts.iter())
-        .chain(same_exts.iter())
-        .cloned()
-        .collect();
-    exts.sort();
-    exts.dedup();
-    let extset: HashSet<String> = exts.iter().cloned().collect();
+    // Der Bibliotheks-Scan betrachtet jedes Audioformat: eine bytegleiche Kopie
+    // ist unabhaengig vom Format eine Kopie.
+    let exts: HashSet<String> = env.audio_exts.iter().cloned().collect();
+    if exts.is_empty() {
+        return Err("AUDIO_EXTS ist leer – der Bibliotheks-Scan haette nichts zu tun".into());
+    }
 
-    let tmp = tmp_db_path(env);
-    drop_tmp(&tmp);
-    let mut t = Connection::open(&tmp).map_err(|e| format!("Zwischenspeicher {}: {e}", tmp.display()))?;
-    t.execute_batch(
-        "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-131072; PRAGMA temp_store=FILE;
-         CREATE TABLE f (abs TEXT PRIMARY KEY, lib INTEGER, rel TEXT, size INTEGER,
-                         k TEXT, astart INTEGER, alen INTEGER, mf TEXT);
-         CREATE TABLE m (lib INTEGER, rel TEXT, id TEXT, flags TEXT, title TEXT, album TEXT,
-                         comment TEXT, tags TEXT, PRIMARY KEY (lib, rel)) WITHOUT ROWID;",
-    )
-    .map_err(|e| e.to_string())?;
-
-    let res = run(sh, env, reader, schema, settings, libs, &extset, &mut t, planner);
-    drop(t);
-    drop_tmp(&tmp);
-    res
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run(
-    sh: &Shared,
-    env: &Env,
-    reader: &Connection,
-    schema: &Schema,
-    settings: &Settings,
-    libs: &HashMap<i64, String>,
-    exts: &HashSet<String>,
-    t: &mut Connection,
-    planner: &mut Planner,
-) -> Result<(), String> {
     // ── 1. Bibliotheken durchlaufen und jede Datei fingerprinten ──
     sh.phase("durchsuche Bibliotheken");
+    let mut walked: Vec<i64> = vec![];
     for (id, root) in libs {
         if sh.scan_done() {
             break;
         }
         let base = map_root(env, root);
         sh.log(format!("Bibliothek {id}: durchsuche {base}"));
-        walk(sh, t, *id, Path::new(&base), exts)?;
+        walk(sh, settings, idx, run, *id, Path::new(&base), &exts)?;
+        walked.push(*id);
     }
     let files = sh.stats.files.load(Relaxed);
-    sh.log(format!("{files} Audiodateien im Dateisystem gefunden"));
+    let reused = sh.stats.reused.load(Relaxed);
+    sh.log(format!(
+        "{files} Audiodateien erfasst, davon {reused} unveraendert aus dem Index uebernommen"
+    ));
     if sh.scan_done() {
         return Ok(());
     }
 
-    // ── 2. Navidromes Sicht dazuholen (ein Durchlauf, kein Suchen pro Datei) ──
-    sh.phase("lese Navidrome-Datenbank");
-    load_media_files(sh, reader, schema, exts, t)?;
-    t.execute_batch(
-        "CREATE INDEX f_k ON f(k);
-         UPDATE f SET mf = (SELECT id FROM m WHERE m.lib = f.lib AND m.rel = f.rel);",
-    )
-    .map_err(|e| format!("Abgleich mit der Datenbank: {e}"))?;
+    // Verschwundene Dateien aus dem Index werfen
+    if !walked.is_empty() {
+        let list = walked.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        let gone = idx
+            .execute(&format!("DELETE FROM files WHERE seen <> ?1 AND lib IN ({list})"), params![run])
+            .map_err(|e| format!("Index aufraeumen: {e}"))?;
+        if gone > 0 {
+            sh.log(format!("{gone} Eintraege aus dem Index entfernt (Datei nicht mehr vorhanden)"));
+        }
+    }
 
-    let unknown: i64 = t.query_row("SELECT count(*) FROM f WHERE mf IS NULL", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+    // ── 2. Navidromes Sicht einlesen ──
+    sh.phase("lese Navidrome-Datenbank");
+    load_media_files(sh, reader, schema, idx)?;
+
+    let unknown: i64 = idx
+        .query_row(
+            "SELECT count(*) FROM files f LEFT JOIN nd ON nd.lib=f.lib AND nd.rel=f.rel WHERE nd.id IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
     sh.stats.unknown.store(unknown.max(0) as u64, Relaxed);
     if unknown > 0 {
         sh.log(format!("{unknown} Dateien liegen im Ordner, sind aber nicht in Navidrome (Scan in Navidrome noetig?)"));
         if settings.report_unknown {
-            let mut st = t.prepare("SELECT abs FROM f WHERE mf IS NULL ORDER BY abs LIMIT 50").map_err(|e| e.to_string())?;
+            let mut st = idx
+                .prepare(
+                    "SELECT f.abs FROM files f LEFT JOIN nd ON nd.lib=f.lib AND nd.rel=f.rel \
+                     WHERE nd.id IS NULL ORDER BY f.abs LIMIT 50",
+                )
+                .map_err(|e| e.to_string())?;
             let it = st.query_map([], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?;
             for p in it.flatten() {
                 sh.log(format!("NICHT IN NAVIDROME: {p}"));
@@ -159,15 +149,15 @@ fn run(
         }
     }
 
-    // ── 3. Gruppen gleicher Fingerprints abarbeiten ──
+    // ── 3. Gruppen gleicher Fingerabdruecke abarbeiten ──
     sh.phase("vergleiche Dateiinhalte");
-    let sql = "SELECT f.k, f.abs, f.size, f.astart, f.alen, COALESCE(f.mf,''), \
-                      COALESCE(m.flags,''), COALESCE(m.title,''), COALESCE(m.album,''), \
-                      COALESCE(m.comment,''), COALESCE(m.tags,'') \
-               FROM f LEFT JOIN m ON m.lib = f.lib AND m.rel = f.rel \
-               WHERE f.k IN (SELECT k FROM f GROUP BY k HAVING count(*) > 1) \
-               ORDER BY f.k";
-    let mut st = t.prepare(sql).map_err(|e| e.to_string())?;
+    let sql = "SELECT f.fkey, f.abs, f.size, f.astart, f.alen, COALESCE(nd.id,''), \
+                      COALESCE(nd.flags,''), COALESCE(nd.title,''), COALESCE(nd.album,''), \
+                      COALESCE(nd.comment,''), COALESCE(nd.tags,'') \
+               FROM files f LEFT JOIN nd ON nd.lib = f.lib AND nd.rel = f.rel \
+               WHERE f.fkey IN (SELECT fkey FROM files GROUP BY fkey HAVING count(*) > 1) \
+               ORDER BY f.fkey";
+    let mut st = idx.prepare(sql).map_err(|e| e.to_string())?;
     let mut rows = st.query([]).map_err(|e| e.to_string())?;
     let mut key = String::new();
     let mut group: Vec<Cand> = vec![];
@@ -200,11 +190,23 @@ fn run(
     Ok(())
 }
 
-/// Laeuft einen Bibliotheksordner ab und legt jede Audiodatei mit ihrem Fingerprint ab.
-fn walk(sh: &Shared, t: &mut Connection, lib: i64, base: &Path, exts: &HashSet<String>) -> Result<(), String> {
+// ───────────────────────── Verzeichnisdurchlauf ─────────────────────────
+
+/// Laeuft einen Bibliotheksordner ab. Reihenfolge der Pruefungen ist bewusst so
+/// gewaehlt, dass jede Datei moeglichst frueh aussortiert wird:
+/// Dateiname → Endung → `stat` → (nur wenn noetig) die Datei oeffnen.
+fn walk(
+    sh: &Shared,
+    settings: &Settings,
+    idx: &mut Connection,
+    run: i64,
+    lib: i64,
+    base: &Path,
+    exts: &HashSet<String>,
+) -> Result<(), String> {
     let mut stack = vec![base.to_path_buf()];
     let mut seen_dirs: HashSet<(u64, u64)> = HashSet::new();
-    let mut batch: Vec<(String, String, i64, audio::Info)> = vec![];
+    let mut batch: Vec<Found> = Vec::with_capacity(1024);
 
     while let Some(dir) = stack.pop() {
         if sh.scan_done() {
@@ -225,56 +227,136 @@ fn walk(sh: &Shared, t: &mut Connection, lib: i64, base: &Path, exts: &HashSet<S
             }
         };
         for ent in rd.flatten() {
+            let name = ent.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || name == "@eaDir" || name == "#recycle" || name == "lost+found" {
+                continue;
+            }
+            // file_type() kommt unter Linux aus dem Verzeichniseintrag selbst,
+            // kostet also keinen zusaetzlichen Systemaufruf.
+            let ft = match ent.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                stack.push(ent.path());
+                continue;
+            }
+            let is_link = ft.is_symlink();
+            if !ft.is_file() && !is_link {
+                continue;
+            }
+            // Endung zuerst pruefen – das sortiert Cover, Logs und Playlists
+            // aus, ohne dass dafuer das Dateisystem gefragt werden muss.
+            let ext = match name.rfind('.') {
+                Some(i) if i + 1 < name.len() => name[i + 1..].to_ascii_lowercase(),
+                _ => continue,
+            };
+            if !exts.contains(&ext) {
+                continue;
+            }
             let path = ent.path();
-            let name = ent.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') || name == "@eaDir" || name == "#recycle" {
-                continue;
-            }
-            let md = match fs::metadata(&path) {
+            // Symlinks muessen aufgeloest werden, sonst stimmen Groesse und Zeit nicht.
+            let md = match if is_link { fs::metadata(&path) } else { ent.metadata() } {
                 Ok(m) => m,
-                Err(_) => continue, // toter Symlink o. ae.
+                Err(_) => continue,
             };
-            if md.is_dir() {
-                stack.push(path);
+            if !md.is_file() || md.len() == 0 {
                 continue;
             }
-            let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-            if !exts.contains(&ext) || md.len() == 0 {
-                continue;
-            }
-            let info = match audio::probe(&path) {
-                Ok(i) => i,
-                Err(e) => {
-                    sh.stats.errors.fetch_add(1, Relaxed);
-                    sh.log(format!("FEHLER beim Lesen von {}: {e}", path.display()));
-                    continue;
-                }
-            };
+            let mtime = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
             let abs = path.to_string_lossy().to_string();
-            let rel = path.strip_prefix(base).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| abs.clone());
-            batch.push((abs, rel, md.len() as i64, info));
-            sh.stats.files.fetch_add(1, Relaxed);
-            sh.stats.scanned.fetch_add(1, Relaxed);
-            if batch.len() >= 2000 {
-                insert(t, lib, &mut batch)?;
+            let rel = path
+                .strip_prefix(base)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| abs.clone());
+            batch.push(Found { abs, rel, ext, size: md.len() as i64, mtime });
+            if batch.len() >= 1000 {
+                store(sh, settings, idx, run, lib, &mut batch)?;
             }
         }
     }
-    insert(t, lib, &mut batch)
+    store(sh, settings, idx, run, lib, &mut batch)
 }
 
-fn insert(t: &mut Connection, lib: i64, batch: &mut Vec<(String, String, i64, audio::Info)>) -> Result<(), String> {
+/// Legt einen Stapel gefundener Dateien im Index ab. Unveraenderte Dateien
+/// werden nicht erneut untersucht – das ist der eigentliche Zeitgewinn.
+fn store(
+    sh: &Shared,
+    settings: &Settings,
+    idx: &mut Connection,
+    run: i64,
+    lib: i64,
+    batch: &mut Vec<Found>,
+) -> Result<(), String> {
     if batch.is_empty() {
         return Ok(());
     }
-    let tx = t.transaction().map_err(|e| e.to_string())?;
+    // 1. Nachsehen, was sich seit dem letzten Lauf nicht geaendert hat
+    let mut fresh: Vec<bool> = Vec::with_capacity(batch.len());
     {
-        let mut st = tx
-            .prepare_cached("INSERT OR IGNORE INTO f (abs, lib, rel, size, k, astart, alen) VALUES (?1,?2,?3,?4,?5,?6,?7)")
+        let mut look = idx
+            .prepare_cached("SELECT size, mtime FROM files WHERE abs=?1")
             .map_err(|e| e.to_string())?;
-        for (abs, rel, size, i) in batch.iter() {
-            st.execute(params![abs, lib, rel, size, i.key, i.audio_start as i64, i.audio_len as i64])
+        for f in batch.iter() {
+            let hit = settings.reuse_index
+                && look
+                    .query_row(params![f.abs], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+                    .map(|(s, m)| s == f.size && m == f.mtime)
+                    .unwrap_or(false);
+            fresh.push(hit);
+        }
+    }
+    // 2. Nur die uebrigen Dateien wirklich oeffnen
+    let mut probed: Vec<Option<audio::Info>> = Vec::with_capacity(batch.len());
+    for (f, hit) in batch.iter().zip(fresh.iter()) {
+        if *hit {
+            probed.push(None);
+            continue;
+        }
+        match audio::probe(Path::new(&f.abs)) {
+            Ok(i) => probed.push(Some(i)),
+            Err(e) => {
+                sh.stats.errors.fetch_add(1, Relaxed);
+                sh.log(format!("FEHLER beim Lesen von {}: {e}", f.abs));
+                probed.push(None);
+            }
+        }
+    }
+    // 3. In einem Rutsch schreiben
+    let tx = idx.transaction().map_err(|e| e.to_string())?;
+    {
+        let mut touch = tx
+            .prepare_cached("UPDATE files SET seen=?2 WHERE abs=?1")
+            .map_err(|e| e.to_string())?;
+        let mut put = tx
+            .prepare_cached(
+                "INSERT OR REPLACE INTO files \
+                 (abs, lib, rel, ext, size, mtime, fkey, exact, astart, alen, srate, bits, chans, dur, seen) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            )
+            .map_err(|e| e.to_string())?;
+        for ((f, hit), info) in batch.iter().zip(fresh.iter()).zip(probed.iter()) {
+            if *hit {
+                touch.execute(params![f.abs, run]).map_err(|e| e.to_string())?;
+                sh.stats.reused.fetch_add(1, Relaxed);
+            } else if let Some(i) = info {
+                put.execute(params![
+                    f.abs, lib, f.rel, f.ext, f.size, f.mtime, i.key, i.exact as i64,
+                    i.audio_start as i64, i.audio_len as i64,
+                    i.sample_rate as i64, i.bits as i64, i.channels as i64, i.duration, run
+                ])
                 .map_err(|e| e.to_string())?;
+            } else {
+                continue; // unlesbar – nicht in den Index aufnehmen
+            }
+            sh.stats.files.fetch_add(1, Relaxed);
+            sh.stats.scanned.fetch_add(1, Relaxed);
         }
     }
     tx.commit().map_err(|e| e.to_string())?;
@@ -282,50 +364,51 @@ fn insert(t: &mut Connection, lib: i64, batch: &mut Vec<(String, String, i64, au
     Ok(())
 }
 
-/// Holt die Navidrome-Eintraege in den Zwischenspeicher – ein sequenzieller Durchlauf
-/// statt einer Pfadsuche pro Datei (auf `media_file.path` gibt es keinen Index).
-fn load_media_files(
-    sh: &Shared,
-    reader: &Connection,
-    schema: &Schema,
-    exts: &HashSet<String>,
-    t: &mut Connection,
-) -> Result<(), String> {
-    let list = exts.iter().map(|e| format!("'{e}'")).collect::<Vec<_>>().join(",");
+/// Holt die Navidrome-Eintraege in den Index – ein sequenzieller Durchlauf
+/// statt einer Pfadsuche pro Datei. Navidrome hat zwar einen Index auf
+/// `media_file.path`, aber ein Durchlauf ist bei Millionen Titeln guenstiger
+/// als ebenso viele Einzelabfragen ueber zwei Datenbanken hinweg.
+fn load_media_files(sh: &Shared, reader: &Connection, schema: &Schema, idx: &mut Connection) -> Result<(), String> {
     let missing = if schema.mf("missing") { "missing=0 AND " } else { "" };
     let sql = format!(
-        "SELECT library_id, path, id, {flags}, title, {album}, {comment}, {tags} \
-         FROM media_file WHERE {missing}lower(suffix) IN ({list})",
+        "SELECT library_id, path, id, {flags}, title, {album}, {artist}, {track}, {disc}, {mbz}, \
+                {brate}, {comment}, {tags} \
+         FROM media_file WHERE {missing}1=1",
         flags = schema.tag_flags_expr(),
         album = schema.expr("album", "''"),
+        artist = schema.expr("artist", "''"),
+        track = schema.expr("track_number", "0"),
+        disc = schema.expr("disc_number", "0"),
+        mbz = schema.expr("mbz_recording_id", "''"),
+        brate = schema.expr("bit_rate", "0"),
         comment = schema.expr("comment", "''"),
         tags = if schema.mf("tags") { "CAST(tags AS TEXT)" } else { "''" },
     );
     let mut st = reader.prepare(&sql).map_err(|e| e.to_string())?;
     let mut rows = st.query([]).map_err(|e| e.to_string())?;
+
+    idx.execute("DELETE FROM nd", []).map_err(|e| e.to_string())?;
     let mut n = 0u64;
-    let mut tx = t.transaction().map_err(|e| e.to_string())?;
+    let mut tx = idx.transaction().map_err(|e| e.to_string())?;
     while let Some(r) = rows.next().map_err(|e| e.to_string())? {
         {
             let mut ins = tx
-                .prepare_cached("INSERT OR REPLACE INTO m (lib, rel, id, flags, title, album, comment, tags) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)")
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO nd (lib, rel, id, flags, title, album, artist, track, disc, mbz, brate, comment, tags) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                )
                 .map_err(|e| e.to_string())?;
+            let s = |i: usize| r.get::<_, Option<String>>(i).ok().flatten().unwrap_or_default();
+            let n64 = |i: usize| r.get::<_, Option<i64>>(i).ok().flatten().unwrap_or(0);
             ins.execute(params![
-                r.get::<_, Option<i64>>(0).unwrap_or_default().unwrap_or(0),
-                r.get::<_, Option<String>>(1).unwrap_or_default().unwrap_or_default(),
-                r.get::<_, Option<String>>(2).unwrap_or_default().unwrap_or_default(),
-                r.get::<_, Option<String>>(3).unwrap_or_default().unwrap_or_default(),
-                r.get::<_, Option<String>>(4).unwrap_or_default().unwrap_or_default(),
-                r.get::<_, Option<String>>(5).unwrap_or_default().unwrap_or_default(),
-                r.get::<_, Option<String>>(6).unwrap_or_default().unwrap_or_default(),
-                r.get::<_, Option<String>>(7).unwrap_or_default().unwrap_or_default(),
+                n64(0), s(1), s(2), s(3), s(4), s(5), s(6), n64(7), n64(8), s(9), n64(10), s(11), s(12)
             ])
             .map_err(|e| e.to_string())?;
         }
         n += 1;
         if n % 50_000 == 0 {
             tx.commit().map_err(|e| e.to_string())?;
-            tx = t.transaction().map_err(|e| e.to_string())?;
+            tx = idx.transaction().map_err(|e| e.to_string())?;
         }
     }
     tx.commit().map_err(|e| e.to_string())?;
@@ -333,14 +416,10 @@ fn load_media_files(
     Ok(())
 }
 
-/// Entscheidet innerhalb einer Fingerprint-Gruppe, was bleibt und was geht.
-fn handle(
-    sh: &Shared,
-    settings: &Settings,
-    key: &str,
-    group: Vec<Cand>,
-    planner: &mut Planner,
-) -> Result<(), String> {
+// ───────────────────────── Entscheidung ─────────────────────────
+
+/// Entscheidet innerhalb einer Fingerabdruck-Gruppe, was bleibt und was geht.
+fn handle(sh: &Shared, settings: &Settings, key: &str, group: Vec<Cand>, planner: &mut Planner) -> Result<(), String> {
     if group.len() < 2 || key.is_empty() {
         return Ok(());
     }
@@ -396,13 +475,7 @@ fn protected(settings: &Settings, c: &Cand) -> bool {
     })
 }
 
-fn decide(
-    sh: &Shared,
-    settings: &Settings,
-    group: Vec<Cand>,
-    exact: bool,
-    planner: &mut Planner,
-) -> Result<(), String> {
+fn decide(sh: &Shared, settings: &Settings, group: Vec<Cand>, exact: bool, planner: &mut Planner) -> Result<(), String> {
     if group.len() < 2 {
         return Ok(());
     }
@@ -455,7 +528,6 @@ fn decide(
                 }
             }
         }
-        // Verliert die behaltene Datei dabei Tags?
         let mut reason = if exact { "inhalt:flac-md5".to_string() } else { "inhalt:bytegleich".to_string() };
         if d.known() && keeper.known() {
             let lost = tags_missing(&d.flags, &keeper.flags);
@@ -468,7 +540,12 @@ fn decide(
                     sh.log(format!("SKIP (Tag-Verlust: {}): {}", names.join(", "), d.abs));
                     continue;
                 }
-                sh.log(format!("TAG-WARNUNG: {} fehlen der behaltenen Datei {} (aus {})", names.join(", "), keeper.abs, d.abs));
+                sh.log(format!(
+                    "TAG-WARNUNG: {} fehlen der behaltenen Datei {} (aus {})",
+                    names.join(", "),
+                    keeper.abs,
+                    d.abs
+                ));
             }
         }
         if !d.known() {
@@ -492,4 +569,10 @@ fn decide(
         }
     }
     Ok(())
+}
+
+/// Nur fuer die Tests: liefert den Pfad des Index.
+#[allow(dead_code)]
+pub fn index_path(env: &Env) -> PathBuf {
+    index::path(env)
 }

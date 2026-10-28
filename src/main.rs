@@ -1,6 +1,7 @@
 mod audio;
 mod content;
 mod engine;
+mod index;
 
 use axum::{
     body::Body,
@@ -237,6 +238,63 @@ async fn backup_now(State(app): State<App>) -> impl IntoResponse {
     }
 }
 
+#[derive(Deserialize)]
+struct IndexQuery {
+    q: Option<String>,
+    only: Option<String>,
+    ext: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+/// Durchsucht die eigene Index-Datenbank. Laeuft auf einer Nur-Lese-Verbindung,
+/// stoert also keinen laufenden Scan.
+async fn index_search(State(app): State<App>, Query(q): Query<IndexQuery>) -> impl IntoResponse {
+    let r = tokio::task::spawn_blocking(move || {
+        let c = engine_index_open(&app)?;
+        index::search(
+            &c,
+            q.q.as_deref().unwrap_or(""),
+            q.only.as_deref().unwrap_or("all"),
+            q.ext.as_deref().unwrap_or(""),
+            q.limit.unwrap_or(50),
+            q.offset.unwrap_or(0),
+        )
+    })
+    .await;
+    match r {
+        Ok(Ok(v)) => (StatusCode::OK, Json(v)),
+        Ok(Err(e)) => (StatusCode::NOT_FOUND, Json(json!({"error": e}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))),
+    }
+}
+
+async fn index_summary(State(app): State<App>) -> impl IntoResponse {
+    let r = tokio::task::spawn_blocking(move || engine_index_open(&app).and_then(|c| index::summary(&c))).await;
+    match r {
+        Ok(Ok(v)) => (StatusCode::OK, Json(v)),
+        Ok(Err(e)) => (StatusCode::NOT_FOUND, Json(json!({"error": e}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))),
+    }
+}
+
+async fn index_reset(State(app): State<App>) -> impl IntoResponse {
+    if app.running.load(Relaxed) {
+        return (StatusCode::CONFLICT, Json(json!({"ok": false, "error": "Waehrend eines Laufs gesperrt"})));
+    }
+    match index::reset(&app.env) {
+        Ok(()) => {
+            app.log("Index verworfen – der naechste Lauf baut ihn neu auf");
+            (StatusCode::OK, Json(json!({"ok": true})))
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"ok": false, "error": e}))),
+    }
+}
+
+fn engine_index_open(app: &App) -> Result<rusqlite::Connection, String> {
+    index::open_ro(&app.env)
+}
+
 async fn healthz() -> String {
     format!("ok navidrome-dedupe {VERSION}")
 }
@@ -310,6 +368,9 @@ async fn main() {
         .route("/api/logs.zip", get(logs_zip))
         .route("/api/history", get(history))
         .route("/api/backup", post(backup_now))
+        .route("/api/index", get(index_search))
+        .route("/api/index/summary", get(index_summary))
+        .route("/api/index/reset", post(index_reset))
         .layer(middleware::from_fn_with_state(app.clone(), auth));
     let router = Router::new()
         .route("/healthz", get(healthz))

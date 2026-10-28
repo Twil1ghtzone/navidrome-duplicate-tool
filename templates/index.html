@@ -142,6 +142,7 @@
     <div><span>Speicher</span><b id="freed">0 B</b></div>
     <div><span>Favoriten/Statistiken übertragen</span><b id="annotations">0</b></div>
     <div><span>Playlists aktualisiert</span><b id="playlists">0</b></div>
+    <div><span>Playlist-Dateien geschrieben</span><b id="m3u">0</b></div>
     <div><span>Tag-Warnungen</span><b id="tags_lost">0</b></div>
     <div><span>geschützt (Instrumental u.&nbsp;ä.)</span><b id="protected">0</b></div>
     <div><span>ausgeschlossene Ordner</span><b id="excluded">0</b></div>
@@ -197,9 +198,40 @@
       <label class="chk"><input type="checkbox" id="verify_bytes"> Treffer ohne FLAC-Prüfsumme vor dem Löschen Byte für Byte vergleichen</label>
       <label class="chk"><input type="checkbox" id="report_unknown"> Dateien auflisten, die Navidrome nicht kennt</label>
       <label class="chk"><input type="checkbox" id="use_trash"> in den Papierkorb verschieben statt löschen (Ordner /trash)</label>
+      <label class="chk"><input type="checkbox" id="rewrite_m3u"> Pfad in eingelesenen Playlist-Dateien (m3u) mitschreiben</label>
+      <label class="chk"><input type="checkbox" id="use_index"> eigenen Index führen (/config/index.db)</label>
+      <label class="chk"><input type="checkbox" id="reuse_index"> unveränderte Dateien nicht erneut einlesen (schnelle Folgeläufe)</label>
+      <label class="chk"><input type="checkbox" id="reuse_plan"> beim Ausführen den Plan des letzten Dry-Runs übernehmen, statt neu zu suchen</label>
     </div>
   </div>
   <p style="margin:12px 0 0"><button onclick="saveCfg(this)">Speichern</button><span class="msg" id="cfgmsg"></span></p>
+</section>
+
+<section>
+  <h2>Index</h2>
+  <div class="line" id="idxsum">noch kein Index – ein Lauf mit Dateiinhalt-Suche legt ihn an</div>
+  <div class="logbar" style="margin-top:10px">
+    <input type="text" class="f" id="idxq" placeholder="Suche in Pfad, Titel, Album, Interpret">
+    <select id="idxonly">
+      <option value="all">alle Dateien</option>
+      <option value="dups">nur Duplikate</option>
+      <option value="exact">nur exakt bestätigt (FLAC-Prüfsumme)</option>
+      <option value="unknown">nur nicht in Navidrome</option>
+      <option value="planned">nur zum Löschen vorgemerkt</option>
+    </select>
+    <select id="idxext"><option value="">alle Formate</option></select>
+    <button onclick="idxPage(-1)">&lt;</button>
+    <span class="hint" id="idxpos">–</span>
+    <button onclick="idxPage(1)">&gt;</button>
+    <button onclick="idxReset(this)">Index verwerfen</button>
+  </div>
+  <div style="overflow:auto">
+    <table id="idxtab">
+      <thead><tr><th>Datei</th><th>Format</th><th>Größe</th><th>Dauer</th><th>Kopien</th><th>Titel / Album</th><th>Status</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <p class="hint" id="idxmsg"></p>
 </section>
 
 <section>
@@ -220,7 +252,7 @@
 "use strict";
 const $ = id => document.getElementById(id);
 const NUMS = ["scanned","files","unknown","candidates","duplicates","same_format","exact","planned",
-              "deleted","annotations","playlists","tags_lost","protected","excluded","mismatch","errors"];
+              "deleted","annotations","playlists","m3u","tags_lost","protected","excluded","mismatch","errors"];
 const MAXLINES = 800;
 let since = 0, running = false, idleTicks = 0, last = {};
 const PAGE_VERSION = "{{VERSION}}";
@@ -329,7 +361,9 @@ async function poll() {
       if (stick) log.scrollTop = log.scrollHeight;
     }
     since = d.next;
-    if (!d.running && idleTicks++ % 6 === 0) loadHistory();
+    if (!d.running && idleTicks++ % 6 === 0) { loadHistory(); idxSummary(); }
+    if (last.run === true && !d.running) { idxSummary(); idxLoad(); }
+    last.run = d.running;
   } catch (e) { $("st").textContent = "Verbindung gestört"; }
   setTimeout(poll, running ? 1000 : 4000);
 }
@@ -359,7 +393,8 @@ async function stopRun() { await press($("stop"), "stoppt …", () => api("/api/
 
 /* Einstellungen */
 const FLAGS = ["dedupe_flac","strip_copy_suffix","skip_on_tag_loss","require_mbz_match","require_same_track",
-               "playlist_keep_duplicates","verify_bytes","report_unknown","use_trash"];
+               "playlist_keep_duplicates","verify_bytes","report_unknown","use_trash",
+               "use_index","reuse_index","reuse_plan","rewrite_m3u"];
 const lines = t => t.split("\n").map(x => x.trim()).filter(Boolean);
 async function loadCfg() {
   const c = await (await api("/api/config")).json();
@@ -390,6 +425,81 @@ async function saveCfg(btn) {
   await press(btn, "speichert …", async () => {
     await api("/api/config", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     $("cfgmsg").textContent = "gespeichert um " + new Date().toLocaleTimeString("de-DE");
+  });
+}
+
+/* Index */
+let idxOffset = 0, idxTotal = 0, idxTimer = 0;
+const IDXLIMIT = 50;
+
+async function idxLoad() {
+  const q = encodeURIComponent($("idxq").value.trim());
+  const only = $("idxonly").value, ext = $("idxext").value;
+  const url = `/api/index?q=${q}&only=${only}&ext=${ext}&limit=${IDXLIMIT}&offset=${idxOffset}`;
+  const tb = $("idxtab").tBodies[0];
+  try {
+    const d = await (await api(url)).json();
+    idxTotal = d.total;
+    tb.replaceChildren();
+    const frag = document.createDocumentFragment();
+    for (const r of d.rows) {
+      const tr = document.createElement("tr");
+      cell(tr, r.path, true);
+      cell(tr, r.ext);
+      cell(tr, bytes(r.size), true);
+      cell(tr, r.duration ? hms(r.duration) : "–", true);
+      cell(tr, r.copies > 1 ? String(r.copies) + (r.exact ? " (exakt)" : "") : "–", true);
+      cell(tr, r.id ? (r.title + (r.album ? " – " + r.album : "")) : "nicht in Navidrome");
+      cell(tr, r.status || "–");
+      frag.appendChild(tr);
+    }
+    tb.appendChild(frag);
+    const from = idxTotal ? idxOffset + 1 : 0;
+    $("idxpos").textContent = from + "–" + Math.min(idxOffset + IDXLIMIT, idxTotal) + " von " + fmt(idxTotal);
+    $("idxmsg").textContent = idxTotal ? "" : "Keine Treffer.";
+  } catch (e) {
+    tb.replaceChildren();
+    $("idxpos").textContent = "–";
+    $("idxmsg").textContent = e.message;
+  }
+}
+function idxPage(dir) {
+  const next = idxOffset + dir * IDXLIMIT;
+  if (next < 0 || next >= idxTotal) return;
+  idxOffset = next; idxLoad();
+}
+function idxSearch() { idxOffset = 0; clearTimeout(idxTimer); idxTimer = setTimeout(idxLoad, 300); }
+$("idxq").addEventListener("input", idxSearch);
+$("idxonly").addEventListener("change", idxSearch);
+$("idxext").addEventListener("change", idxSearch);
+
+async function idxSummary() {
+  try {
+    const d = await (await api("/api/index/summary")).json();
+    const parts = [fmt(d.files) + " Dateien", bytes(d.bytes),
+                   fmt(d.duplicates) + " überzählige Kopien",
+                   fmt(d.exact) + " exakt bestätigt",
+                   fmt(d.unknown) + " nicht in Navidrome"];
+    if (d.planned) parts.push(fmt(d.planned) + " vorgemerkt");
+    if (d.removed) parts.push(fmt(d.removed) + " entfernt");
+    if (d.last_run) parts.push("letzter Lauf " + d.last_run.started + " (" + d.last_run.mode + ")");
+    if (d.reusable) parts.push("übernehmbarer Plan vom " + d.reusable.started + " mit " + fmt(d.reusable.rows) + " Einträgen");
+    $("idxsum").textContent = parts.join(" · ");
+    const sel = $("idxext"), cur = sel.value;
+    sel.replaceChildren();
+    const all = document.createElement("option"); all.value = ""; all.textContent = "alle Formate"; sel.appendChild(all);
+    for (const e of d.exts) {
+      const o = document.createElement("option"); o.value = e.ext;
+      o.textContent = e.ext + " (" + fmt(e.n) + ")"; sel.appendChild(o);
+    }
+    sel.value = cur;
+  } catch (e) { $("idxsum").textContent = e.message; }
+}
+async function idxReset(btn) {
+  if (!confirm("Index verwerfen? Der nächste Lauf muss dann wieder jede Datei einlesen.")) return;
+  await press(btn, "verwirft …", async () => {
+    await api("/api/index/reset", { method: "POST" });
+    idxOffset = 0; await idxSummary(); await idxLoad();
   });
 }
 
@@ -425,7 +535,7 @@ async function backupNow(btn) {
 }
 
 if ({{MODE_EXECUTE}}) document.querySelector("input[value=exec]").checked = true;
-loadCfg(); loadHistory(); poll();
+loadCfg(); loadHistory(); idxSummary(); idxLoad(); poll();
 </script>
 </body>
 </html>

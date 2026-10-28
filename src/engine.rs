@@ -44,6 +44,8 @@ pub struct Env {
     pub keep_exts: Vec<String>,
     pub delete_exts: Vec<String>,
     pub same_exts: Vec<String>,
+    /// Alle Formate, die der Bibliotheks-Scan indexiert (Inhaltssuche gilt fuer alle davon)
+    pub audio_exts: Vec<String>,
     pub duration_tol: f64,
     pub batch_size: usize,
     pub backup_keep: usize,
@@ -63,7 +65,7 @@ fn list(k: &str, d: &str) -> Vec<String> {
     var(k, d)
         .split(',')
         .map(|s| s.trim().trim_start_matches('.').to_lowercase())
-        .filter(|s| !s.is_empty() && s != "none" && s.chars().all(|c| c.is_ascii_alphanumeric()))
+        .filter(|s| !s.is_empty() && s != "none" && (s == "*" || s.chars().all(|c| c.is_ascii_alphanumeric())))
         .collect()
 }
 
@@ -111,7 +113,12 @@ impl Env {
             path_map,
             keep_exts: list("KEEP_EXTS", "flac"),
             delete_exts: list("DELETE_EXTS", "mp3"),
-            same_exts: list("DEDUPE_SAME_EXTS", "flac"),
+            // "*" = jedes Format, das auch sonst betrachtet wird (FLAC/FLAC, MP3/MP3, ...)
+            same_exts: list("DEDUPE_SAME_EXTS", "*"),
+            audio_exts: list(
+                "AUDIO_EXTS",
+                "flac,mp3,m4a,m4b,aac,alac,ogg,oga,opus,wma,wav,aiff,aif,ape,wv,mpc,dsf,dff",
+            ),
             duration_tol: var("DURATION_TOLERANCE", "3").parse().unwrap_or(3.0),
             batch_size: var("BATCH_SIZE", "200").parse().unwrap_or(200).max(1),
             backup_keep: var("BACKUP_KEEP", "3").parse().unwrap_or(3),
@@ -159,6 +166,17 @@ pub struct Settings {
     pub report_unknown: bool,
     /// Geloeschte Dateien in den Papierkorb verschieben statt entfernen.
     pub use_trash: bool,
+    /// Eigene Index-Datenbank fuehren (/config/index.db).
+    pub use_index: bool,
+    /// Unveraenderte Dateien nicht erneut untersuchen, sondern aus dem Index nehmen.
+    pub reuse_index: bool,
+    /// In Playlist-Dateien (m3u), die Navidrome einliest, den Pfad mitschreiben.
+    /// Sonst baut Navidrome die Playlist beim naechsten Scan aus der Datei neu auf
+    /// und der Eintrag faellt heraus, weil die alte Datei nicht mehr existiert.
+    pub rewrite_m3u: bool,
+    /// Echter Lauf uebernimmt den Plan des letzten vollstaendigen Dry-Runs,
+    /// statt die Bibliothek noch einmal zu durchsuchen.
+    pub reuse_plan: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -178,6 +196,10 @@ impl Default for Settings {
             verify_bytes: true,
             report_unknown: true,
             use_trash: false,
+            use_index: true,
+            reuse_index: true,
+            reuse_plan: false,
+            rewrite_m3u: true,
         }
     }
 }
@@ -193,6 +215,7 @@ pub struct Stats {
     pub same_format: AtomicU64,
     pub planned: AtomicU64,
     pub files: AtomicU64,
+    pub reused: AtomicU64,
     pub unknown: AtomicU64,
     pub exact: AtomicU64,
     pub tags_lost: AtomicU64,
@@ -203,6 +226,7 @@ pub struct Stats {
     pub bytes_freed: AtomicU64,
     pub annotations: AtomicU64,
     pub playlists: AtomicU64,
+    pub m3u: AtomicU64,
     pub errors: AtomicU64,
 }
 
@@ -267,13 +291,14 @@ impl Shared {
             "total": st.total.load(Relaxed), "scanned": st.scanned.load(Relaxed),
             "candidates": st.candidates.load(Relaxed), "duplicates": st.duplicates.load(Relaxed),
             "same_format": st.same_format.load(Relaxed), "planned": st.planned.load(Relaxed),
-            "files": st.files.load(Relaxed), "unknown": st.unknown.load(Relaxed),
+            "files": st.files.load(Relaxed), "reused": st.reused.load(Relaxed),
+            "unknown": st.unknown.load(Relaxed),
             "exact": st.exact.load(Relaxed),
             "tags_lost": st.tags_lost.load(Relaxed),
             "protected": st.protected.load(Relaxed), "excluded": st.excluded.load(Relaxed),
             "mismatch": st.mismatch.load(Relaxed), "deleted": st.deleted.load(Relaxed),
             "bytes_freed": st.bytes_freed.load(Relaxed), "annotations": st.annotations.load(Relaxed),
-            "playlists": st.playlists.load(Relaxed),
+            "playlists": st.playlists.load(Relaxed), "m3u": st.m3u.load(Relaxed),
             "errors": st.errors.load(Relaxed)
         })
     }
@@ -283,9 +308,9 @@ impl Shared {
     fn reset_stats(&self) {
         let s = &self.stats;
         for a in [&s.total, &s.scanned, &s.candidates, &s.duplicates, &s.same_format, &s.planned,
-                  &s.files, &s.unknown, &s.exact,
+                  &s.files, &s.reused, &s.unknown, &s.exact,
                   &s.tags_lost, &s.protected, &s.excluded, &s.mismatch, &s.deleted, &s.bytes_freed,
-                  &s.annotations, &s.playlists, &s.errors] {
+                  &s.annotations, &s.playlists, &s.m3u, &s.errors] {
             a.store(0, Relaxed);
         }
     }
@@ -307,6 +332,7 @@ fn load_settings(env: &Env) -> Settings {
         let mut s = Settings::default();
         s.duration_tol = env.duration_tol;
         s.dedupe_flac = !env.same_exts.is_empty();
+        s.mode = "both".into();
         s
     })
 }
@@ -327,29 +353,40 @@ pub fn cols(c: &Connection, table: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Wie wird geprueft, ob ein Tag-Feld gefuellt ist?
+#[derive(PartialEq, Clone, Copy)]
+pub enum Kind {
+    /// Text: alles ausser der leeren Zeichenkette zaehlt
+    Text,
+    /// Zahl: alles ausser 0 zaehlt
+    Num,
+    /// JSON: Navidrome legt leere Felder als '[]' oder '{}' an – die zaehlen nicht
+    Json,
+}
+
 /// Tag-Felder, deren Vorhandensein pro Datei als Flag abgefragt wird.
-/// (Flag, Spalte, Anzeigename, numerisch)
-const TAG_FIELDS: &[(char, &str, &str, bool)] = &[
-    ('A', "album_artist", "Album-Interpret", false),
-    ('r', "artist", "Interpret", false),
-    ('b', "album", "Album", false),
-    ('t', "title", "Titel", false),
-    ('n', "track_number", "Tracknummer", true),
-    ('d', "disc_number", "Disc-Nummer", true),
-    ('y', "year", "Jahr", true),
-    ('D', "date", "Datum", false),
-    ('g', "genre", "Genre", false),
-    ('c', "comment", "Kommentar", false),
-    ('l', "lyrics", "Liedtext", false),
-    ('m', "mbz_recording_id", "MusicBrainz-Recording", false),
-    ('M', "mbz_album_id", "MusicBrainz-Album", false),
-    ('k', "catalog_num", "Katalognummer", false),
-    ('p', "bpm", "BPM", true),
-    ('v', "has_cover_art", "Cover", true),
-    ('s', "sort_title", "Sortiertitel", false),
-    ('x', "explicit_status", "Explicit-Kennzeichen", false),
-    ('R', "rg_track_gain", "ReplayGain", true),
-    ('T', "tags", "weitere Tags", false),
+/// (Flag, Spalte, Anzeigename, Art)
+const TAG_FIELDS: &[(char, &str, &str, Kind)] = &[
+    ('A', "album_artist", "Album-Interpret", Kind::Text),
+    ('r', "artist", "Interpret", Kind::Text),
+    ('b', "album", "Album", Kind::Text),
+    ('t', "title", "Titel", Kind::Text),
+    ('n', "track_number", "Tracknummer", Kind::Num),
+    ('d', "disc_number", "Disc-Nummer", Kind::Num),
+    ('y', "year", "Jahr", Kind::Num),
+    ('D', "date", "Datum", Kind::Text),
+    ('g', "genre", "Genre", Kind::Text),
+    ('c', "comment", "Kommentar", Kind::Text),
+    ('l', "lyrics", "Liedtext", Kind::Json),
+    ('m', "mbz_recording_id", "MusicBrainz-Recording", Kind::Text),
+    ('M', "mbz_album_id", "MusicBrainz-Album", Kind::Text),
+    ('k', "catalog_num", "Katalognummer", Kind::Text),
+    ('p', "bpm", "BPM", Kind::Num),
+    ('v', "has_cover_art", "Cover", Kind::Num),
+    ('s', "sort_title", "Sortiertitel", Kind::Text),
+    ('x', "explicit_status", "Explicit-Kennzeichen", Kind::Text),
+    ('R', "rg_track_gain", "ReplayGain", Kind::Num),
+    ('T', "tags", "weitere Tags", Kind::Json),
 ];
 
 pub fn tag_label(flag: char) -> &'static str {
@@ -409,14 +446,13 @@ impl Schema {
         let parts: Vec<String> = TAG_FIELDS
             .iter()
             .filter(|(_, col, _, _)| self.mf(col))
-            .map(|(flag, col, _, numeric)| {
-                if *numeric {
-                    format!("CASE WHEN COALESCE({col},0)<>0 THEN '{flag}' ELSE '-' END")
-                } else if *col == "tags" {
-                    format!("CASE WHEN COALESCE({col},'') NOT IN ('','{{}}') THEN '{flag}' ELSE '-' END")
-                } else {
-                    format!("CASE WHEN COALESCE({col},'')<>'' THEN '{flag}' ELSE '-' END")
+            .map(|(flag, col, _, kind)| match kind {
+                Kind::Num => format!("CASE WHEN COALESCE({col},0)<>0 THEN '{flag}' ELSE '-' END"),
+                // Navidrome speichert leere JSON-Felder als '[]' bzw. '{{}}' – kein Inhalt
+                Kind::Json => {
+                    format!("CASE WHEN COALESCE({col},'') NOT IN ('','{{}}','[]','null') THEN '{flag}' ELSE '-' END")
                 }
+                Kind::Text => format!("CASE WHEN COALESCE({col},'')<>'' THEN '{flag}' ELSE '-' END"),
             })
             .collect();
         if parts.is_empty() { "''".to_string() } else { parts.join(" || ") }
@@ -536,13 +572,21 @@ pub struct Planner {
     plan: BufWriter<fs::File>,
     pub planned: u64,
     doomed: HashSet<String>,
+    /// eigene Verbindung zum Index, damit der laufende Scan nicht blockiert wird
+    idx: Option<(Connection, i64)>,
 }
 
 impl Planner {
     pub fn new(file: fs::File) -> Result<Planner, String> {
         let mut plan = BufWriter::new(file);
         writeln!(plan, "#keeper_id\tkeeper_path\tdel_id\tdel_path\tdel_size\treason").map_err(|e| e.to_string())?;
-        Ok(Planner { plan, planned: 0, doomed: HashSet::new() })
+        Ok(Planner { plan, planned: 0, doomed: HashSet::new(), idx: None })
+    }
+
+    /// Haelt jede geplante Loeschung zusaetzlich im Index fest.
+    pub fn with_index(mut self, c: Connection, run: i64) -> Planner {
+        self.idx = Some((c, run));
+        self
     }
 
     /// Merkt eine Loeschung vor. Gibt false zurueck, wenn sie verworfen wurde.
@@ -574,6 +618,9 @@ impl Planner {
             esc(keeper_id), esc(keeper_path), esc(del_id), esc(del_path), size.max(0), esc(reason)
         )
         .map_err(|e| format!("Plan-Datei schreiben: {e}"))?;
+        if let Some((c, run)) = &self.idx {
+            crate::index::add_plan(c, *run, keeper_id, keeper_path, del_id, del_path, size.max(0), reason)?;
+        }
         self.doomed.insert(del_path.to_string());
         self.planned += 1;
         sh.stats.planned.fetch_add(1, Relaxed);
@@ -802,7 +849,19 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
     if env.keep_exts.is_empty() {
         return Err("KEEP_EXTS ist leer – ohne zu behaltendes Format kann nichts entschieden werden".into());
     }
-    let same_exts: Vec<String> = if settings.dedupe_flac { env.same_exts.clone() } else { vec![] };
+    // Gleiche Formate bereinigen heisst: doppelte FLACs, doppelte MP3s, doppelte M4As ...
+    let same_exts: Vec<String> = if settings.dedupe_flac {
+        if env.same_exts.iter().any(|e| e == "*") {
+            let mut v: Vec<String> = env.keep_exts.iter().chain(env.delete_exts.iter()).cloned().collect();
+            v.sort();
+            v.dedup();
+            v
+        } else {
+            env.same_exts.clone()
+        }
+    } else {
+        vec![]
+    };
     if env.delete_exts.is_empty() && same_exts.is_empty() {
         return Err("Weder DELETE_EXTS noch die Bereinigung gleicher Formate ist aktiv – es gaebe nichts zu loeschen".into());
     }
@@ -820,7 +879,39 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
         _ => (true, true),
     };
 
-    let planned = {
+    let mut idx = if settings.use_index { Some(crate::index::open(env)?) } else { None };
+    let run_id = match &idx {
+        Some(c) => crate::index::start_run(c, &mode, execute)?,
+        None => 0,
+    };
+    // Der echte Lauf darf den Plan des letzten vollstaendigen Dry-Runs uebernehmen.
+    let mut plan_run = run_id;
+    let mut reused_plan = false;
+    if execute && settings.reuse_plan {
+        if let Some(c) = &idx {
+            if let Some((old, started, n)) = crate::index::reusable_plan(c) {
+                sh.log(format!("Uebernehme den Plan des Dry-Runs vom {started} ({n} Eintraege) – es wird nicht neu gesucht"));
+                let rows = crate::index::plan_rows(c, old)?;
+                let mut planner = Planner::new(fs::File::create(&plan_path).map_err(|e| format!("Plan-Datei: {e}"))?)?;
+                for (ki, kp, di, dp, size, reason) in rows {
+                    if !Path::new(&dp).is_file() {
+                        sh.log(format!("SKIP (nicht mehr vorhanden): {dp}"));
+                        continue;
+                    }
+                    planner.add(sh, &ki, &kp, &di, &dp, size, &reason)?;
+                }
+                planner.flush()?;
+                plan_run = old;
+                reused_plan = true;
+            } else {
+                sh.log("Kein uebernehmbarer Dry-Run-Plan im Index – es wird normal gesucht");
+            }
+        }
+    }
+
+    let planned = if reused_plan {
+        sh.stats.planned.load(Relaxed)
+    } else {
         let reader = open(env, true)?;
         let schema = Schema::load(&reader)?;
         let libs = libraries(sh, &reader)?;
@@ -843,10 +934,32 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
         let phases = do_content as u64 + do_db as u64;
         sh.stats.total.store(media_count * phases.max(1), Relaxed);
         sh.log(format!("{media_count} relevante Titel in Navidrome"));
+        if settings.rewrite_m3u {
+            check_m3u(sh, &reader, &schema);
+        }
         sh.log(format!("Report/Plan: {}", plan_path.display()));
-        let mut planner = Planner::new(fs::File::create(&plan_path).map_err(|e| format!("Plan-Datei: {e}"))?)?;
+        let planner = Planner::new(fs::File::create(&plan_path).map_err(|e| format!("Plan-Datei: {e}"))?);
+        let mut planner = match (planner, &idx) {
+            (Ok(p), Some(_)) => p.with_index(crate::index::open(env)?, run_id),
+            (Ok(p), None) => p,
+            (Err(e), _) => return Err(e),
+        };
         if do_content && !sh.scan_done() {
-            crate::content::scan(sh, env, &reader, &schema, &settings, &libs, &same_exts, &mut planner)?;
+            match idx.as_mut() {
+                Some(c) => crate::content::scan(sh, env, &reader, &schema, &settings, &libs, c, run_id, &mut planner)?,
+                None => {
+                    // ohne Index arbeitet der Bibliotheks-Scan auf einer Wegwerf-Datenbank
+                    let tmp = env.config_dir.join("scan-tmp.db");
+                    let _ = fs::remove_file(&tmp);
+                    let mut c = crate::index::open_at(&tmp)?;
+                    let r = crate::content::scan(sh, env, &reader, &schema, &settings, &libs, &mut c, run_id, &mut planner);
+                    drop(c);
+                    for suffix in ["", "-wal", "-shm"] {
+                        let _ = fs::remove_file(format!("{}{suffix}", tmp.display()));
+                    }
+                    r?
+                }
+            }
         }
         if do_db && !sh.scan_done() {
             scan(sh, &reader, &schema, &settings, &libs, &same_exts, &mut planner)?;
@@ -855,6 +968,9 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
         planner.planned
     }; // Reader hier geschlossen: ab jetzt blockiert keine Lese-Transaktion den WAL-Checkpoint
 
+    if let Some(c) = &idx {
+        crate::index::end_run(c, run_id, sh.stats.files.load(Relaxed), planned, !sh.scan_done());
+    }
     sh.log(format!("Plan fertig: {planned} Loeschungen vorgemerkt"));
     if !execute {
         return Ok(());
@@ -883,7 +999,55 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
         None
     };
     let applied = rdir.join(format!("{ts}-execute-applied.tsv"));
-    apply(sh, &mut w, &schema, &settings, trash.as_deref(), &plan_path, &applied)
+    apply(sh, &mut w, &schema, &settings, trash.as_deref(), idx.as_ref().map(|c| (c, plan_run)), &plan_path, &applied)
+}
+
+/// Meldet vor dem Lauf, welche eingelesenen Playlist-Dateien angefasst werden
+/// muessten und ob das ueberhaupt geht. Das laeuft auch im Dry-Run – man soll
+/// nicht erst beim echten Loeschen merken, dass eine m3u schreibgeschuetzt ist.
+fn check_m3u(sh: &Shared, reader: &Connection, schema: &Schema) {
+    if !schema.table("playlist") || !schema.playlist.contains("path") {
+        return;
+    }
+    let sync = if schema.playlist.contains("sync") { "COALESCE(sync,0)=1 AND " } else { "" };
+    let sql = format!("SELECT name, path FROM playlist WHERE {sync}COALESCE(path,'') <> ''");
+    let mut st = match reader.prepare(&sql) {
+        Ok(x) => x,
+        Err(_) => return,
+    };
+    let rows = match st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) {
+        Ok(x) => x,
+        Err(_) => return,
+    };
+    let (mut gesamt, mut fehlt, mut schreibgeschuetzt) = (0u32, 0u32, 0u32);
+    for (name, path) in rows.flatten() {
+        gesamt += 1;
+        let p = map_root(&sh.env, &path);
+        let f = Path::new(&p);
+        if !f.is_file() {
+            fehlt += 1;
+            sh.log(format!("PLAYLIST-WARNUNG: Datei zu '{name}' nicht gefunden: {p}"));
+            continue;
+        }
+        // Zum Anhaengen oeffnen aendert nichts, zeigt aber zuverlaessig,
+        // ob wir schreiben duerfen (Rechte, ACLs, read-only gemountet).
+        if fs::OpenOptions::new().append(true).open(f).is_err() {
+            schreibgeschuetzt += 1;
+            sh.log(format!("PLAYLIST-WARNUNG: '{name}' ist nicht schreibbar: {p}"));
+        }
+    }
+    if gesamt == 0 {
+        return;
+    }
+    if fehlt == 0 && schreibgeschuetzt == 0 {
+        sh.log(format!("{gesamt} eingelesene Playlist-Datei(en) gefunden und beschreibbar"));
+    } else {
+        sh.log(format!(
+            "ACHTUNG: von {gesamt} eingelesenen Playlist-Dateien fehlen {fehlt} und sind {schreibgeschuetzt} \
+             schreibgeschuetzt. Navidrome baut diese Playlists beim naechsten Scan aus der Datei neu auf – \
+             dort entfernte Titel fallen dann heraus."
+        ));
+    }
 }
 
 /// Zahl der Titel, die ueberhaupt in Frage kommen – dient als Massstab fuer den Fortschritt.
@@ -1286,6 +1450,7 @@ fn apply(
     schema: &Schema,
     settings: &Settings,
     trash: Option<&Path>,
+    idx: Option<(&Connection, i64)>,
     plan_path: &Path,
     applied_path: &Path,
 ) -> Result<(), String> {
@@ -1319,11 +1484,11 @@ fn apply(
             reason: unesc(p[5]),
         });
         if batch.len() >= sh.env.batch_size {
-            flush(sh, w, schema, settings, trash, std::mem::take(&mut batch), applied.as_mut())?;
+            flush(sh, w, schema, settings, trash, idx, std::mem::take(&mut batch), applied.as_mut())?;
         }
     }
     if !batch.is_empty() {
-        flush(sh, w, schema, settings, trash, batch, applied.as_mut())?;
+        flush(sh, w, schema, settings, trash, idx, batch, applied.as_mut())?;
     }
     if let Some(a) = applied.as_mut() {
         let _ = a.flush();
@@ -1367,22 +1532,32 @@ fn flush(
     schema: &Schema,
     settings: &Settings,
     trash: Option<&Path>,
+    idx: Option<(&Connection, i64)>,
     batch: Vec<PlanRow>,
     applied: Option<&mut BufWriter<fs::File>>,
 ) -> Result<(), String> {
-    match commit_batch(sh, w, schema, settings, &batch) {
+    let mut m3u: Vec<M3uFix> = vec![];
+    match commit_batch(sh, w, schema, settings, &batch, &mut m3u) {
         Ok(()) => {
-            remove_files(sh, trash, &batch, applied);
+            rewrite_m3u(sh, &m3u);
+            remove_files(sh, trash, idx, &batch, applied);
             Ok(())
         }
         Err(e) => {
             sh.log(format!("Block zurueckgerollt ({e}) – Eintraege werden einzeln geprueft"));
             for one in batch {
                 let single = vec![one.clone()];
-                match commit_batch(sh, w, schema, settings, &single) {
-                    Ok(()) => remove_files(sh, trash, &single, None),
+                let mut m1: Vec<M3uFix> = vec![];
+                match commit_batch(sh, w, schema, settings, &single, &mut m1) {
+                    Ok(()) => {
+                        rewrite_m3u(sh, &m1);
+                        remove_files(sh, trash, idx, &single, None)
+                    }
                     Err(e) => {
                         sh.stats.errors.fetch_add(1, Relaxed);
+                        if let Some((c, run)) = idx {
+                            crate::index::set_status(c, run, &one.del_path, "fehler");
+                        }
                         sh.log(format!("FEHLER (uebersprungen, nichts geloescht) {}: {e}", one.del_path));
                     }
                 }
@@ -1392,28 +1567,235 @@ fn flush(
     }
 }
 
+/// Eine Playlist-Datei, in der ein Pfad ersetzt werden muss.
+pub struct M3uFix {
+    pub file: String,
+    pub del: String,
+    pub keeper: String,
+}
+
 fn commit_batch(
     sh: &Shared,
     w: &mut Connection,
     schema: &Schema,
     settings: &Settings,
     batch: &[PlanRow],
+    m3u: &mut Vec<M3uFix>,
 ) -> Result<(), String> {
     let mut moved = 0u64;
     let mut playlists: HashSet<String> = HashSet::new();
     let tx = w.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+
+    for p in batch {
+        // Muss VOR dem Umhaengen passieren – danach steht die alte ID nirgends mehr.
+        if settings.rewrite_m3u {
+            collect_m3u(&tx, schema, sh, p, m3u)?;
+        }
+        note_playlists(&tx, schema, &p.del_id, &mut playlists)?;
+    }
+    // Zustand vor der Aenderung festhalten. Nur wenn Doppelte erhalten bleiben
+    // sollen, darf eine Playlist hinterher nicht kuerzer sein – beim bewussten
+    // Zusammenfassen ist das Kuerzerwerden ja gerade gewollt.
+    let before = if settings.playlist_keep_duplicates {
+        playlist_lengths(&tx, schema, &playlists)?
+    } else {
+        HashMap::new()
+    };
+
     for p in batch {
         moved += transfer(&tx, schema, settings, &p.keeper_id, &p.del_id, &mut playlists, sh.env.delete_rows)
             .map_err(|e| format!("{}: {e}", p.del_path))?;
     }
     refresh_playlists(&tx, schema, &playlists).map_err(|e| format!("Playlist-Zaehler: {e}"))?;
+
+    // Sicherheitsgurt: war eine Playlist vorher laenger, wird der Block verworfen.
+    let after = playlist_lengths(&tx, schema, &playlists)?;
+    for (id, n) in &before {
+        let now = after.get(id).copied().unwrap_or(0);
+        if now < *n {
+            return Err(format!(
+                "Playlist {id} haette von {n} auf {now} Eintraege verloren – Block zurueckgerollt, nichts geloescht"
+            ));
+        }
+    }
+
     tx.commit().map_err(|e| format!("Commit fehlgeschlagen: {e}"))?;
     sh.stats.annotations.fetch_add(moved, Relaxed);
     sh.stats.playlists.fetch_add(playlists.len() as u64, Relaxed);
     Ok(())
 }
 
-fn remove_files(sh: &Shared, trash: Option<&Path>, batch: &[PlanRow], mut applied: Option<&mut BufWriter<fs::File>>) {
+/// Playlists, in denen diese Datei vorkommt, fuer die Laengenpruefung vormerken.
+fn note_playlists(
+    tx: &rusqlite::Transaction,
+    schema: &Schema,
+    del_id: &str,
+    out: &mut HashSet<String>,
+) -> Result<(), String> {
+    if !schema.table("playlist_tracks") || del_id.is_empty() {
+        return Ok(());
+    }
+    let mut st = tx
+        .prepare_cached("SELECT DISTINCT playlist_id FROM playlist_tracks WHERE media_file_id=?1")
+        .map_err(|e| e.to_string())?;
+    let it = st.query_map(params![del_id], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?;
+    for p in it.flatten() {
+        out.insert(p);
+    }
+    Ok(())
+}
+
+/// Wie viele aufloesbare Eintraege hat jede dieser Playlists gerade?
+fn playlist_lengths(
+    tx: &rusqlite::Transaction,
+    schema: &Schema,
+    ids: &HashSet<String>,
+) -> Result<HashMap<String, i64>, String> {
+    let mut out = HashMap::new();
+    if ids.is_empty() || !schema.table("playlist_tracks") {
+        return Ok(out);
+    }
+    let mut st = tx
+        .prepare_cached(
+            "SELECT count(*) FROM playlist_tracks t JOIN media_file m ON m.id = t.media_file_id WHERE t.playlist_id=?1",
+        )
+        .map_err(|e| e.to_string())?;
+    for id in ids {
+        let n: i64 = st.query_row(params![id], |r| r.get(0)).map_err(|e| e.to_string())?;
+        out.insert(id.clone(), n);
+    }
+    Ok(out)
+}
+
+/// Sucht die von Navidrome eingelesenen Playlist-Dateien, in denen diese Datei steht.
+fn collect_m3u(
+    tx: &rusqlite::Transaction,
+    schema: &Schema,
+    sh: &Shared,
+    p: &PlanRow,
+    out: &mut Vec<M3uFix>,
+) -> Result<(), String> {
+    if !schema.table("playlist") || !schema.table("playlist_tracks") || p.del_id.is_empty() {
+        return Ok(());
+    }
+    if !schema.playlist.contains("path") {
+        return Ok(());
+    }
+    let sync = if schema.playlist.contains("sync") { "COALESCE(pl.sync,0)=1 AND " } else { "" };
+    let sql = format!(
+        "SELECT DISTINCT pl.path FROM playlist pl JOIN playlist_tracks t ON t.playlist_id = pl.id \
+         WHERE t.media_file_id = ?1 AND {sync}COALESCE(pl.path,'') <> ''"
+    );
+    let mut st = tx.prepare_cached(&sql).map_err(|e| e.to_string())?;
+    let it = st.query_map(params![p.del_id], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?;
+    for f in it.flatten() {
+        let mapped = map_root(&sh.env, &f);
+        out.push(M3uFix { file: mapped, del: p.del_path.clone(), keeper: p.keeper_path.clone() });
+    }
+    Ok(())
+}
+
+/// Zeigen zwei Pfade auf dieselbe Datei? Zuerst der billige Textvergleich,
+/// danach – nur wenn noetig – der echte, der Symlinks und `..` aufloest.
+fn same_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Schreibt den neuen Pfad in die Playlist-Datei. Zeilen, die nicht passen,
+/// bleiben unveraendert; geschrieben wird ueber eine Nachbardatei und `rename`,
+/// damit die Playlist nie halbfertig auf der Platte liegt.
+fn rewrite_m3u(sh: &Shared, fixes: &[M3uFix]) {
+    let mut by_file: HashMap<&str, Vec<&M3uFix>> = HashMap::new();
+    for f in fixes {
+        by_file.entry(f.file.as_str()).or_default().push(f);
+    }
+    for (file, list) in by_file {
+        let path = Path::new(file);
+        let raw = match fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                sh.stats.errors.fetch_add(1, Relaxed);
+                sh.log(format!("FEHLER: Playlist-Datei {file} nicht lesbar: {e}"));
+                continue;
+            }
+        };
+        // .m3u8 ist per Definition UTF-8; eine alte .m3u kann eine andere Kodierung
+        // haben. Dann lieber gar nichts anfassen als die Datei zu zerschiessen.
+        let text = match String::from_utf8(raw) {
+            Ok(t) => t,
+            Err(_) => {
+                sh.stats.errors.fetch_add(1, Relaxed);
+                sh.log(format!(
+                    "FEHLER: Playlist-Datei {file} ist nicht UTF-8 kodiert – sie wird nicht veraendert. \
+                     Bitte den Pfad dort von Hand anpassen oder die Datei als UTF-8 speichern."
+                ));
+                continue;
+            }
+        };
+        let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let mut changed = 0usize;
+        let mut out = String::with_capacity(text.len());
+        for line in text.lines() {
+            let t = line.trim();
+            let mut replaced: Option<String> = None;
+            if !t.is_empty() && !t.starts_with('#') {
+                // m3u darf absolute wie relative Pfade enthalten
+                let abs = if Path::new(t).is_absolute() { PathBuf::from(t) } else { dir.join(t) };
+                for f in &list {
+                    if same_file(&abs, Path::new(&f.del)) {
+                        let keeper = Path::new(&f.keeper);
+                        let rel = keeper.strip_prefix(&dir).ok();
+                        replaced = Some(match (Path::new(t).is_absolute(), rel) {
+                            (false, Some(r)) => r.to_string_lossy().to_string(),
+                            _ => f.keeper.clone(),
+                        });
+                        break;
+                    }
+                }
+            }
+            match replaced {
+                Some(neu) => {
+                    out.push_str(&neu);
+                    changed += 1;
+                }
+                None => out.push_str(line),
+            }
+            out.push('\n');
+        }
+        if changed == 0 {
+            continue;
+        }
+        let tmp = path.with_extension("ndtmp");
+        let ok = fs::write(&tmp, out.as_bytes()).and_then(|()| fs::rename(&tmp, path));
+        match ok {
+            Ok(()) => {
+                sh.stats.m3u.fetch_add(1, Relaxed);
+                sh.log(format!("PLAYLIST-DATEI aktualisiert ({changed} Zeile(n)): {file}"));
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                sh.stats.errors.fetch_add(1, Relaxed);
+                sh.log(format!(
+                    "FEHLER: Playlist-Datei {file} nicht schreibbar: {e} – Navidrome baut sie beim naechsten Scan aus der alten Datei neu auf"
+                ));
+            }
+        }
+    }
+}
+
+fn remove_files(
+    sh: &Shared,
+    trash: Option<&Path>,
+    idx: Option<(&Connection, i64)>,
+    batch: &[PlanRow],
+    mut applied: Option<&mut BufWriter<fs::File>>,
+) {
     for p in batch {
         let dpath = Path::new(&p.del_path);
         let kpath = Path::new(&p.keeper_path);
@@ -1452,6 +1834,18 @@ fn remove_files(sh: &Shared, trash: Option<&Path>, batch: &[PlanRow], mut applie
         if status == "GELOESCHT" || status == "VERSCHOBEN" {
             sh.stats.deleted.fetch_add(1, Relaxed);
             sh.stats.bytes_freed.fetch_add(p.size.max(0) as u64, Relaxed);
+        }
+        if let Some((c, run)) = idx {
+            crate::index::set_status(
+                c,
+                run,
+                &p.del_path,
+                match status {
+                    "GELOESCHT" => "geloescht",
+                    "VERSCHOBEN" => "verschoben",
+                    _ => "fehlte-schon",
+                },
+            );
         }
         sh.log(format!("{status} {} (behalten: {})", p.del_path, p.keeper_path));
         if let Some(a) = applied.as_mut() {
@@ -1686,38 +2080,195 @@ mod tests {
         p
     }
 
+    /// Aus dem Schema-Dump einer echten Navidrome-Installation uebernommen:
+    /// dieselben Spalten, dieselben Fremdschluessel und vor allem die FTS5-Trigger,
+    /// die bei jedem INSERT, UPDATE und DELETE auf `media_file` mitlaufen.
     const SCHEMA: &str = r#"
-    CREATE TABLE library (id integer primary key, path varchar not null);
+    CREATE TABLE user (
+        id varchar(255) not null primary key,
+        user_name varchar(255) default '' not null unique,
+        name varchar(255) collate NOCASE default '' not null,
+        email varchar(255) default '' not null,
+        password varchar(255) default '' not null,
+        is_admin bool default FALSE not null,
+        created_at datetime not null, updated_at datetime not null);
+    CREATE TABLE library (
+        id integer primary key autoincrement,
+        name text not null unique,
+        path text not null unique,
+        remote_path text null default '',
+        total_songs integer default 0 not null,
+        total_size integer default 0 not null);
     CREATE TABLE media_file (
-        id varchar primary key, library_id integer not null, path varchar not null,
-        title varchar, album varchar, album_id varchar, artist_id varchar,
-        disc_number integer, order_title varchar, suffix varchar, size integer,
-        duration real, bit_rate integer, comment varchar, track_number integer,
-        sample_rate integer, bit_depth integer, channels integer,
-        mbz_recording_id varchar, tags varchar, missing bool default 0,
-        album_artist varchar, genre varchar, lyrics varchar, year integer, has_cover_art bool default 0,
-        average_rating real not null default 0);
+        id varchar(255) not null primary key,
+        path varchar(255) default '' not null,
+        title varchar(255) default '' not null,
+        album varchar(255) default '' not null,
+        artist varchar(255) default '' not null,
+        artist_id varchar(255) default '' not null,
+        album_artist varchar(255) default '' not null,
+        album_id varchar(255) default '' not null,
+        has_cover_art bool default FALSE not null,
+        track_number integer default 0 not null,
+        disc_number integer default 0 not null,
+        year integer default 0 not null,
+        size integer default 0 not null,
+        suffix varchar(255) default '' not null,
+        duration real default 0 not null,
+        bit_rate integer default 0 not null,
+        genre varchar(255) default '' not null,
+        compilation bool default FALSE not null,
+        created_at datetime, updated_at datetime,
+        date varchar(255) default '' not null,
+        sort_album_name varchar collate NOCASE default '' not null,
+        sort_artist_name varchar collate NOCASE default '' not null,
+        sort_album_artist_name varchar collate NOCASE default '' not null,
+        sort_title varchar collate NOCASE default '' not null,
+        disc_subtitle varchar default '' not null,
+        catalog_num varchar default '' not null,
+        comment varchar default '' not null,
+        order_title varchar collate NOCASE default '' not null,
+        order_album_name varchar collate NOCASE default '' not null,
+        order_artist_name varchar collate NOCASE default '' not null,
+        order_album_artist_name varchar collate NOCASE default '' not null,
+        mbz_recording_id varchar default '' not null,
+        mbz_album_id varchar default '' not null,
+        channels integer default 0 not null,
+        lyrics jsonb default '[]' not null,
+        sample_rate integer default 0 not null,
+        library_id integer default 1 not null references library on delete cascade,
+        missing boolean default false not null,
+        tags jsonb default '{}' not null,
+        participants jsonb default '{}' not null,
+        explicit_status varchar default '' not null,
+        rg_track_gain real, rg_track_peak real,
+        average_rating REAL NOT NULL DEFAULT 0,
+        search_participants TEXT NOT NULL DEFAULT '',
+        search_normalized TEXT NOT NULL DEFAULT '',
+        codec VARCHAR(255) DEFAULT '' NOT NULL,
+        bpm integer, bit_depth integer);
+    CREATE INDEX media_file_path ON media_file (path);
     CREATE TABLE annotation (
-        user_id varchar not null, item_id varchar not null, item_type varchar not null,
-        play_count integer default 0, play_date datetime, rating integer default 0,
-        starred bool default 0 not null, starred_at datetime, rated_at datetime,
+        user_id varchar(255) not null REFERENCES user(id) ON DELETE CASCADE ON UPDATE CASCADE,
+        item_id varchar(255) default '' not null,
+        item_type varchar(255) default '' not null,
+        play_count integer default 0,
+        play_date datetime,
+        rating integer default 0,
+        starred bool default FALSE not null,
+        starred_at datetime, rated_at datetime,
         unique (user_id, item_id, item_type));
-    CREATE TABLE playlist (id varchar primary key, name varchar, duration real default 0,
-        size integer default 0, song_count integer default 0);
-    CREATE TABLE playlist_tracks (id integer default 0 not null, playlist_id varchar not null,
-        media_file_id varchar not null);
+    CREATE TABLE playlist (
+        id varchar(255) not null primary key,
+        name varchar(255) collate NOCASE default '' not null,
+        comment varchar(255) default '' not null,
+        duration real default 0 not null,
+        song_count integer default 0 not null,
+        public bool default FALSE not null,
+        created_at datetime, updated_at datetime,
+        path string default '' not null,
+        sync bool default false not null,
+        size integer default 0 not null,
+        rules varchar, evaluated_at datetime,
+        owner_id varchar(255) not null references user on update cascade on delete cascade,
+        average_rating REAL NOT NULL DEFAULT 0,
+        imported_hash varchar default '' not null);
+    CREATE TABLE playlist_tracks (
+        id integer default 0 not null,
+        playlist_id varchar(255) not null references playlist on update cascade on delete cascade,
+        media_file_id varchar(255) not null);
     CREATE UNIQUE INDEX playlist_tracks_pos ON playlist_tracks (playlist_id, id);
-    CREATE TABLE bookmark (user_id varchar not null, item_id varchar not null,
-        item_type varchar not null, comment varchar, position integer, changed_by varchar,
-        created_at datetime, updated_at datetime, unique (user_id, item_id, item_type));
-    CREATE TABLE playqueue (id varchar not null, user_id varchar not null, current integer default 0,
-        position real, changed_by varchar, items varchar, created_at datetime, updated_at datetime);
-    CREATE TABLE scrobbles (media_file_id varchar not null, user_id varchar not null,
-        submission_time integer not null);
-    CREATE TABLE scrobble_buffer (user_id varchar not null, service varchar not null,
-        media_file_id varchar not null, play_time datetime not null, enqueue_time datetime,
-        id varchar not null default '', unique (user_id, service, media_file_id, play_time));
-    CREATE TABLE share (id varchar primary key, resource_ids varchar not null, user_id varchar);
+    CREATE TABLE bookmark (
+        user_id varchar(255) not null references user on update cascade on delete cascade,
+        item_id varchar(255) not null,
+        item_type varchar(255) not null,
+        comment varchar(255), position integer, changed_by varchar(255),
+        created_at datetime, updated_at datetime,
+        constraint bookmark_pk unique (user_id, item_id, item_type));
+    CREATE TABLE playqueue (
+        id varchar(255) not null,
+        user_id varchar(255) not null references user(id) on update cascade on delete cascade,
+        current integer not null default 0,
+        changed_by varchar(255), items varchar(255),
+        created_at datetime, updated_at datetime, position integer);
+    CREATE TABLE scrobbles (
+        id INTEGER PRIMARY KEY,
+        media_file_id VARCHAR(255) NOT NULL REFERENCES media_file(id) ON DELETE CASCADE ON UPDATE CASCADE,
+        user_id VARCHAR(255) NOT NULL REFERENCES user(id) ON DELETE CASCADE ON UPDATE CASCADE,
+        submission_time INTEGER NOT NULL);
+    CREATE TABLE scrobble_buffer (
+        user_id varchar NOT NULL REFERENCES user ON UPDATE CASCADE ON DELETE CASCADE,
+        service varchar NOT NULL,
+        media_file_id varchar NOT NULL REFERENCES media_file ON UPDATE CASCADE ON DELETE CASCADE,
+        play_time datetime NOT NULL,
+        enqueue_time datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        id varchar NOT NULL DEFAULT '',
+        CONSTRAINT scrobble_buffer_pk UNIQUE (user_id, service, media_file_id, play_time));
+    CREATE TABLE share (
+        id varchar(255) not null primary key,
+        expires_at datetime, last_visited_at datetime,
+        resource_ids varchar not null,
+        created_at datetime, updated_at datetime,
+        user_id varchar(255) not null references user on update cascade on delete cascade,
+        downloadable bool not null default false,
+        description varchar not null default '',
+        resource_type varchar not null default '',
+        contents varchar not null default '',
+        format varchar not null default '',
+        max_bit_rate integer not null default 0,
+        visit_count integer not null default 0);
+    CREATE TABLE media_file_tags (
+        media_file_id varchar not null references media_file (id) on delete cascade,
+        tag_id varchar not null,
+        constraint media_file_tags unique (media_file_id, tag_id));
+
+    CREATE VIRTUAL TABLE media_file_fts USING fts5(
+        title, album, artist, album_artist,
+        sort_title, sort_album_name, sort_artist_name, sort_album_artist_name,
+        disc_subtitle, search_participants, search_normalized,
+        content='', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');
+    CREATE TRIGGER media_file_fts_ai AFTER INSERT ON media_file BEGIN
+        INSERT INTO media_file_fts(rowid, title, album, artist, album_artist,
+            sort_title, sort_album_name, sort_artist_name, sort_album_artist_name,
+            disc_subtitle, search_participants, search_normalized)
+        VALUES (NEW.rowid, NEW.title, NEW.album, NEW.artist, NEW.album_artist,
+            NEW.sort_title, NEW.sort_album_name, NEW.sort_artist_name, NEW.sort_album_artist_name,
+            COALESCE(NEW.disc_subtitle, ''), COALESCE(NEW.search_participants, ''),
+            COALESCE(NEW.search_normalized, ''));
+    END;
+    CREATE TRIGGER media_file_fts_ad AFTER DELETE ON media_file BEGIN
+        INSERT INTO media_file_fts(media_file_fts, rowid, title, album, artist, album_artist,
+            sort_title, sort_album_name, sort_artist_name, sort_album_artist_name,
+            disc_subtitle, search_participants, search_normalized)
+        VALUES ('delete', OLD.rowid, OLD.title, OLD.album, OLD.artist, OLD.album_artist,
+            OLD.sort_title, OLD.sort_album_name, OLD.sort_artist_name, OLD.sort_album_artist_name,
+            COALESCE(OLD.disc_subtitle, ''), COALESCE(OLD.search_participants, ''),
+            COALESCE(OLD.search_normalized, ''));
+    END;
+    CREATE TRIGGER media_file_fts_au AFTER UPDATE ON media_file
+    WHEN OLD.title IS NOT NEW.title OR OLD.album IS NOT NEW.album OR OLD.artist IS NOT NEW.artist
+      OR OLD.album_artist IS NOT NEW.album_artist OR OLD.sort_title IS NOT NEW.sort_title
+      OR OLD.sort_album_name IS NOT NEW.sort_album_name OR OLD.sort_artist_name IS NOT NEW.sort_artist_name
+      OR OLD.sort_album_artist_name IS NOT NEW.sort_album_artist_name
+      OR OLD.disc_subtitle IS NOT NEW.disc_subtitle
+      OR OLD.search_participants IS NOT NEW.search_participants
+      OR OLD.search_normalized IS NOT NEW.search_normalized
+    BEGIN
+        INSERT INTO media_file_fts(media_file_fts, rowid, title, album, artist, album_artist,
+            sort_title, sort_album_name, sort_artist_name, sort_album_artist_name,
+            disc_subtitle, search_participants, search_normalized)
+        VALUES ('delete', OLD.rowid, OLD.title, OLD.album, OLD.artist, OLD.album_artist,
+            OLD.sort_title, OLD.sort_album_name, OLD.sort_artist_name, OLD.sort_album_artist_name,
+            COALESCE(OLD.disc_subtitle, ''), COALESCE(OLD.search_participants, ''),
+            COALESCE(OLD.search_normalized, ''));
+        INSERT INTO media_file_fts(rowid, title, album, artist, album_artist,
+            sort_title, sort_album_name, sort_artist_name, sort_album_artist_name,
+            disc_subtitle, search_participants, search_normalized)
+        VALUES (NEW.rowid, NEW.title, NEW.album, NEW.artist, NEW.album_artist,
+            NEW.sort_title, NEW.sort_album_name, NEW.sort_artist_name, NEW.sort_album_artist_name,
+            COALESCE(NEW.disc_subtitle, ''), COALESCE(NEW.search_participants, ''),
+            COALESCE(NEW.search_normalized, ''));
+    END;
     "#;
 
     /// Legt eine Navidrome-aehnliche DB samt Musikdateien an.
@@ -1731,7 +2282,14 @@ mod tests {
         let db = cfg.join("navidrome.db");
         let c = Connection::open(&db).unwrap();
         c.execute_batch(SCHEMA).unwrap();
-        c.execute("INSERT INTO library (id, path) VALUES (1, ?1)", params![music.to_string_lossy()]).unwrap();
+        c.execute("INSERT INTO library (id, name, path) VALUES (1, 'Musik', ?1)", params![music.to_string_lossy()]).unwrap();
+        for u in ["u1", "u2"] {
+            c.execute(
+                "INSERT INTO user (id, user_name, created_at, updated_at) VALUES (?1, ?1, datetime('now'), datetime('now'))",
+                params![u],
+            )
+            .unwrap();
+        }
         let ins = "INSERT INTO media_file (id, library_id, path, title, album, album_id, artist_id, disc_number, \
                    order_title, suffix, size, duration, bit_rate, comment, track_number, sample_rate, bit_depth, \
                    channels, mbz_recording_id, tags, missing) \
@@ -1753,7 +2311,7 @@ mod tests {
         c.execute("INSERT INTO annotation (user_id, item_id, item_type, play_count, rating, starred) \
                    VALUES ('u1','flacLo','media_file',3,3,1)", []).unwrap();
 
-        c.execute("INSERT INTO playlist (id, name) VALUES ('pl1','Favoriten')", []).unwrap();
+        c.execute("INSERT INTO playlist (id, name, owner_id) VALUES ('pl1','Favoriten','u1')", []).unwrap();
         for (pos, mf) in [(1, "mp3a"), (2, "flacA"), (3, "flacLo")] {
             c.execute("INSERT INTO playlist_tracks (id, playlist_id, media_file_id) VALUES (?1,'pl1',?2)", params![pos, mf]).unwrap();
         }
@@ -1774,7 +2332,8 @@ mod tests {
             path_map: None,
             keep_exts: vec!["flac".into()],
             delete_exts: vec!["mp3".into()],
-            same_exts: vec!["flac".into()],
+            same_exts: vec!["flac".into(), "mp3".into()],
+            audio_exts: vec!["flac".into(), "mp3".into()],
             duration_tol: 3.0,
             batch_size: 2,
             backup_keep: 2,
@@ -1800,8 +2359,8 @@ mod tests {
                    order_title, suffix, size, duration, bit_rate, comment, track_number, sample_rate, bit_depth, \
                    channels, mbz_recording_id, tags, missing, genre, lyrics) \
                    VALUES (?1, 1, ?2, ?3, 'Album', 'alb1', 'art1', 1, ?4, 'flac', 800, 240.0, 800, ?5, 3, 44100, 16, 2, '', '{}', 0, ?6, ?7)";
-        c.execute(ins, params!["flacOrig", "g3.flac", "Song Three", "song three", "", "Rock", "la la"]).unwrap();
-        c.execute(ins, params!["flacCopy", "g3 (1).flac", "Song Three (1)", "song three (1)", "aus dem Netz", Option::<String>::None, Option::<String>::None]).unwrap();
+        c.execute(ins, params!["flacOrig", "g3.flac", "Song Three", "song three", "", "Rock", "[{\"value\":\"la la\"}]"]).unwrap();
+        c.execute(ins, params!["flacCopy", "g3 (1).flac", "Song Three (1)", "song three (1)", "aus dem Netz", "", "[]"]).unwrap();
     }
 
     #[test]
@@ -1922,8 +2481,8 @@ mod tests {
                    order_title, suffix, size, duration, bit_rate, comment, track_number, sample_rate, bit_depth, \
                    channels, mbz_recording_id, tags, missing, genre, lyrics) \
                    VALUES (?1, 1, ?2, ?3, ?4, ?5, 'art1', 1, ?6, 'flac', ?7, 10.0, 900, '', 1, 44100, 16, 2, '', '{}', 0, ?8, ?9)";
-        c.execute(ins, params!["album1", "Alben/Nachtflug/01 Lied.flac", "Lied", "Nachtflug", "albN", "lied", 450, "Rock", "text"]).unwrap();
-        c.execute(ins, params!["dl1", "Downloads/irgendwas.flac", "irgendwas", "Unbekannt", "albU", "irgendwas", 950, Option::<String>::None, Option::<String>::None]).unwrap();
+        c.execute(ins, params!["album1", "Alben/Nachtflug/01 Lied.flac", "Lied", "Nachtflug", "albN", "lied", 450, "Rock", "[{\"value\":\"text\"}]"]).unwrap();
+        c.execute(ins, params!["dl1", "Downloads/irgendwas.flac", "irgendwas", "Unbekannt", "albU", "irgendwas", 950, "", "[]"]).unwrap();
         // Favorit und Playlist-Eintrag haengen an der Datei, die weichen soll
         c.execute("INSERT INTO annotation (user_id,item_id,item_type,play_count,rating,starred,starred_at) \
                    VALUES ('u1','dl1','media_file',11,4,1,'2025-01-01')", []).unwrap();
@@ -2034,6 +2593,398 @@ mod tests {
         assert_eq!(sh.stats.errors.load(Relaxed), 0);
         let left = ["Rest/mit-tags.mp3", "Rest/mehr-tags.mp3"].iter().filter(|p| music.join(p).exists()).count();
         assert_eq!(left, 1, "von zwei inhaltsgleichen MP3s bleibt genau eine");
+    }
+
+    // ───────── Index-Datenbank ─────────
+
+    #[test]
+    fn doppelte_mp3s_ohne_flac_werden_bereinigt() {
+        let (env, music, _cfg) = fixture();
+        fs::write(music.join("solo-192.mp3"), vec![b'y'; 400]).unwrap();
+        fs::write(music.join("solo-320.mp3"), vec![b'z'; 900]).unwrap();
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            let ins = "INSERT INTO media_file (id, library_id, path, title, album, album_id, artist_id, disc_number, \
+                       order_title, suffix, size, duration, bit_rate, comment, track_number, sample_rate, bit_depth, \
+                       channels, mbz_recording_id, tags, missing, genre) \
+                       VALUES (?1, 1, ?2, 'Solo', 'Album', 'albS', 'art1', 1, 'solo', 'mp3', ?3, 150.0, ?4, '', 1, 44100, 0, 2, '', '{}', 0, ?5)";
+            c.execute(ins, params!["mp3lo", "solo-192.mp3", 400, 192, ""]).unwrap();
+            c.execute(ins, params!["mp3hi", "solo-320.mp3", 900, 320, "Pop"]).unwrap();
+            c.execute("INSERT INTO annotation (user_id,item_id,item_type,play_count,rating,starred) \
+                       VALUES ('u1','mp3lo','media_file',4,5,1)", []).unwrap();
+        }
+        let sh = db_mode(env);
+        let db = sh.env.db_path.clone();
+        run(&sh, true);
+        assert_eq!(sh.stats.errors.load(Relaxed), 0);
+        assert!(music.join("solo-320.mp3").exists(), "die bessere MP3 bleibt");
+        assert!(!music.join("solo-192.mp3").exists(), "die schlechtere MP3 geht, auch ohne FLAC");
+        let c = Connection::open(&db).unwrap();
+        let starred: i64 = c
+            .query_row("SELECT starred FROM annotation WHERE user_id='u1' AND item_id='mp3hi'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(starred, 1, "Favorit wandert auf die behaltene MP3");
+    }
+
+    #[test]
+    fn index_wird_angelegt_und_beim_zweiten_lauf_genutzt() {
+        let (env, _music, cfg) = content_fixture();
+        let sh = content_mode(env);
+        run(&sh, false);
+        let erster = sh.stats.files.load(Relaxed);
+        assert!(erster > 0, "Dateien im Index erfasst");
+        assert_eq!(sh.stats.reused.load(Relaxed), 0, "beim ersten Lauf gibt es nichts zu uebernehmen");
+        assert!(cfg.join("index.db").is_file(), "Index-Datenbank angelegt");
+
+        run(&sh, false);
+        assert_eq!(sh.stats.files.load(Relaxed), erster, "gleiche Dateizahl");
+        assert_eq!(sh.stats.reused.load(Relaxed), erster, "zweiter Lauf nimmt alles aus dem Index");
+    }
+
+    #[test]
+    fn geaenderte_dateien_werden_neu_eingelesen() {
+        let (env, music, _cfg) = content_fixture();
+        let sh = content_mode(env);
+        run(&sh, false);
+        let n = sh.stats.files.load(Relaxed);
+        // eine Datei austauschen: andere Groesse, andere Zeit
+        fs::write(music.join("Downloads/irgendwas.flac"), crate::audio::flac_bytes([0x99; 16], 44100, 16, 2, 441000, 1234)).unwrap();
+        run(&sh, false);
+        assert_eq!(sh.stats.files.load(Relaxed), n);
+        assert_eq!(sh.stats.reused.load(Relaxed), n - 1, "genau die geaenderte Datei wird neu gelesen");
+    }
+
+    #[test]
+    fn plan_aus_dem_dry_run_wird_uebernommen() {
+        let (env, music, _cfg) = content_fixture();
+        let sh = content_mode(env);
+        run(&sh, false);
+        assert_eq!(sh.stats.planned.load(Relaxed), 1, "ein Duplikat vorgemerkt");
+
+        sh.settings.lock().unwrap().reuse_plan = true;
+        run(&sh, true);
+        assert_eq!(sh.stats.files.load(Relaxed), 0, "der echte Lauf durchsucht nichts mehr");
+        assert_eq!(sh.stats.deleted.load(Relaxed), 1, "er wendet den gespeicherten Plan an");
+        assert!(!music.join("Downloads/irgendwas.flac").exists());
+        assert!(music.join("Alben/Nachtflug/01 Lied.flac").exists());
+    }
+
+    #[test]
+    fn index_laesst_sich_durchsuchen_und_filtern() {
+        let (env, _music, _cfg) = content_fixture();
+        let sh = content_mode(env);
+        run(&sh, false);
+
+        let c = crate::index::open_ro(&sh.env).unwrap();
+        let all = crate::index::search(&c, "", "all", "", 100, 0).unwrap();
+        assert!(all["total"].as_i64().unwrap() >= 2);
+
+        let treffer = crate::index::search(&c, "irgendwas", "all", "", 100, 0).unwrap();
+        assert_eq!(treffer["total"], 1, "Suche nach dem Dateinamen");
+
+        let dups = crate::index::search(&c, "", "dups", "", 100, 0).unwrap();
+        assert_eq!(dups["total"], 2, "beide Seiten des Duplikats");
+
+        let geplant = crate::index::search(&c, "", "planned", "", 100, 0).unwrap();
+        assert_eq!(geplant["total"], 1, "nur die vorgemerkte Datei");
+
+        let s = crate::index::summary(&c).unwrap();
+        assert_eq!(s["duplicates"], 1, "eine ueberzaehlige Kopie");
+        assert!(s["reusable"].is_object(), "der Plan ist uebernehmbar");
+    }
+
+    #[test]
+    fn index_laesst_sich_verwerfen() {
+        let (env, _music, cfg) = content_fixture();
+        let sh = content_mode(env);
+        run(&sh, false);
+        assert!(cfg.join("index.db").is_file());
+        crate::index::reset(&sh.env).unwrap();
+        assert!(!cfg.join("index.db").is_file(), "Index geloescht");
+        assert!(crate::index::open_ro(&sh.env).is_err(), "danach gibt es nichts zu lesen");
+    }
+
+    // ───────── Playlists ─────────
+
+    #[test]
+    fn playlist_wird_nie_kuerzer_auch_wenn_beide_seiten_drin_stehen() {
+        let (env, _music, _cfg) = fixture();
+        {
+            // mp3 UND flac stehen in derselben Playlist
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("DELETE FROM playlist_tracks", []).unwrap();
+            c.execute("INSERT INTO playlist_tracks VALUES (1,'pl1','mp3a')", []).unwrap();
+            c.execute("INSERT INTO playlist_tracks VALUES (2,'pl1','flacA')", []).unwrap();
+            c.execute("UPDATE playlist SET song_count=2 WHERE id='pl1'", []).unwrap();
+        }
+        let sh = db_mode(env);
+        let db = sh.env.db_path.clone();
+        run(&sh, true);
+        assert_eq!(sh.stats.errors.load(Relaxed), 0);
+        let c = Connection::open(&db).unwrap();
+        let n: i64 = c.query_row("SELECT count(*) FROM playlist_tracks WHERE playlist_id='pl1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2, "die Playlist behaelt beide Plaetze");
+        let auf_keeper: i64 = c
+            .query_row("SELECT count(*) FROM playlist_tracks WHERE playlist_id='pl1' AND media_file_id='flacA'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(auf_keeper, 2, "beide zeigen jetzt auf die behaltene Datei");
+        let cnt: i64 = c.query_row("SELECT song_count FROM playlist WHERE id='pl1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(cnt, 2, "song_count stimmt weiterhin");
+    }
+
+    #[test]
+    fn zusammenfassen_darf_die_playlist_kuerzen() {
+        let (env, _music, _cfg) = fixture();
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("DELETE FROM playlist_tracks", []).unwrap();
+            c.execute("INSERT INTO playlist_tracks VALUES (1,'pl1','mp3a')", []).unwrap();
+            c.execute("INSERT INTO playlist_tracks VALUES (2,'pl1','flacA')", []).unwrap();
+        }
+        let sh = db_mode(env);
+        let db = sh.env.db_path.clone();
+        sh.settings.lock().unwrap().playlist_keep_duplicates = false;
+        run(&sh, true);
+        assert_eq!(sh.stats.errors.load(Relaxed), 0);
+        let c = Connection::open(&db).unwrap();
+        let n: i64 = c.query_row("SELECT count(*) FROM playlist_tracks WHERE playlist_id='pl1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "hier ist das Kuerzen ausdruecklich gewollt");
+    }
+
+    #[test]
+    fn eingelesene_playlist_datei_wird_mitgeschrieben() {
+        let (env, music, _cfg) = fixture();
+        let m3u = music.join("Mix.m3u");
+        // Navidrome-Playlists aus Dateien enthalten oft relative Pfade und Kommentarzeilen
+        fs::write(
+            &m3u,
+            format!("#EXTM3U\n#EXTINF:180,Song One\ng1.mp3\n{}\n", music.join("g2-hi.flac").display()),
+        )
+        .unwrap();
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("DELETE FROM playlist_tracks", []).unwrap();
+            c.execute("INSERT INTO playlist_tracks VALUES (1,'pl1','mp3a')", []).unwrap();
+            c.execute(
+                "UPDATE playlist SET path=?1, sync=1, song_count=1 WHERE id='pl1'",
+                params![m3u.to_string_lossy()],
+            )
+            .unwrap();
+        }
+        let sh = db_mode(env);
+        run(&sh, true);
+        assert_eq!(sh.stats.errors.load(Relaxed), 0);
+        assert_eq!(sh.stats.m3u.load(Relaxed), 1, "eine Playlist-Datei angefasst");
+
+        let text = fs::read_to_string(&m3u).unwrap();
+        assert!(text.contains("g1.flac"), "der neue Pfad steht in der Datei:\n{text}");
+        assert!(!text.contains("g1.mp3"), "der alte Pfad ist weg:\n{text}");
+        assert!(text.contains("#EXTM3U") && text.contains("#EXTINF"), "Kommentarzeilen bleiben erhalten");
+        assert!(text.lines().any(|l| l.trim() == "g1.flac"), "relativ bleibt relativ");
+    }
+
+    #[test]
+    fn playlist_datei_ohne_sync_wird_nicht_angefasst() {
+        let (env, music, _cfg) = fixture();
+        let m3u = music.join("Hand.m3u");
+        fs::write(&m3u, "g1.mp3\n").unwrap();
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("UPDATE playlist SET path=?1, sync=0 WHERE id='pl1'", params![m3u.to_string_lossy()]).unwrap();
+        }
+        let sh = db_mode(env);
+        run(&sh, true);
+        assert_eq!(fs::read_to_string(&m3u).unwrap(), "g1.mp3\n", "selbst gepflegte Playlists bleiben unberuehrt");
+        assert_eq!(sh.stats.m3u.load(Relaxed), 0);
+    }
+
+    // ───────── Volltextindex (FTS5) ─────────
+
+    /// Wie viele Eintraege findet Navidromes Suchindex zu diesem Begriff?
+    fn fts_treffer(db: &str, wort: &str) -> i64 {
+        let c = Connection::open(db).unwrap();
+        c.query_row(
+            "SELECT count(*) FROM media_file_fts WHERE media_file_fts MATCH ?1",
+            params![wort],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn markieren_als_fehlend_laesst_den_suchindex_in_ruhe() {
+        let (env, _music, _cfg) = fixture();
+        let db = env.db_path.clone();
+        assert_eq!(fts_treffer(&db, "one"), 2, "mp3 und flac stehen im Suchindex");
+        let sh = db_mode(env);
+        assert!(!sh.env.delete_rows, "Standard ist markieren, nicht loeschen");
+        run(&sh, true);
+        assert_eq!(sh.stats.errors.load(Relaxed), 0);
+        // Der FTS-Trigger haengt an Titel- und Sortierfeldern, nicht an `missing` –
+        // die Zeile bleibt also im Index, so wie Navidrome es auch selbst macht.
+        assert_eq!(fts_treffer(&db, "one"), 2, "Suchindex unveraendert");
+    }
+
+    #[test]
+    fn zeilen_loeschen_raeumt_den_suchindex_mit_auf() {
+        let (mut env, _music, _cfg) = fixture();
+        env.delete_rows = true;
+        let db = env.db_path.clone();
+        assert_eq!(fts_treffer(&db, "one"), 2);
+        let sh = db_mode(env);
+        run(&sh, true);
+        assert_eq!(sh.stats.errors.load(Relaxed), 0);
+
+        let c = Connection::open(&db).unwrap();
+        let weg: i64 = c.query_row("SELECT count(*) FROM media_file WHERE id='mp3a'", [], |r| r.get(0)).unwrap();
+        assert_eq!(weg, 0, "die Zeile ist wirklich geloescht");
+        assert_eq!(fts_treffer(&db, "one"), 1, "der Loesch-Trigger hat den Suchindex nachgezogen");
+        // Fremdschluessel mit ON DELETE CASCADE duerfen nichts mitreissen, was wir
+        // vorher umgehaengt haben
+        let scr: i64 = c.query_row("SELECT count(*) FROM scrobbles WHERE media_file_id='flacA'", [], |r| r.get(0)).unwrap();
+        assert_eq!(scr, 1, "die Historie haengt an der behaltenen Datei und ueberlebt");
+    }
+
+    #[test]
+    fn leere_json_felder_zaehlen_nicht_als_tags() {
+        // Navidrome legt lyrics als '[]' und tags als '{}' an. Das sind leere Felder –
+        // werden sie als vorhanden gezaehlt, waere die Tag-Bewertung fuer jede Datei gleich.
+        let (env, _music, _cfg) = fixture();
+        let c = Connection::open(&env.db_path).unwrap();
+        let schema = Schema::load(&c).unwrap();
+        let sql = format!("SELECT {} FROM media_file WHERE id=?1", schema.tag_flags_expr());
+        let flags = |id: &str| -> String { c.query_row(&sql, params![id], |r| r.get(0)).unwrap() };
+
+        let leer = flags("mp3a");
+        assert!(!leer.contains('l'), "lyrics='[]' zaehlt nicht: {leer}");
+        assert!(!leer.contains('T'), "tags='{{}}' zaehlt nicht: {leer}");
+
+        c.execute("UPDATE media_file SET lyrics='[{\"value\":\"hallo\"}]' WHERE id='mp3a'", []).unwrap();
+        assert!(flags("mp3a").contains('l'), "echter Liedtext zaehlt");
+    }
+
+    #[test]
+    fn schreibgeschuetzte_playlist_datei_wird_vorher_gemeldet() {
+        let (env, music, _cfg) = fixture();
+        let gut = music.join("Gut.m3u");
+        let schlecht = music.join("Schreibgeschuetzt.m3u");
+        fs::write(&gut, "g1.mp3\n").unwrap();
+        fs::write(&schlecht, "g1.mp3\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&schlecht, fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("UPDATE playlist SET path=?1, sync=1 WHERE id='pl1'", params![gut.to_string_lossy()]).unwrap();
+            c.execute(
+                "INSERT INTO playlist (id, name, owner_id, path, sync) VALUES ('pl2','Zweite','u1',?1,1)",
+                params![schlecht.to_string_lossy()],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO playlist (id, name, owner_id, path, sync) VALUES ('pl3','Weg','u1','/gibt/es/nicht.m3u',1)",
+                [],
+            )
+            .unwrap();
+        }
+        let sh = db_mode(env);
+        run(&sh, false); // schon der Dry-Run muss warnen
+        let log: String = sh.log.lock().unwrap().1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(log.contains("nicht schreibbar"), "schreibgeschuetzte Datei gemeldet:\n{log}");
+        assert!(log.contains("nicht gefunden"), "fehlende Datei gemeldet:\n{log}");
+        assert!(log.contains("ACHTUNG"), "zusammenfassende Warnung:\n{log}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&schlecht, fs::Permissions::from_mode(0o644));
+        }
+    }
+
+    #[test]
+    fn beschreibbare_playlist_dateien_werden_bestaetigt() {
+        let (env, music, _cfg) = fixture();
+        let m3u = music.join("Ok.m3u");
+        fs::write(&m3u, "g1.mp3\n").unwrap();
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("UPDATE playlist SET path=?1, sync=1 WHERE id='pl1'", params![m3u.to_string_lossy()]).unwrap();
+        }
+        let sh = db_mode(env);
+        run(&sh, false);
+        let log: String = sh.log.lock().unwrap().1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(log.contains("beschreibbar"), "Bestaetigung im Protokoll:\n{log}");
+        assert!(!log.contains("ACHTUNG"), "keine Warnung noetig:\n{log}");
+    }
+
+    #[test]
+    fn playlist_m3u8_im_albumordner_wie_in_der_praxis() {
+        // Nachgebaut nach einer echten Installation: pro Albumordner eine
+        // playlist.m3u8 mit relativen Dateinamen, dazu eine im Wurzelordner
+        // mit absoluten Pfaden.
+        let (env, music, _cfg) = fixture();
+        let album = music.join("Artemas/i like the way you kiss me");
+        fs::create_dir_all(&album).unwrap();
+        fs::write(album.join("01 Kuss.mp3"), vec![b'k'; 300]).unwrap();
+        fs::write(album.join("01 Kuss.flac"), vec![b'K'; 900]).unwrap();
+        let im_album = album.join("playlist.m3u8");
+        fs::write(&im_album, "#EXTM3U\n#EXTINF:200,Kuss\n01 Kuss.mp3\n").unwrap();
+        let wurzel = music.join("playlist.m3u8");
+        fs::write(&wurzel, format!("#EXTM3U\n{}\n", album.join("01 Kuss.mp3").display())).unwrap();
+
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            let ins = "INSERT INTO media_file (id, library_id, path, title, album, album_id, artist_id, disc_number, \
+                       order_title, suffix, size, duration, bit_rate, comment, track_number, sample_rate, bit_depth, \
+                       channels, mbz_recording_id, tags, missing, genre) \
+                       VALUES (?1, 1, ?2, 'Kuss', 'Kuss-EP', 'albK', 'art1', 1, 'kuss', ?3, ?4, 200.0, ?5, '', 1, 44100, ?6, 2, '', '{}', 0, 'Pop')";
+            c.execute(ins, params!["kussmp3", "Artemas/i like the way you kiss me/01 Kuss.mp3", "mp3", 300, 320, 0]).unwrap();
+            c.execute(ins, params!["kussflac", "Artemas/i like the way you kiss me/01 Kuss.flac", "flac", 900, 900, 16]).unwrap();
+            c.execute("INSERT INTO playlist (id,name,owner_id,path,sync) VALUES ('plA','playlist','u1',?1,1)",
+                      params![im_album.to_string_lossy()]).unwrap();
+            c.execute("INSERT INTO playlist (id,name,owner_id,path,sync) VALUES ('plR','playlist','u1',?1,1)",
+                      params![wurzel.to_string_lossy()]).unwrap();
+            c.execute("INSERT INTO playlist_tracks VALUES (1,'plA','kussmp3')", []).unwrap();
+            c.execute("INSERT INTO playlist_tracks VALUES (1,'plR','kussmp3')", []).unwrap();
+        }
+        let sh = db_mode(env);
+        run(&sh, true);
+        assert_eq!(sh.stats.errors.load(Relaxed), 0);
+        assert!(!album.join("01 Kuss.mp3").exists(), "die mp3 ist weg");
+        assert!(album.join("01 Kuss.flac").exists(), "die flac bleibt");
+        assert_eq!(sh.stats.m3u.load(Relaxed), 2, "beide Playlist-Dateien angefasst");
+
+        let a = fs::read_to_string(&im_album).unwrap();
+        assert!(a.lines().any(|l| l.trim() == "01 Kuss.flac"), "relativ bleibt relativ:\n{a}");
+        assert!(a.contains("#EXTINF:200,Kuss"), "Kommentarzeile erhalten:\n{a}");
+
+        let w = fs::read_to_string(&wurzel).unwrap();
+        assert!(w.contains("01 Kuss.flac"), "absoluter Pfad ersetzt:\n{w}");
+        assert!(!w.contains("01 Kuss.mp3"), "alter Pfad weg:\n{w}");
+    }
+
+    #[test]
+    fn playlist_in_fremder_kodierung_bleibt_unangetastet() {
+        let (env, music, _cfg) = fixture();
+        let m3u = music.join("Alt.m3u");
+        // Latin-1: "Grün.mp3" – kein gueltiges UTF-8
+        let mut bytes = b"g1.mp3\nGr".to_vec();
+        bytes.push(0xFC);
+        bytes.extend_from_slice(b"n.mp3\n");
+        fs::write(&m3u, &bytes).unwrap();
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("UPDATE playlist SET path=?1, sync=1 WHERE id='pl1'", params![m3u.to_string_lossy()]).unwrap();
+            c.execute("DELETE FROM playlist_tracks", []).unwrap();
+            c.execute("INSERT INTO playlist_tracks VALUES (1,'pl1','mp3a')", []).unwrap();
+        }
+        let sh = db_mode(env);
+        run(&sh, true);
+        assert_eq!(fs::read(&m3u).unwrap(), bytes, "die Datei wurde nicht angefasst");
+        let log: String = sh.log.lock().unwrap().1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(log.contains("nicht UTF-8"), "deutliche Meldung statt stiller Beschaedigung:\n{log}");
     }
 
     #[test]
