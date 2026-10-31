@@ -137,6 +137,7 @@
     <div><span>Duplikate erkannt</span><b id="duplicates">0</b></div>
     <div><span>davon gleiches Format</span><b id="same_format">0</b></div>
     <div><span>davon inhaltlich identisch</span><b id="exact">0</b></div>
+    <div><span>davon doppelt im selben Album</span><b id="album_dupes">0</b></div>
     <div><span>zum Löschen vorgemerkt</span><b id="planned">0</b></div>
     <div><span>Dateien gelöscht</span><b id="deleted">0</b></div>
     <div><span>Speicher</span><b id="freed">0 B</b></div>
@@ -192,6 +193,7 @@
       <label class="chk"><input type="checkbox" id="dedupe_flac"> doppelte Dateien gleichen Formats bereinigen (FLAC/FLAC)</label>
       <label class="chk"><input type="checkbox" id="strip_copy_suffix"> „Song (1)“, „Song (2)“, „Song - Copy“ als dasselbe Stück behandeln</label>
       <label class="chk"><input type="checkbox" id="skip_on_tag_loss"> nicht löschen, wenn die Kopie Tag-Felder hat, die der behaltenen Datei fehlen</label>
+      <label class="chk"><input type="checkbox" id="strict_album_match"> im selben Album streng prüfen, ob es wirklich dasselbe Stück ist (nicht Live, Remix, Radio Edit)</label>
       <label class="chk"><input type="checkbox" id="require_mbz_match"> nicht löschen bei unterschiedlicher MusicBrainz-Recording-ID</label>
       <label class="chk"><input type="checkbox" id="require_same_track"> gleiche Tracknummer verlangen (bei gleichem Format)</label>
       <label class="chk"><input type="checkbox" id="playlist_keep_duplicates"> Playlist-Einträge immer umbiegen, auch wenn der Titel dadurch doppelt vorkommt (Playlist wird nie kürzer)</label>
@@ -252,7 +254,7 @@
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
-const NUMS = ["scanned","files","unknown","candidates","duplicates","same_format","exact","planned",
+const NUMS = ["scanned","files","unknown","candidates","duplicates","same_format","exact","album_dupes","planned",
               "deleted","annotations","playlists","m3u","tags_lost","protected","excluded","mismatch","errors"];
 const MAXLINES = 800;
 let since = 0, running = false, idleTicks = 0, last = {};
@@ -395,7 +397,7 @@ async function stopRun() { await press($("stop"), "stoppt …", () => api("/api/
 /* Einstellungen */
 const FLAGS = ["dedupe_flac","strip_copy_suffix","skip_on_tag_loss","require_mbz_match","require_same_track",
                "playlist_keep_duplicates","verify_bytes","report_unknown","use_trash",
-               "use_index","reuse_index","reuse_plan","rewrite_m3u","verify_size_before_delete"];
+               "use_index","reuse_index","reuse_plan","rewrite_m3u","verify_size_before_delete","strict_album_match"];
 const lines = t => t.split("\n").map(x => x.trim()).filter(Boolean);
 async function loadCfg() {
   const c = await (await api("/api/config")).json();

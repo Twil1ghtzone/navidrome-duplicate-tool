@@ -38,6 +38,8 @@ struct Cand {
     title: String,
     album: String,
     comment: String,
+    genre: String,
+    subtitle: String,
     tags: String,
 }
 
@@ -49,10 +51,29 @@ impl Cand {
     /// (damit Favoriten und Playlists ihren Anker behalten), dann Tag-Vollstaendigkeit,
     /// dann ein Dateiname ohne Kopie-Zaehler. Weil das Audio identisch ist, entscheidet
     /// zuletzt die groessere Datei – sie traegt eher eingebettete Cover und Zusatz-Tags.
-    fn rank(&self) -> (i64, i64, i64, i64, std::cmp::Reverse<String>) {
+    /// Passt die Ablage zu den Tags? Eine Datei unter "Interpret/Album/01 Titel.flac"
+    /// ist offensichtlich einsortiert; eine unter "Downloads/zufall_42.flac" nicht –
+    /// selbst wenn beide dasselbe Audio enthalten und gleich getaggt sind.
+    fn path_fit(&self) -> i64 {
+        let p = norm(&self.abs);
+        let mut s = 0;
+        let album = self.album.trim().to_lowercase();
+        if album.len() >= 3 && p.contains(&album) {
+            s += 1;
+        }
+        let title = self.title.trim().to_lowercase();
+        if title.len() >= 3 && p.contains(&title) {
+            s += 1;
+        }
+        s
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn rank(&self) -> (i64, i64, i64, i64, i64, std::cmp::Reverse<String>) {
         (
             self.known() as i64,
             tag_score(&self.flags),
+            self.path_fit(),
             !is_copy_name(&self.abs) as i64,
             self.size,
             std::cmp::Reverse(self.abs.clone()),
@@ -179,6 +200,8 @@ pub fn scan(
             title: r.get(7).map_err(|e| e.to_string())?,
             album: r.get(8).map_err(|e| e.to_string())?,
             comment: r.get(9).map_err(|e| e.to_string())?,
+            genre: String::new(),
+            subtitle: String::new(),
             tags: String::new(), // wird nur fuer Kandidaten nachgeladen
         };
         if k != key {
@@ -309,6 +332,27 @@ fn walk(
     Ok(())
 }
 
+/// Verteilt eine Aufgabe ueber mehrere Threads. Der Bibliotheks-Scan wartet fast
+/// nur auf die Platte; nacheinander zu fragen verschenkt auf Netzwerkspeicher und
+/// Festplatten den groessten Teil der moeglichen Geschwindigkeit.
+fn parallel<T: Sync, R: Send>(threads: usize, items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let n = threads.max(1).min(items.len());
+    if n <= 1 {
+        return items.iter().map(&f).collect();
+    }
+    let chunk = items.len().div_ceil(n);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = items
+            .chunks(chunk)
+            .map(|teil| {
+                let fref = &f;
+                scope.spawn(move || teil.iter().map(fref).collect::<Vec<R>>())
+            })
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().expect("Scan-Thread abgestuerzt")).collect()
+    })
+}
+
 /// Legt einen Stapel gefundener Dateien im Index ab. Unveraenderte Dateien
 /// werden nicht erneut untersucht – das ist der eigentliche Zeitgewinn.
 fn store(
@@ -337,20 +381,28 @@ fn store(
             fresh.push(hit);
         }
     }
-    // 2. Nur die uebrigen Dateien wirklich oeffnen
+    // 2. Nur die uebrigen Dateien wirklich oeffnen – und das parallel,
+    //    weil dabei fast nur auf die Platte gewartet wird.
+    let offen: Vec<&Found> = batch.iter().zip(fresh.iter()).filter(|(_, h)| !**h).map(|(f, _)| f).collect();
+    let ergebnis = parallel(sh.env.scan_threads, &offen, |f| match audio::probe(Path::new(&f.abs)) {
+        Ok(i) => Ok(i),
+        Err(e) => Err(format!("FEHLER beim Lesen von {}: {e}", f.abs)),
+    });
     let mut probed: Vec<Option<audio::Info>> = Vec::with_capacity(batch.len());
-    for (f, hit) in batch.iter().zip(fresh.iter()) {
+    let mut it = ergebnis.into_iter();
+    for hit in fresh.iter() {
         if *hit {
             probed.push(None);
             continue;
         }
-        match audio::probe(Path::new(&f.abs)) {
-            Ok(i) => probed.push(Some(i)),
-            Err(e) => {
+        match it.next() {
+            Some(Ok(i)) => probed.push(Some(i)),
+            Some(Err(msg)) => {
                 sh.stats.errors.fetch_add(1, Relaxed);
-                sh.log(format!("FEHLER beim Lesen von {}: {e}", f.abs));
+                sh.log(msg);
                 probed.push(None);
             }
+            None => probed.push(None),
         }
     }
     // 3. In einem Rutsch schreiben
@@ -497,11 +549,25 @@ fn handle(
     // `s:` heisst nur "gleiche Audio-Laenge" und muss noch geprueft werden.
     // Tag-Block erst jetzt nachladen: er wird nur fuer die Schutz-Begriffe
     // gebraucht und waere im Index der mit Abstand groesste Posten.
-    if schema.mf("tags") {
-        if let Ok(mut st) = reader.prepare_cached("SELECT CAST(tags AS TEXT) FROM media_file WHERE id=?1") {
+    {
+        let sql = format!(
+            "SELECT {}, {}, {} FROM media_file WHERE id=?1",
+            if schema.mf("tags") { "CAST(tags AS TEXT)" } else { "''" },
+            schema.expr("genre", "''"),
+            schema.expr("disc_subtitle", "''"),
+        );
+        if let Ok(mut st) = reader.prepare_cached(&sql) {
             for c in group.iter_mut().filter(|c| c.known()) {
-                if let Ok(t) = st.query_row(params![c.id], |r| r.get::<_, Option<String>>(0)) {
+                if let Ok((t, g, sub)) = st.query_row(params![c.id], |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                }) {
                     c.tags = t.unwrap_or_default();
+                    c.genre = g.unwrap_or_default();
+                    c.subtitle = sub.unwrap_or_default();
                 }
             }
         }
@@ -542,7 +608,11 @@ fn excluded(settings: &Settings, abs: &str) -> bool {
 }
 
 fn protected(settings: &Settings, c: &Cand) -> bool {
-    let hay = format!("{}\n{}\n{}\n{}\n{}", c.title, c.album, c.comment, c.tags, c.abs).to_lowercase();
+    let hay = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        c.title, c.album, c.comment, c.genre, c.subtitle, c.tags, c.abs
+    )
+    .to_lowercase();
     settings.keywords.iter().any(|k| {
         let k = k.trim().to_lowercase();
         !k.is_empty() && hay.contains(&k)

@@ -56,6 +56,9 @@ pub struct Env {
     pub generated_pass: bool,
     pub require_dryrun: bool,
     pub log_keep: usize,
+    /// Wie viele Dateien gleichzeitig angefasst werden. Lohnt vor allem auf
+    /// Netzwerk- und Plattenspeicher, wo jede einzelne Anfrage lange braucht.
+    pub scan_threads: usize,
 }
 
 fn var(k: &str, d: &str) -> String {
@@ -129,6 +132,16 @@ impl Env {
             generated_pass,
             require_dryrun: var("REQUIRE_DRYRUN", "true") != "false",
             log_keep: var("LOG_KEEP", "30").parse().unwrap_or(30),
+            scan_threads: var("SCAN_THREADS", "0")
+                .parse()
+                .ok()
+                .filter(|n: &usize| *n > 0)
+                .unwrap_or_else(|| {
+                    // Der Scan wartet fast nur auf die Platte, nicht auf die CPU –
+                    // deshalb ruhig mehr Threads als Kerne, aber mit Deckel.
+                    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(4, 16)
+                })
+                .clamp(1, 64),
         })
     }
 }
@@ -170,6 +183,9 @@ pub struct Settings {
     pub use_index: bool,
     /// Unveraenderte Dateien nicht erneut untersuchen, sondern aus dem Index nehmen.
     pub reuse_index: bool,
+    /// Bei zwei Dateien im selben Album streng pruefen, ob es wirklich dasselbe
+    /// Stueck ist und nicht eine andere Fassung (Live, Remix, Radio Edit ...).
+    pub strict_album_match: bool,
     /// Vor dem Loeschen pruefen, ob die Datei noch die Groesse aus dem Plan hat.
     /// Weicht sie ab, wurde sie seit der Planung ersetzt – dann bleibt sie liegen.
     pub verify_size_before_delete: bool,
@@ -204,6 +220,7 @@ impl Default for Settings {
             reuse_plan: false,
             rewrite_m3u: true,
             verify_size_before_delete: true,
+            strict_album_match: true,
         }
     }
 }
@@ -217,6 +234,7 @@ pub struct Stats {
     pub candidates: AtomicU64,
     pub duplicates: AtomicU64,
     pub same_format: AtomicU64,
+    pub album_dupes: AtomicU64,
     pub planned: AtomicU64,
     pub files: AtomicU64,
     pub reused: AtomicU64,
@@ -278,10 +296,10 @@ impl Shared {
     pub fn log(&self, msg: impl AsRef<str>) {
         let line = format!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), msg.as_ref());
         eprintln!("{line}");
-        if let Some(f) = self.logfile.lock().unwrap().as_mut() {
+        if let Some(f) = self.logfile.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             let _ = writeln!(f, "{line}");
         }
-        let mut g = self.log.lock().unwrap();
+        let mut g = self.log.lock().unwrap_or_else(|e| e.into_inner());
         g.0 += 1;
         let seq = g.0;
         g.1.push_back((seq, line));
@@ -294,7 +312,8 @@ impl Shared {
         json!({
             "total": st.total.load(Relaxed), "scanned": st.scanned.load(Relaxed),
             "candidates": st.candidates.load(Relaxed), "duplicates": st.duplicates.load(Relaxed),
-            "same_format": st.same_format.load(Relaxed), "planned": st.planned.load(Relaxed),
+            "same_format": st.same_format.load(Relaxed), "album_dupes": st.album_dupes.load(Relaxed),
+            "planned": st.planned.load(Relaxed),
             "files": st.files.load(Relaxed), "reused": st.reused.load(Relaxed),
             "unknown": st.unknown.load(Relaxed),
             "exact": st.exact.load(Relaxed),
@@ -307,11 +326,11 @@ impl Shared {
         })
     }
     pub fn phase(&self, p: &str) {
-        *self.phase.lock().unwrap() = p.to_string();
+        *self.phase.lock().unwrap_or_else(|e| e.into_inner()) = p.to_string();
     }
     fn reset_stats(&self) {
         let s = &self.stats;
-        for a in [&s.total, &s.scanned, &s.candidates, &s.duplicates, &s.same_format, &s.planned,
+        for a in [&s.total, &s.scanned, &s.candidates, &s.duplicates, &s.same_format, &s.album_dupes, &s.planned,
                   &s.files, &s.reused, &s.unknown, &s.exact,
                   &s.tags_lost, &s.protected, &s.excluded, &s.mismatch, &s.deleted, &s.bytes_freed,
                   &s.annotations, &s.playlists, &s.m3u, &s.errors] {
@@ -538,6 +557,56 @@ pub fn norm_title(t: &str, strip: bool) -> String {
     s
 }
 
+/// Woerter, die eine eigene Fassung eines Stuecks kennzeichnen. Steht eins davon
+/// nur bei einer der beiden Dateien, sind es nicht dieselben Aufnahmen.
+const VERSION_WORDS: &[&str] = &[
+    "live", "remix", "rmx", "edit", "radio", "extended", "demo", "acoustic", "akustik", "unplugged",
+    "remaster", "mono", "stereo", "version", "fassung", "alternate", "alternativ", "reprise", "bonus",
+    "interlude", "cover", "session", "rehearsal", "club", "dub", "single", "original", "orchestral",
+    "piano", "sped up", "slowed", "nightcore", "clean", "explicit", "edit)", "mix", "take",
+];
+
+/// Sind zwei Dateien desselben Albums wirklich dasselbe Stueck? Gibt den Grund
+/// zurueck, wenn nicht. Jede einzelne Pruefung sagt: "das waere bei derselben
+/// Aufnahme nicht so".
+fn unterschied(a: &Row, b: &Row) -> Option<String> {
+    // Der eindeutigste Fall: MusicBrainz benennt den Track auf dieser Veroeffentlichung.
+    let (ra, rb) = (a.rtid.trim(), b.rtid.trim());
+    if !ra.is_empty() && !rb.is_empty() && ra != rb {
+        return Some("andere MusicBrainz-Release-Track-ID".into());
+    }
+    if a.track != b.track {
+        return Some(format!("Tracknummer {} vs {}", a.track, b.track));
+    }
+    if a.disc != b.disc {
+        return Some(format!("Disc {} vs {}", a.disc, b.disc));
+    }
+    // Innerhalb eines Albums darf die Laufzeit nur minimal abweichen. Eine andere
+    // Fassung ist praktisch immer deutlich laenger oder kuerzer.
+    if (a.duration - b.duration).abs() > 1.0 {
+        return Some(format!("Laufzeit {:.1}s vs {:.1}s", a.duration, b.duration));
+    }
+    let (sa, sb) = (a.subtitle.trim(), b.subtitle.trim());
+    if !sa.is_empty() && !sb.is_empty() && !sa.eq_ignore_ascii_case(sb) {
+        return Some(format!("Disc-Untertitel '{sa}' vs '{sb}'"));
+    }
+    let ma = version_marks(&format!("{} {}", a.title, a.subtitle));
+    let mb = version_marks(&format!("{} {}", b.title, b.subtitle));
+    if ma != mb {
+        return Some(format!("Fassung unterscheidet sich ({ma:?} vs {mb:?})"));
+    }
+    None
+}
+
+/// Welche Versionsmerkmale stecken in diesem Text?
+fn version_marks(text: &str) -> Vec<&'static str> {
+    let hay = text.to_lowercase();
+    let mut v: Vec<&'static str> = VERSION_WORDS.iter().copied().filter(|w| hay.contains(w)).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
 /// Sieht der Dateiname nach einer Kopie aus ("track (1).flac")?
 pub fn is_copy_name(path: &str) -> bool {
     let stem = Path::new(path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
@@ -562,7 +631,12 @@ struct Row {
     bit_depth: i64,
     channels: i64,
     mbz: String,
+    /// MusicBrainz-Release-Track: benennt genau diesen Track auf genau dieser Veroeffentlichung
+    rtid: String,
+    disc: i64,
+    subtitle: String,
     comment: String,
+    genre: String,
     tags: String,
     tag_flags: String,
     track: i64,
@@ -691,7 +765,7 @@ pub fn run(sh: &Shared, execute: bool) {
     let logname = format!("{}-{mode}.log", started.format("%Y%m%d-%H%M%S"));
     let ldir = sh.env.config_dir.join("logs");
     let _ = fs::create_dir_all(&ldir);
-    *sh.logfile.lock().unwrap() = fs::File::create(ldir.join(&logname)).ok();
+    *sh.logfile.lock().unwrap_or_else(|e| e.into_inner()) = fs::File::create(ldir.join(&logname)).ok();
     sh.log(format!("=== START ({}) ===", if execute { "EXECUTE – echte Loeschung" } else { "DRY-RUN – es wird nichts veraendert" }));
     let (result, completed) = match run_inner(sh, execute) {
         Ok(()) if sh.halt() => ("gestoppt", false),
@@ -715,7 +789,7 @@ pub fn run(sh: &Shared, execute: bool) {
             "log": logname, "stats": sh.stats_json(),
         }),
     );
-    *sh.logfile.lock().unwrap() = None;
+    *sh.logfile.lock().unwrap_or_else(|e| e.into_inner()) = None;
     rotate(&ldir, sh.env.log_keep);
     rotate(&sh.env.config_dir.join("reports"), sh.env.log_keep * 2);
     sh.running.store(false, Relaxed);
@@ -801,7 +875,7 @@ pub fn build_zip(sh: &Shared) -> std::io::Result<fs::File> {
         env.same_exts,
         if env.match_mode == MatchMode::Album { "album" } else { "artist_title" },
         env.delete_rows,
-        serde_json::to_string(&*sh.settings.lock().unwrap()).unwrap_or_default()
+        serde_json::to_string(&*sh.settings.lock().unwrap_or_else(|e| e.into_inner())).unwrap_or_default()
     );
     zw.start_file("system-info.txt", opt)?;
     zw.write_all(info.as_bytes())?;
@@ -869,7 +943,7 @@ fn backup(sh: &Shared, w: &Connection) -> Result<PathBuf, String> {
 
 fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
     let env = &sh.env;
-    let settings = sh.settings.lock().unwrap().clone();
+    let settings = sh.settings.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if env.keep_exts.is_empty() {
         return Err("KEEP_EXTS ist leer – ohne zu behaltendes Format kann nichts entschieden werden".into());
     }
@@ -915,6 +989,17 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
         if let Some(c) = &idx {
             if let Some((old, started, n)) = crate::index::reusable_plan(c) {
                 sh.log(format!("Uebernehme den Plan des Dry-Runs vom {started} ({n} Eintraege) – es wird nicht neu gesucht"));
+                // Auch ohne neue Suche muessen die Vorabpruefungen laufen: sonst
+                // faellt eine schreibgeschuetzte Bibliothek erst beim Loeschen auf.
+                {
+                    let reader = open(env, true)?;
+                    let schema = Schema::load(&reader)?;
+                    let libs = libraries(sh, &reader)?;
+                    check_music_writable(sh, &libs);
+                    if settings.rewrite_m3u {
+                        check_m3u(sh, &reader, &schema);
+                    }
+                }
                 let rows = crate::index::plan_rows(c, old)?;
                 let mut planner = Planner::new(fs::File::create(&plan_path).map_err(|e| format!("Plan-Datei: {e}"))?)?;
                 for (ki, kp, di, dp, size, reason) in rows {
@@ -1179,7 +1264,7 @@ fn scan(
     };
     let sql = format!(
         "SELECT id, library_id, path, title, album, album_id, artist_id, {disc}, {ot}, suffix, size, duration, bit_rate, \
-                {comment}, {track}, {srate}, {depth}, {chan}, {mbz}, {tags}, {flags} \
+                {comment}, {track}, {srate}, {depth}, {chan}, {mbz}, {rtid}, {sub}, {flags} \
          FROM media_file WHERE {missing}lower(suffix) IN ({all_exts}) ORDER BY {order}",
         comment = schema.expr("comment", "''"),
         track = schema.expr("track_number", "0"),
@@ -1187,11 +1272,22 @@ fn scan(
         depth = schema.expr("bit_depth", "0"),
         chan = schema.expr("channels", "0"),
         mbz = schema.expr("mbz_recording_id", "''"),
-        tags = if schema.mf("tags") { "CAST(tags AS TEXT)" } else { "''" },
+        rtid = schema.expr("mbz_release_track_id", "''"),
+        sub = schema.expr("disc_subtitle", "''"),
         flags = schema.tag_flags_expr(),
     );
 
-    let mut ctx = Ctx { sh, env, same_exts: same_exts.to_vec(), settings: settings.clone(), libs: libs.clone(), planner };
+    let mut ctx = Ctx {
+        sh,
+        env,
+        reader,
+        has_tags: schema.mf("tags"),
+        has_genre: schema.mf("genre"),
+        same_exts: same_exts.to_vec(),
+        settings: settings.clone(),
+        libs: libs.clone(),
+        planner,
+    };
     sh.phase("scanne und plane");
 
     let mut stmt = reader.prepare(&sql).map_err(|e| format!("Abfrage vorbereiten: {e}"))?;
@@ -1227,8 +1323,12 @@ fn scan(
             bit_depth: n(r, 16),
             channels: n(r, 17),
             mbz: s(r, 18),
-            tags: s(r, 19),
-            tag_flags: s(r, 20),
+            rtid: s(r, 19),
+            subtitle: s(r, 20),
+            disc: n(r, 7),
+            genre: String::new(),
+            tags: String::new(), // wird nur fuer Kandidaten nachgeladen
+            tag_flags: s(r, 21),
         };
         let (album_id, artist_id, disc_v, raw_title) = (s(r, 5), s(r, 6), n(r, 7), s(r, 8));
         // "Song (1)" und "Song" landen damit in derselben Gruppe
@@ -1256,6 +1356,9 @@ fn scan(
 struct Ctx<'a, 'p> {
     sh: &'a Shared,
     env: &'a Env,
+    reader: &'a Connection,
+    has_tags: bool,
+    has_genre: bool,
     same_exts: Vec<String>,
     settings: Settings,
     libs: HashMap<i64, String>,
@@ -1300,7 +1403,11 @@ impl<'a, 'p> Ctx<'a, 'p> {
     }
 
     fn is_protected(&self, r: &Row, full: &Path) -> bool {
-        let hay = format!("{}\n{}\n{}\n{}\n{}", r.title, r.album, r.comment, r.tags, full.to_string_lossy()).to_lowercase();
+        let hay = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            r.title, r.album, r.comment, r.genre, r.subtitle, r.tags, full.to_string_lossy()
+        )
+        .to_lowercase();
         self.settings.keywords.iter().any(|k| {
             let k = k.trim().to_lowercase();
             !k.is_empty() && hay.contains(&k)
@@ -1335,10 +1442,30 @@ impl<'a, 'p> Ctx<'a, 'p> {
         )
     }
 
-    fn group(&mut self, g: Vec<Row>) -> Result<(), String> {
+    fn group(&mut self, mut g: Vec<Row>) -> Result<(), String> {
         if g.len() < 2 {
             return Ok(());
         }
+        // Der Tag-Block wird nur fuer die Schutz-Begriffe gebraucht. Ihn fuer jede
+        // Zeile mitzulesen kostet bei Millionen Titeln hunderte Megabyte. Hier sind
+        // es nur noch Gruppen mit mindestens zwei Dateien – ein Bruchteil davon.
+        if self.has_tags {
+            let sql = format!(
+                "SELECT CAST(tags AS TEXT), {} FROM media_file WHERE id=?1",
+                if self.has_genre { "genre" } else { "''" }
+            );
+            if let Ok(mut st) = self.reader.prepare_cached(&sql) {
+                for r in g.iter_mut() {
+                    if let Ok((t, ge)) = st.query_row(params![r.id], |x| {
+                        Ok((x.get::<_, Option<String>>(0)?, x.get::<_, Option<String>>(1)?))
+                    }) {
+                        r.tags = t.unwrap_or_default();
+                        r.genre = ge.unwrap_or_default();
+                    }
+                }
+            }
+        }
+        let g = g;
         let sh = self.sh;
         let max = self.settings.max_delete;
         if max > 0 && sh.stats.duplicates.load(Relaxed) >= max {
@@ -1427,11 +1554,25 @@ impl<'a, 'p> Ctx<'a, 'p> {
                 sh.log(format!("SKIP (Tracknummer {} vs {} bei gleichem Format): {}", d.track, keeper.track, d.path));
                 continue;
             }
+            // Zwei Dateien im selben Album: hier muss es wirklich 1:1 dasselbe
+            // Stueck sein. Eine andere Fassung – Live, Remix, Radio Edit – traegt
+            // oft denselben Titel und waere sonst nicht zu unterscheiden.
+            let same_album = d.album.eq_ignore_ascii_case(&keeper.album) && !d.album.trim().is_empty();
+            if same_album && self.settings.strict_album_match {
+                if let Some(grund) = unterschied(&keeper, &d) {
+                    sh.stats.mismatch.fetch_add(1, Relaxed);
+                    sh.log(format!("SKIP (im selben Album, aber {grund}): {}", d.path));
+                    continue;
+                }
+            }
             let mut reason = if same_format {
                 format!("gleiches-format:{}", d.suffix)
             } else {
                 format!("{}->{}", d.suffix, keeper.suffix)
             };
+            if same_album {
+                reason.push_str(";album-dublette");
+            }
             // Tags: haette die zu loeschende Datei Felder, die der behaltenen fehlen?
             let lost = d.tags_missing_in(&keeper);
             if !lost.is_empty() {
@@ -1460,6 +1601,9 @@ impl<'a, 'p> Ctx<'a, 'p> {
             sh.stats.duplicates.fetch_add(1, Relaxed);
             if same_format {
                 sh.stats.same_format.fetch_add(1, Relaxed);
+            }
+            if same_album {
+                sh.stats.album_dupes.fetch_add(1, Relaxed);
             }
             if !self.sh.execute.load(Relaxed) {
                 sh.stats.bytes_freed.fetch_add(d.size.max(0) as u64, Relaxed);
@@ -1565,6 +1709,13 @@ fn apply(
 /// Verschiebt eine Datei in den Papierkorb und behaelt dabei ihren Pfad bei,
 /// damit man sie spaeter zuordnen (und zurueckschieben) kann.
 fn to_trash(root: &Path, file: &Path) -> std::io::Result<PathBuf> {
+    // Ein ".." im Pfad wuerde sonst aus dem Papierkorb herausfuehren.
+    if file.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Pfad enthaelt '..' – wird nicht in den Papierkorb verschoben",
+        ));
+    }
     let rel = file.to_string_lossy().trim_start_matches('/').replace(':', "_");
     let mut target = root.join(&rel);
     if let Some(dir) = target.parent() {
@@ -2180,7 +2331,7 @@ mod tests {
     /// Die aelteren Tests pruefen gezielt die Gruppierung ueber die Navidrome-Datenbank.
     fn db_mode(env: Env) -> Shared {
         let sh = Shared::new(env);
-        sh.settings.lock().unwrap().mode = "db".into();
+        sh.settings.lock().unwrap_or_else(|e| e.into_inner()).mode = "db".into();
         sh
     }
 
@@ -2247,6 +2398,7 @@ mod tests {
         order_album_artist_name varchar collate NOCASE default '' not null,
         mbz_recording_id varchar default '' not null,
         mbz_album_id varchar default '' not null,
+        mbz_release_track_id varchar default '' not null,
         channels integer default 0 not null,
         lyrics jsonb default '[]' not null,
         sample_rate integer default 0 not null,
@@ -2458,6 +2610,7 @@ mod tests {
             generated_pass: false,
             require_dryrun: false,
             log_keep: 5,
+            scan_threads: 2,
         };
         (env, music, cfg)
     }
@@ -2519,7 +2672,7 @@ mod tests {
         let (env, music, _cfg) = fixture();
         add_copy_pair(&env, &music);
         let sh = db_mode(env);
-        sh.settings.lock().unwrap().strip_copy_suffix = false;
+        sh.settings.lock().unwrap_or_else(|e| e.into_inner()).strip_copy_suffix = false;
         run(&sh, true);
         assert!(music.join("g3 (1).flac").exists(), "ohne Normalisierung bleibt die Kopie liegen");
         assert_eq!(sh.stats.tags_lost.load(Relaxed), 0);
@@ -2530,7 +2683,7 @@ mod tests {
         let (env, music, _cfg) = fixture();
         add_copy_pair(&env, &music);
         let sh = db_mode(env);
-        sh.settings.lock().unwrap().skip_on_tag_loss = true;
+        sh.settings.lock().unwrap_or_else(|e| e.into_inner()).skip_on_tag_loss = true;
         run(&sh, true);
         assert!(music.join("g3 (1).flac").exists(), "Tag-Verlust verhindert das Loeschen");
         assert_eq!(sh.stats.tags_lost.load(Relaxed), 1);
@@ -2577,7 +2730,7 @@ mod tests {
 
     fn content_mode(env: Env) -> Shared {
         let sh = Shared::new(env);
-        let mut st = sh.settings.lock().unwrap();
+        let mut st = sh.settings.lock().unwrap_or_else(|e| e.into_inner());
         st.mode = "content".into();
         drop(st);
         sh
@@ -2656,7 +2809,7 @@ mod tests {
         let (env, music, _cfg) = content_fixture();
         let trash = env.trash_dir.clone();
         let sh = content_mode(env);
-        sh.settings.lock().unwrap().use_trash = true;
+        sh.settings.lock().unwrap_or_else(|e| e.into_inner()).use_trash = true;
         run(&sh, true);
         assert!(!music.join("Downloads/irgendwas.flac").exists(), "aus der Bibliothek verschwunden");
         let found = walk_find(&trash, "irgendwas.flac");
@@ -2778,7 +2931,7 @@ mod tests {
         run(&sh, false);
         assert_eq!(sh.stats.planned.load(Relaxed), 1, "ein Duplikat vorgemerkt");
 
-        sh.settings.lock().unwrap().reuse_plan = true;
+        sh.settings.lock().unwrap_or_else(|e| e.into_inner()).reuse_plan = true;
         run(&sh, true);
         assert_eq!(sh.stats.files.load(Relaxed), 0, "der echte Lauf durchsucht nichts mehr");
         assert_eq!(sh.stats.deleted.load(Relaxed), 1, "er wendet den gespeicherten Plan an");
@@ -2860,7 +3013,7 @@ mod tests {
         }
         let sh = db_mode(env);
         let db = sh.env.db_path.clone();
-        sh.settings.lock().unwrap().playlist_keep_duplicates = false;
+        sh.settings.lock().unwrap_or_else(|e| e.into_inner()).playlist_keep_duplicates = false;
         run(&sh, true);
         assert_eq!(sh.stats.errors.load(Relaxed), 0);
         let c = Connection::open(&db).unwrap();
@@ -3008,7 +3161,7 @@ mod tests {
         }
         let sh = db_mode(env);
         run(&sh, false); // schon der Dry-Run muss warnen
-        let log: String = sh.log.lock().unwrap().1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+        let log: String = sh.log.lock().unwrap_or_else(|e| e.into_inner()).1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
         assert!(log.contains("nicht schreibbar"), "schreibgeschuetzte Datei gemeldet:\n{log}");
         assert!(log.contains("nicht gefunden"), "fehlende Datei gemeldet:\n{log}");
         assert!(log.contains("ACHTUNG"), "zusammenfassende Warnung:\n{log}");
@@ -3031,7 +3184,7 @@ mod tests {
         }
         let sh = db_mode(env);
         run(&sh, false);
-        let log: String = sh.log.lock().unwrap().1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+        let log: String = sh.log.lock().unwrap_or_else(|e| e.into_inner()).1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
         assert!(log.contains("beschreibbar"), "Bestaetigung im Protokoll:\n{log}");
         assert!(!log.contains("ACHTUNG"), "keine Warnung noetig:\n{log}");
     }
@@ -3100,7 +3253,7 @@ mod tests {
         let sh = db_mode(env);
         run(&sh, true);
         assert_eq!(fs::read(&m3u).unwrap(), bytes, "die Datei wurde nicht angefasst");
-        let log: String = sh.log.lock().unwrap().1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+        let log: String = sh.log.lock().unwrap_or_else(|e| e.into_inner()).1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
         assert!(log.contains("nicht UTF-8"), "deutliche Meldung statt stiller Beschaedigung:\n{log}");
     }
 
@@ -3134,7 +3287,7 @@ mod tests {
 
     fn mit_plan(env: Env) -> Shared {
         let sh = db_mode(env);
-        let mut st = sh.settings.lock().unwrap();
+        let mut st = sh.settings.lock().unwrap_or_else(|e| e.into_inner());
         st.reuse_plan = true;
         drop(st);
         sh
@@ -3207,7 +3360,7 @@ mod tests {
         let sh = content_mode(env);
         run(&sh, false);
         let protokoll = |sh: &Shared| -> String {
-            sh.log.lock().unwrap().1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n")
+            sh.log.lock().unwrap_or_else(|e| e.into_inner()).1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n")
         };
         assert!(protokoll(&sh).contains("Navidrome-Eintraege zugeordnet"), "erster Lauf liest ein");
 
@@ -3237,7 +3390,7 @@ mod tests {
             .unwrap();
         }
         let sh = content_mode(env);
-        sh.settings.lock().unwrap().keywords = vec!["karaoke".into()];
+        sh.settings.lock().unwrap_or_else(|e| e.into_inner()).keywords = vec!["karaoke".into()];
         run(&sh, true);
         assert_eq!(sh.stats.protected.load(Relaxed), 1, "Schutz-Begriff aus dem Tag-Block erkannt");
         assert!(music.join("Downloads/irgendwas.flac").exists(), "geschuetzt, also nicht geloescht");
@@ -3253,7 +3406,7 @@ mod tests {
         }
         let sh = db_mode(env);
         run(&sh, false); // schon der Dry-Run muss warnen
-        let log: String = sh.log.lock().unwrap().1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+        let log: String = sh.log.lock().unwrap_or_else(|e| e.into_inner()).1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -3268,7 +3421,7 @@ mod tests {
         let (env, music, _cfg) = fixture();
         let sh = db_mode(env);
         run(&sh, false);
-        let log: String = sh.log.lock().unwrap().1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+        let log: String = sh.log.lock().unwrap_or_else(|e| e.into_inner()).1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
         assert!(!log.contains("laesst sich nichts anlegen"), "keine Warnung noetig:\n{log}");
         let reste: Vec<String> = fs::read_dir(&music)
             .unwrap()
@@ -3277,6 +3430,315 @@ mod tests {
             .filter(|n| n.starts_with(".nd-dedupe"))
             .collect();
         assert!(reste.is_empty(), "die Testdatei wurde wieder entfernt, gefunden: {reste:?}");
+    }
+
+    // ───────── Album-Dubletten: 1:1 oder andere Fassung? ─────────
+
+    /// Legt zwei Dateien mit gleichem Titel im selben Album an.
+    /// `extra` passt die zweite Zeile danach an.
+    fn album_paar(env: &Env, music: &Path, extra: &str) {
+        fs::write(music.join("a1.flac"), vec![b'1'; 900]).unwrap();
+        fs::write(music.join("a2.flac"), vec![b'2'; 800]).unwrap();
+        let c = Connection::open(&env.db_path).unwrap();
+        let ins = "INSERT INTO media_file (id, library_id, path, title, album, album_id, artist_id, \
+                   disc_number, order_title, suffix, size, duration, bit_rate, comment, track_number, \
+                   sample_rate, bit_depth, channels, mbz_recording_id, mbz_release_track_id, disc_subtitle, \
+                   tags, missing, genre) \
+                   VALUES (?1, 1, ?2, 'Lied', 'Das Album', 'albX', 'art1', 1, 'lied', 'flac', ?3, 210.0, \
+                   900, '', 4, 44100, 16, 2, '', '', '', '{}', 0, 'Pop')";
+        c.execute(ins, params!["alpha", "a1.flac", 900]).unwrap();
+        c.execute(ins, params!["beta", "a2.flac", 800]).unwrap();
+        if !extra.is_empty() {
+            c.execute(extra, []).unwrap();
+        }
+    }
+
+    fn laeuft(env: Env) -> Shared {
+        let sh = db_mode(env);
+        sh.settings.lock().unwrap_or_else(|e| e.into_inner()).dedupe_flac = true;
+        run(&sh, true);
+        sh
+    }
+
+    #[test]
+    fn echte_dublette_im_album_wird_entfernt() {
+        let (env, music, _cfg) = fixture();
+        album_paar(&env, &music, "");
+        let sh = laeuft(env);
+        assert!(sh.stats.album_dupes.load(Relaxed) >= 1, "als Album-Dublette gezaehlt");
+        assert!(music.join("a1.flac").exists(), "die groessere bleibt");
+        assert!(!music.join("a2.flac").exists(), "die Dublette geht");
+    }
+
+    #[test]
+    fn andere_laufzeit_im_album_ist_eine_andere_fassung() {
+        let (env, music, _cfg) = fixture();
+        // 2,5 s laenger: innerhalb der allgemeinen Toleranz von 3 s, aber fuer
+        // dasselbe Stueck auf demselben Album zu viel
+        album_paar(&env, &music, "UPDATE media_file SET duration=212.5 WHERE id='beta'");
+        let sh = laeuft(env);
+        assert!(music.join("a2.flac").exists(), "bleibt liegen");
+        assert!(music.join("a1.flac").exists(), "und die andere auch");
+    }
+
+    #[test]
+    fn andere_release_track_id_ist_ein_anderer_track() {
+        let (env, music, _cfg) = fixture();
+        album_paar(&env, &music, "UPDATE media_file SET mbz_release_track_id='aaa' WHERE id='alpha'");
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("UPDATE media_file SET mbz_release_track_id='bbb' WHERE id='beta'", []).unwrap();
+        }
+        let sh = laeuft(env);
+        assert!(music.join("a2.flac").exists(), "MusicBrainz sagt: anderer Track");
+        assert_eq!(sh.stats.errors.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn live_fassung_mit_gleichem_titel_bleibt() {
+        let (env, music, _cfg) = fixture();
+        // Gleicher Titel, gleiche Laufzeit, gleicher Track – nur der
+        // Disc-Untertitel verraet, dass es die Live-Aufnahme ist.
+        album_paar(&env, &music, "UPDATE media_file SET disc_subtitle='Live in Hamburg' WHERE id='beta'");
+        let sh = laeuft(env);
+        assert!(music.join("a2.flac").exists(), "andere Fassung bleibt");
+    }
+
+    #[test]
+    fn andere_tracknummer_auch_ueber_formatgrenzen_hinweg() {
+        // Vorher erlaubt: mp3 und flac mit gleichem Titel im selben Album, aber
+        // verschiedenen Tracknummern – typisch fuer Album- und Live-Fassung
+        // auf einer Zusammenstellung.
+        let (env, music, _cfg) = fixture();
+        fs::write(music.join("b1.flac"), vec![b'1'; 900]).unwrap();
+        fs::write(music.join("b2.mp3"), vec![b'2'; 300]).unwrap();
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            let ins = "INSERT INTO media_file (id, library_id, path, title, album, album_id, artist_id, \
+                       disc_number, order_title, suffix, size, duration, bit_rate, comment, track_number, \
+                       sample_rate, bit_depth, channels, mbz_recording_id, tags, missing, genre) \
+                       VALUES (?1, 1, ?2, 'Hit', 'Best Of', 'albB', 'art1', 1, 'hit', ?3, ?4, 210.0, \
+                       ?5, '', ?6, 44100, ?7, 2, '', '{}', 0, 'Pop')";
+            c.execute(ins, params!["bflac", "b1.flac", "flac", 900, 900, 5, 16]).unwrap();
+            c.execute(ins, params!["bmp3", "b2.mp3", "mp3", 300, 320, 12, 0]).unwrap();
+        }
+        let sh = laeuft(env);
+        assert!(music.join("b2.mp3").exists(), "Track 5 und Track 12 sind nicht dasselbe Stueck");
+    }
+
+    #[test]
+    fn strenge_pruefung_laesst_sich_abschalten() {
+        let (env, music, _cfg) = fixture();
+        album_paar(&env, &music, "UPDATE media_file SET duration=212.5 WHERE id='beta'");
+        let sh = db_mode(env);
+        sh.settings.lock().unwrap_or_else(|e| e.into_inner()).strict_album_match = false;
+        run(&sh, true);
+        assert!(!music.join("a2.flac").exists(), "ohne strenge Pruefung greift nur die allgemeine Toleranz");
+    }
+
+    #[test]
+    fn versionsmerkmale_werden_erkannt() {
+        assert_eq!(version_marks("Lied"), Vec::<&str>::new());
+        assert!(version_marks("Lied (Live)").contains(&"live"));
+        assert!(version_marks("Lied - Radio Edit").contains(&"radio"));
+        assert!(version_marks("Lied (2024 Remaster)").contains(&"remaster"));
+        assert_eq!(version_marks("Lied (Live)"), version_marks("LIED live"), "Gross- und Kleinschreibung egal");
+    }
+
+    // ───────── Messlatte: Erkennungs- und Fehlerquote ─────────
+    //
+    // Baut eine Bibliothek, bei der fuer jede Datei feststeht, ob sie weg darf.
+    // Fuenf Arten echter Duplikate stehen sieben Arten von Fallen gegenueber.
+    // Der Test haelt die Messlatte fest: mindestens 99 % gefunden, hoechstens
+    // 1 % Fehlgriffe. Er hat beim Schreiben zwei echte Maengel aufgedeckt –
+    // Genre als Schutz-Begriff und die Wahl der falschen Kopie.
+
+    struct Messlatte {
+        soll_weg: Vec<String>,
+        darf_nicht_weg: Vec<String>,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mf(c: &Connection, id: &str, rel: &str, title: &str, album: &str, albid: &str, suffix: &str,
+          size: i64, dur: f64, br: i64, trk: i64, depth: Option<i64>, genre: &str, rtid: &str, sub: &str) {
+        c.execute(
+            "INSERT INTO media_file (id, library_id, path, title, album, album_id, artist, artist_id, \
+             disc_number, order_title, suffix, size, duration, bit_rate, comment, track_number, \
+             sample_rate, bit_depth, channels, mbz_recording_id, mbz_release_track_id, disc_subtitle, \
+             tags, missing, genre) VALUES (?1,1,?2,?3,?4,?5,'Band','art1',1,?6,?7,?8,?9,?10,'',?11,44100,?12,2,'',?13,?14,'{}',0,?15)",
+            params![id, rel, title, album, albid, title.to_lowercase(), suffix, size, dur, br, trk, depth, rtid, sub, genre],
+        )
+        .unwrap();
+    }
+
+    fn messlatte_bauen(env: &Env, music: &Path) -> Messlatte {
+        let c = Connection::open(&env.db_path).unwrap();
+        let mut m = Messlatte { soll_weg: vec![], darf_nicht_weg: vec![] };
+        let schreib = |rel: &str, data: Vec<u8>| -> String {
+            let f = music.join(rel);
+            fs::create_dir_all(f.parent().unwrap()).unwrap();
+            fs::write(&f, data).unwrap();
+            f.to_string_lossy().to_string()
+        };
+        let mp3 = |tag: u8, n: usize, taglen: u8| {
+            let mut v = b"ID3\x04\x00\x00\x00\x00\x00".to_vec();
+            v.push(taglen);
+            v.extend(std::iter::repeat(b'T').take(taglen as usize));
+            v.extend(std::iter::repeat(tag).take(n));
+            v
+        };
+        for i in 0..8u8 {
+            let md5 = [8 + i; 16];
+            // 1. identische FLACs im selben Album, eine mit Kopie-Zaehler
+            let a = format!("Band/Album {i}/01 Lied.flac");
+            let b = format!("Band/Album {i}/01 Lied (1).flac");
+            schreib(&a, crate::audio::flac_bytes(md5, 44100, 16, 2, 441000, 300));
+            let bp = schreib(&b, crate::audio::flac_bytes(md5, 44100, 16, 2, 441000, 500));
+            mf(&c, &format!("a{i}k"), &a, "Lied", &format!("Album {i}"), &format!("alA{i}"), "flac", 300, 200.0, 900, 1, Some(16), "Pop", "", "");
+            mf(&c, &format!("a{i}d"), &b, "Lied", &format!("Album {i}"), &format!("alA{i}"), "flac", 500, 200.0, 900, 1, Some(16), "Pop", "", "");
+            m.soll_weg.push(bp);
+
+            // 2. MP3 neben FLAC im selben Album
+            let a = format!("Band/B-Album {i}/02 Stueck.flac");
+            let b = format!("Band/B-Album {i}/02 Stueck.mp3");
+            schreib(&a, crate::audio::flac_bytes([16 + i; 16], 44100, 16, 2, 441000, 400));
+            let bp = schreib(&b, mp3(130 + i, 1500, 20));
+            mf(&c, &format!("b{i}k"), &a, "Stueck", &format!("B-Album {i}"), &format!("alB{i}"), "flac", 400, 180.0, 900, 2, Some(16), "Pop", "", "");
+            mf(&c, &format!("b{i}d"), &b, "Stueck", &format!("B-Album {i}"), &format!("alB{i}"), "mp3", 1529, 180.0, 320, 2, None, "Pop", "", "");
+            m.soll_weg.push(bp);
+
+            // 3. zwei MP3s, kein FLAC – die schlechtere geht
+            let a = format!("Band/C-Album {i}/03 Song.mp3");
+            let b = format!("Band/C-Album {i}/03 Song [128].mp3");
+            schreib(&a, mp3(140 + i, 2500, 20));
+            let bp = schreib(&b, mp3(150 + i, 900, 20));
+            mf(&c, &format!("c{i}k"), &a, "Song", &format!("C-Album {i}"), &format!("alC{i}"), "mp3", 2529, 170.0, 320, 3, None, "Pop", "", "");
+            mf(&c, &format!("c{i}d"), &b, "Song", &format!("C-Album {i}"), &format!("alC{i}"), "mp3", 929, 170.0, 128, 3, None, "Pop", "", "");
+            m.soll_weg.push(bp);
+
+            // 4. inhaltsgleich, voellig andere Tags, anderer Ordner
+            let md5 = [24 + i; 16];
+            let a = format!("Band/D-Album {i}/04 Titel.flac");
+            let b = format!("Downloads/zufall_{i}.flac");
+            schreib(&a, crate::audio::flac_bytes(md5, 44100, 16, 2, 441000, 600));
+            let bp = schreib(&b, crate::audio::flac_bytes(md5, 44100, 16, 2, 441000, 900));
+            mf(&c, &format!("d{i}k"), &a, "Titel", &format!("D-Album {i}"), &format!("alD{i}"), "flac", 600, 190.0, 900, 4, Some(16), "Pop", "", "");
+            mf(&c, &format!("d{i}d"), &b, &format!("zufall {i}"), "Unsortiert", "alU", "flac", 900, 190.0, 900, 1, Some(16), "", "", "");
+            m.soll_weg.push(bp);
+
+            // ── Fallen ──
+            // 5. Live-Fassung: gleicher Titel, anderer Track, laenger
+            let a = format!("Band/F-Album {i}/06 Hit.flac");
+            let b = format!("Band/F-Album {i}/12 Hit.flac");
+            schreib(&a, crate::audio::flac_bytes([32 + i; 16], 44100, 16, 2, 441000, 300));
+            let bp = schreib(&b, crate::audio::flac_bytes([40 + i; 16], 44100, 16, 2, 441000, 310));
+            mf(&c, &format!("f1{i}a"), &a, "Hit", &format!("F-Album {i}"), &format!("alF{i}"), "flac", 300, 200.0, 900, 6, Some(16), "Pop", "", "");
+            mf(&c, &format!("f1{i}b"), &b, "Hit", &format!("F-Album {i}"), &format!("alF{i}"), "flac", 310, 243.0, 900, 12, Some(16), "Pop", "", "Live in Berlin");
+            m.darf_nicht_weg.push(bp);
+
+            // 6. Radio Edit: gleicher Track, nur 2 s kuerzer
+            let a = format!("Band/G-Album {i}/07 Welle.flac");
+            let b = format!("Band/G-Album {i}/07 Welle radio.flac");
+            schreib(&a, crate::audio::flac_bytes([48 + i; 16], 44100, 16, 2, 441000, 300));
+            let bp = schreib(&b, crate::audio::flac_bytes([56 + i; 16], 44100, 16, 2, 441000, 305));
+            mf(&c, &format!("f2{i}a"), &a, "Welle", &format!("G-Album {i}"), &format!("alG{i}"), "flac", 300, 210.0, 900, 7, Some(16), "Pop", "", "");
+            mf(&c, &format!("f2{i}b"), &b, "Welle", &format!("G-Album {i}"), &format!("alG{i}"), "flac", 305, 208.0, 900, 7, Some(16), "Pop", "", "Radio Edit");
+            m.darf_nicht_weg.push(bp);
+
+            // 7. andere Tracknummer ueber Formatgrenzen hinweg
+            let a = format!("Band/H-Album {i}/05 Nacht.flac");
+            let b = format!("Band/H-Album {i}/11 Nacht.mp3");
+            schreib(&a, crate::audio::flac_bytes([64 + i; 16], 44100, 16, 2, 441000, 300));
+            let bp = schreib(&b, mp3(160 + i, 1200, 20));
+            mf(&c, &format!("f3{i}a"), &a, "Nacht", &format!("H-Album {i}"), &format!("alH{i}"), "flac", 300, 200.0, 900, 5, Some(16), "Pop", "", "");
+            mf(&c, &format!("f3{i}b"), &b, "Nacht", &format!("H-Album {i}"), &format!("alH{i}"), "mp3", 1229, 200.0, 320, 11, None, "Pop", "", "");
+            m.darf_nicht_weg.push(bp);
+
+            // 8. andere MusicBrainz-Release-Track-ID
+            let a = format!("Band/I-Album {i}/08 Tag.flac");
+            let b = format!("Band/I-Album {i}/08 Tag b.flac");
+            schreib(&a, crate::audio::flac_bytes([72 + i; 16], 44100, 16, 2, 441000, 300));
+            let bp = schreib(&b, crate::audio::flac_bytes([80 + i; 16], 44100, 16, 2, 441000, 320));
+            mf(&c, &format!("f4{i}a"), &a, "Tag", &format!("I-Album {i}"), &format!("alI{i}"), "flac", 300, 200.0, 900, 8, Some(16), "Pop", &format!("rt{i}a"), "");
+            mf(&c, &format!("f4{i}b"), &b, "Tag", &format!("I-Album {i}"), &format!("alI{i}"), "flac", 320, 200.0, 900, 8, Some(16), "Pop", &format!("rt{i}b"), "");
+            m.darf_nicht_weg.push(bp);
+
+            // 9. verschiedene Aufnahmen, identisch getaggt, 2,5 s Unterschied
+            let a = format!("Band/J-Album {i}/09 Wind.flac");
+            let b = format!("Band/J-Album {i}/09 Wind b.flac");
+            schreib(&a, crate::audio::flac_bytes([88 + i; 16], 44100, 16, 2, 441000, 300));
+            let bp = schreib(&b, crate::audio::flac_bytes([96 + i; 16], 44100, 16, 2, 441000, 340));
+            mf(&c, &format!("f5{i}a"), &a, "Wind", &format!("J-Album {i}"), &format!("alJ{i}"), "flac", 300, 200.0, 900, 9, Some(16), "Pop", "", "");
+            mf(&c, &format!("f5{i}b"), &b, "Wind", &format!("J-Album {i}"), &format!("alJ{i}"), "flac", 340, 202.5, 900, 9, Some(16), "Pop", "", "");
+            m.darf_nicht_weg.push(bp);
+
+            // 10. Instrumentalfassung – nur das Genre verraet es
+            let a = format!("Band/K-Album {i}/10 Ruhe.flac");
+            let b = format!("Band/K-Album {i}/10 Ruhe.mp3");
+            schreib(&a, crate::audio::flac_bytes([104 + i; 16], 44100, 16, 2, 441000, 300));
+            let bp = schreib(&b, mp3(170 + i, 1100, 20));
+            mf(&c, &format!("f6{i}a"), &a, "Ruhe", &format!("K-Album {i}"), &format!("alK{i}"), "flac", 300, 200.0, 900, 10, Some(16), "Pop", "", "");
+            mf(&c, &format!("f6{i}b"), &b, "Ruhe", &format!("K-Album {i}"), &format!("alK{i}"), "mp3", 1129, 200.0, 320, 10, None, "Instrumental", "", "");
+            m.darf_nicht_weg.push(bp);
+
+            // 11. Einzelstueck ohne Partner
+            let a = format!("Band/L-Album {i}/01 Allein {i}.flac");
+            let ap = schreib(&a, crate::audio::flac_bytes([112 + i; 16], 44100, 16, 2, 441000, 300 + i as usize));
+            mf(&c, &format!("f7{i}"), &a, &format!("Allein {i}"), &format!("L-Album {i}"), &format!("alL{i}"), "flac", 300, 200.0, 900, 1, Some(16), "Pop", "", "");
+            m.darf_nicht_weg.push(ap);
+        }
+        m
+    }
+
+    #[test]
+    fn erkennungsrate_und_fehlerquote() {
+        let (env, music, cfg) = fixture();
+        {
+            // die Grund-Fixture stoert hier nur
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("DELETE FROM playlist_tracks", []).unwrap();
+            c.execute("DELETE FROM annotation", []).unwrap();
+            c.execute("DELETE FROM media_file", []).unwrap();
+        }
+        let m = messlatte_bauen(&env, &music);
+        let sh = Shared::new(env); // Standard: Dateiinhalt + Datenbank
+        run(&sh, false);
+        assert_eq!(sh.stats.errors.load(Relaxed), 0, "Dry-Run ohne Fehler");
+
+        let plan = fs::read_dir(cfg.join("reports"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.to_string_lossy().ends_with("plan.tsv"))
+            .expect("Plan-Datei");
+        let geplant: HashSet<String> = fs::read_to_string(&plan)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+            .filter_map(|l| l.split('\t').nth(3).map(unesc))
+            .collect();
+
+        let gefunden = m.soll_weg.iter().filter(|p| geplant.contains(*p)).count();
+        let fehlgriffe = m.darf_nicht_weg.iter().filter(|p| geplant.contains(*p)).count();
+        let erkennung = 100.0 * gefunden as f64 / m.soll_weg.len() as f64;
+        let quote = 100.0 * fehlgriffe as f64 / m.darf_nicht_weg.len() as f64;
+        let offen: Vec<&String> = m.soll_weg.iter().filter(|p| !geplant.contains(*p)).collect();
+        let daneben: Vec<&String> = m.darf_nicht_weg.iter().filter(|p| geplant.contains(*p)).collect();
+
+        assert!(
+            erkennung >= 99.0,
+            "Erkennung {erkennung:.1} % ({gefunden}/{}) – nicht gefunden: {offen:#?}",
+            m.soll_weg.len()
+        );
+        assert!(
+            quote <= 1.0,
+            "Fehlgriffe {quote:.1} % ({fehlgriffe}/{}) – falsch geplant: {daneben:#?}",
+            m.darf_nicht_weg.len()
+        );
+        // Kein Eintrag darf eine Datei treffen, die in keiner der beiden Listen steht
+        let bekannt: HashSet<&String> = m.soll_weg.iter().chain(m.darf_nicht_weg.iter()).collect();
+        let fremd: Vec<&String> = geplant.iter().filter(|p| !bekannt.contains(p)).collect();
+        assert!(fremd.is_empty(), "unerwartete Eintraege im Plan: {fremd:#?}");
     }
 
     #[test]
@@ -3366,7 +3828,7 @@ mod tests {
         let (env, music, _cfg) = fixture();
         let sh = db_mode(env);
         {
-            let mut s = sh.settings.lock().unwrap();
+            let mut s = sh.settings.lock().unwrap_or_else(|e| e.into_inner());
             s.keywords = vec!["song one".into()]; // trifft Gruppe 1 ueber den Titel
             s.max_delete = 0;
         }
@@ -3408,7 +3870,7 @@ mod tests {
     fn flac_dedupe_can_be_disabled() {
         let (env, music, _cfg) = fixture();
         let sh = db_mode(env);
-        sh.settings.lock().unwrap().dedupe_flac = false;
+        sh.settings.lock().unwrap_or_else(|e| e.into_inner()).dedupe_flac = false;
         run(&sh, true);
         assert!(music.join("g2-lo.flac").exists(), "ohne FLAC-Bereinigung bleiben beide FLACs");
         assert!(!music.join("g1.mp3").exists(), "mp3 wird trotzdem entfernt");

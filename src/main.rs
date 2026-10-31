@@ -87,7 +87,7 @@ struct Since {
 fn warnings(app: &App) -> Vec<String> {
     const TTL: i64 = 15;
     let now = chrono::Utc::now().timestamp();
-    let mut c = app.warn_cache.lock().unwrap();
+    let mut c = app.warn_cache.lock().unwrap_or_else(|e| e.into_inner());
     if c.0 + TTL > now {
         return c.1.clone();
     }
@@ -107,7 +107,7 @@ fn warnings(app: &App) -> Vec<String> {
 
 async fn status(State(app): State<App>, Query(q): Query<Since>) -> Json<serde_json::Value> {
     let (next, lines): (u64, Vec<(u64, String)>) = {
-        let g = app.log.lock().unwrap();
+        let g = app.log.lock().unwrap_or_else(|e| e.into_inner());
         let since = q.since.unwrap_or(0);
         (g.0, g.1.iter().filter(|(i, _)| *i > since).cloned().collect())
     };
@@ -127,7 +127,7 @@ async fn status(State(app): State<App>, Query(q): Query<Since>) -> Json<serde_js
         "version": VERSION,
         "running": running,
         "execute": app.execute.load(Relaxed),
-        "phase": *app.phase.lock().unwrap(),
+        "phase": *app.phase.lock().unwrap_or_else(|e| e.into_inner()),
         "stats": stats,
         "elapsed": elapsed,
         "rate": (rate * 10.0).round() / 10.0,
@@ -148,7 +148,18 @@ fn spawn_run(app: &App, execute: bool) -> bool {
         return false;
     }
     let a = app.clone();
-    std::thread::spawn(move || engine::run(&a, execute));
+    std::thread::spawn(move || {
+        // Ohne diesen Fangarm bliebe nach einem Absturz im Lauf "laeuft gerade"
+        // stehen – und kein weiterer Lauf waere mehr moeglich.
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine::run(&a, execute)));
+        if r.is_err() {
+            a.stats.errors.fetch_add(1, Relaxed);
+            a.log("FEHLER: Der Lauf ist unerwartet abgestuerzt. Es wurde nichts weiter veraendert; \
+                   Einzelheiten stehen im Container-Log.");
+            *a.phase.lock().unwrap_or_else(|e| e.into_inner()) = "abgestuerzt".into();
+        }
+        a.running.store(false, Relaxed);
+    });
     true
 }
 
@@ -173,7 +184,7 @@ async fn stop(State(app): State<App>) -> Json<serde_json::Value> {
 }
 
 async fn get_cfg(State(app): State<App>) -> Json<Settings> {
-    Json(app.settings.lock().unwrap().clone())
+    Json(app.settings.lock().unwrap_or_else(|e| e.into_inner()).clone())
 }
 
 async fn set_cfg(State(app): State<App>, Json(mut s): Json<Settings>) -> impl IntoResponse {
@@ -195,7 +206,7 @@ async fn set_cfg(State(app): State<App>, Json(mut s): Json<Settings>) -> impl In
     if let Err(e) = engine::save_settings(&app.env, &s) {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("speichern fehlgeschlagen: {e}")).into_response();
     }
-    *app.settings.lock().unwrap() = s;
+    *app.settings.lock().unwrap_or_else(|e| e.into_inner()) = s;
     app.log("Konfiguration gespeichert");
     StatusCode::OK.into_response()
 }
