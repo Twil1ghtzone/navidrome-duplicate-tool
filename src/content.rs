@@ -309,6 +309,27 @@ fn walk(
     Ok(())
 }
 
+/// Verteilt eine Aufgabe ueber mehrere Threads. Der Bibliotheks-Scan wartet fast
+/// nur auf die Platte; nacheinander zu fragen verschenkt auf Netzwerkspeicher und
+/// Festplatten den groessten Teil der moeglichen Geschwindigkeit.
+fn parallel<T: Sync, R: Send>(threads: usize, items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let n = threads.max(1).min(items.len());
+    if n <= 1 {
+        return items.iter().map(&f).collect();
+    }
+    let chunk = items.len().div_ceil(n);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = items
+            .chunks(chunk)
+            .map(|teil| {
+                let fref = &f;
+                scope.spawn(move || teil.iter().map(fref).collect::<Vec<R>>())
+            })
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().expect("Scan-Thread abgestuerzt")).collect()
+    })
+}
+
 /// Legt einen Stapel gefundener Dateien im Index ab. Unveraenderte Dateien
 /// werden nicht erneut untersucht – das ist der eigentliche Zeitgewinn.
 fn store(
@@ -337,20 +358,28 @@ fn store(
             fresh.push(hit);
         }
     }
-    // 2. Nur die uebrigen Dateien wirklich oeffnen
+    // 2. Nur die uebrigen Dateien wirklich oeffnen – und das parallel,
+    //    weil dabei fast nur auf die Platte gewartet wird.
+    let offen: Vec<&Found> = batch.iter().zip(fresh.iter()).filter(|(_, h)| !**h).map(|(f, _)| f).collect();
+    let ergebnis = parallel(sh.env.scan_threads, &offen, |f| match audio::probe(Path::new(&f.abs)) {
+        Ok(i) => Ok(i),
+        Err(e) => Err(format!("FEHLER beim Lesen von {}: {e}", f.abs)),
+    });
     let mut probed: Vec<Option<audio::Info>> = Vec::with_capacity(batch.len());
-    for (f, hit) in batch.iter().zip(fresh.iter()) {
+    let mut it = ergebnis.into_iter();
+    for hit in fresh.iter() {
         if *hit {
             probed.push(None);
             continue;
         }
-        match audio::probe(Path::new(&f.abs)) {
-            Ok(i) => probed.push(Some(i)),
-            Err(e) => {
+        match it.next() {
+            Some(Ok(i)) => probed.push(Some(i)),
+            Some(Err(msg)) => {
                 sh.stats.errors.fetch_add(1, Relaxed);
-                sh.log(format!("FEHLER beim Lesen von {}: {e}", f.abs));
+                sh.log(msg);
                 probed.push(None);
             }
+            None => probed.push(None),
         }
     }
     // 3. In einem Rutsch schreiben

@@ -131,6 +131,11 @@ Indexiert wird jedes Audioformat aus `AUDIO_EXTS` (Standard: flac, mp3, m4a, m4b
 opus, wma, wav, aiff, aif, ape, wv, mpc, dsf, dff). Eine bytegleiche Kopie ist unabhaengig vom Format eine
 Kopie, deshalb gilt die Inhaltssuche fuer alle davon.
 
+Die Dateien werden **parallel** angefasst (`SCAN_THREADS`). Der Scan wartet fast nur auf die Platte,
+nicht auf die CPU – nacheinander zu fragen verschenkt auf Netzwerkspeicher und Festplatten den groessten
+Teil der moeglichen Geschwindigkeit. Gemessen an 100.000 Dateien im Betriebssystem-Cache: 1,47 s mit einem
+Thread, 1,06 s mit sechzehn. Auf echtem Netzwerkspeicher faellt der Unterschied deutlich groesser aus.
+
 Der Verzeichnisdurchlauf prueft in dieser Reihenfolge: Dateiname, Endung, `stat`, und erst dann wird die
 Datei geoeffnet. Cover, Logs und Playlists kosten damit nichts, und unveraenderte Dateien kosten nur den
 `stat`.
@@ -235,6 +240,25 @@ verlieren. Playlists, die du in Navidrome selbst angelegt hast, haben keine Date
 - Behalten wird die beste Datei in dieser Reihenfolge: Wunschformat (`KEEP_EXTS`, Standard FLAC), Bit-Tiefe,
   Samplerate, Kanaele, **Tag-Vollstaendigkeit**, "keine Kopie"-Dateiname, dann Bitrate und Groesse.
 
+## Zwei Dateien im selben Album: 1:1 oder andere Fassung?
+Derselbe Titel kommt auf einem Album oft zweimal vor, ohne dass es dieselbe Aufnahme ist –
+Live-Mitschnitt, Radio Edit, Remaster, Bonus-Track. Fuer diesen Fall gilt eine strenge Pruefung
+(abschaltbar). Uebersprungen wird, sobald eines davon zutrifft:
+
+* **andere MusicBrainz-Release-Track-ID** – benennt genau diesen Track auf genau dieser
+  Veroeffentlichung und ist damit das eindeutigste Merkmal ueberhaupt;
+* **andere Tracknummer oder Disc** – und zwar jetzt auch formatuebergreifend. Vorher durften MP3 und
+  FLAC verschiedene Tracknummern haben, womit auf einer Zusammenstellung die Album- und die
+  Live-Fassung haetten zusammenfallen koennen;
+* **Laufzeit weicht um mehr als eine Sekunde ab** – innerhalb eines Albums ist das zu viel fuer
+  dieselbe Aufnahme, auch wenn die allgemeine Toleranz grosszuegiger ist;
+* **verschiedene Disc-Untertitel**;
+* **Versionsmerkmal nur bei einer der beiden** – live, remix, edit, radio, extended, demo, acoustic,
+  unplugged, remaster, mono, stereo, alternate, reprise, bonus, club, dub und weitere.
+
+Treffer dieser Art tragen im Report `album-dublette` und werden in der Oberflaeche getrennt gezaehlt.
+So siehst du auf einen Blick, wie oft dasselbe Stueck wirklich doppelt im selben Album liegt.
+
 ## Tags
 Bei FLAC gegen FLAC entscheidet zuerst die echte Audio-Qualitaet, danach aber die Tags – Bitrate und Dateigroesse
 sind bei identischem Audio bedeutungslos, fehlende Tags nicht. Geprueft werden Album-Interpret, Interpret, Album,
@@ -273,7 +297,8 @@ Gruppe stattdessen uebersprungen. Das Tool schreibt selbst keine Tags in Audioda
 `UI_USER` (admin), `UI_PASSWORD`, `NAVIDROME_DB` (/data/navidrome.db), `PATH_MAP` (`/navidrome-pfad:/container-pfad`), `KEEP_EXTS` (flac),
 `DELETE_EXTS` (mp3), `DEDUPE_SAME_EXTS` (flac, `none` = aus), `DURATION_TOLERANCE` (3), `BATCH_SIZE` (200), `BACKUP_KEEP` (3),
 `MATCH_MODE` (`album` | `artist_title`), `DELETE_ROWS` (false), `REQUIRE_DRYRUN` (true), `LOG_KEEP` (30),
-`TRASH_DIR` (/trash), `AUDIO_EXTS` (Formate fuer den Bibliotheks-Scan).
+`TRASH_DIR` (/trash), `AUDIO_EXTS` (Formate fuer den Bibliotheks-Scan),
+`SCAN_THREADS` (0 = automatisch: Anzahl Kerne, mindestens 4, hoechstens 16).
 In der UI einstellbar: Toleranz, Limit pro Lauf, Exclude-Ordner, Schutz-Begriffe, Bereinigung gleicher Formate,
 Kopie-Erkennung, Tag-Verlust-Sperre, Playlist-Verhalten, MusicBrainz-Pruefung, Tracknummer-Pruefung,
 Suchverfahren, Byte-Vergleich, Meldung nicht indizierter Dateien, Papierkorb, Index fuehren,
@@ -311,7 +336,7 @@ Fuer ein integriertes Gefuehl eignet sich ein Reverse-Proxy, der Navidrome unter
 z. B. `/dedupe/` ausliefert.
 
 ## Entwicklung
-`cargo test` startet die Tests (aktuell 51). Drei davon schleusen von Hand einen Plan in den Index und
+`cargo test` startet die Tests (aktuell 58). Drei davon schleusen von Hand einen Plan in den Index und
 lassen ihn durch den echten Loeschpfad laufen – so laesst sich pruefen, was bei einem Plan passiert,
 der nicht mehr zur Wirklichkeit passt. Das Testschema ist aus dem Schema-Dump einer echten
 Navidrome-Installation uebernommen: dieselben Spalten, dieselben Fremdschluessel (mit `PRAGMA foreign_keys=ON`

@@ -56,6 +56,9 @@ pub struct Env {
     pub generated_pass: bool,
     pub require_dryrun: bool,
     pub log_keep: usize,
+    /// Wie viele Dateien gleichzeitig angefasst werden. Lohnt vor allem auf
+    /// Netzwerk- und Plattenspeicher, wo jede einzelne Anfrage lange braucht.
+    pub scan_threads: usize,
 }
 
 fn var(k: &str, d: &str) -> String {
@@ -129,6 +132,16 @@ impl Env {
             generated_pass,
             require_dryrun: var("REQUIRE_DRYRUN", "true") != "false",
             log_keep: var("LOG_KEEP", "30").parse().unwrap_or(30),
+            scan_threads: var("SCAN_THREADS", "0")
+                .parse()
+                .ok()
+                .filter(|n: &usize| *n > 0)
+                .unwrap_or_else(|| {
+                    // Der Scan wartet fast nur auf die Platte, nicht auf die CPU –
+                    // deshalb ruhig mehr Threads als Kerne, aber mit Deckel.
+                    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(4, 16)
+                })
+                .clamp(1, 64),
         })
     }
 }
@@ -170,6 +183,9 @@ pub struct Settings {
     pub use_index: bool,
     /// Unveraenderte Dateien nicht erneut untersuchen, sondern aus dem Index nehmen.
     pub reuse_index: bool,
+    /// Bei zwei Dateien im selben Album streng pruefen, ob es wirklich dasselbe
+    /// Stueck ist und nicht eine andere Fassung (Live, Remix, Radio Edit ...).
+    pub strict_album_match: bool,
     /// Vor dem Loeschen pruefen, ob die Datei noch die Groesse aus dem Plan hat.
     /// Weicht sie ab, wurde sie seit der Planung ersetzt – dann bleibt sie liegen.
     pub verify_size_before_delete: bool,
@@ -204,6 +220,7 @@ impl Default for Settings {
             reuse_plan: false,
             rewrite_m3u: true,
             verify_size_before_delete: true,
+            strict_album_match: true,
         }
     }
 }
@@ -217,6 +234,7 @@ pub struct Stats {
     pub candidates: AtomicU64,
     pub duplicates: AtomicU64,
     pub same_format: AtomicU64,
+    pub album_dupes: AtomicU64,
     pub planned: AtomicU64,
     pub files: AtomicU64,
     pub reused: AtomicU64,
@@ -294,7 +312,8 @@ impl Shared {
         json!({
             "total": st.total.load(Relaxed), "scanned": st.scanned.load(Relaxed),
             "candidates": st.candidates.load(Relaxed), "duplicates": st.duplicates.load(Relaxed),
-            "same_format": st.same_format.load(Relaxed), "planned": st.planned.load(Relaxed),
+            "same_format": st.same_format.load(Relaxed), "album_dupes": st.album_dupes.load(Relaxed),
+            "planned": st.planned.load(Relaxed),
             "files": st.files.load(Relaxed), "reused": st.reused.load(Relaxed),
             "unknown": st.unknown.load(Relaxed),
             "exact": st.exact.load(Relaxed),
@@ -311,7 +330,7 @@ impl Shared {
     }
     fn reset_stats(&self) {
         let s = &self.stats;
-        for a in [&s.total, &s.scanned, &s.candidates, &s.duplicates, &s.same_format, &s.planned,
+        for a in [&s.total, &s.scanned, &s.candidates, &s.duplicates, &s.same_format, &s.album_dupes, &s.planned,
                   &s.files, &s.reused, &s.unknown, &s.exact,
                   &s.tags_lost, &s.protected, &s.excluded, &s.mismatch, &s.deleted, &s.bytes_freed,
                   &s.annotations, &s.playlists, &s.m3u, &s.errors] {
@@ -538,6 +557,56 @@ pub fn norm_title(t: &str, strip: bool) -> String {
     s
 }
 
+/// Woerter, die eine eigene Fassung eines Stuecks kennzeichnen. Steht eins davon
+/// nur bei einer der beiden Dateien, sind es nicht dieselben Aufnahmen.
+const VERSION_WORDS: &[&str] = &[
+    "live", "remix", "rmx", "edit", "radio", "extended", "demo", "acoustic", "akustik", "unplugged",
+    "remaster", "mono", "stereo", "version", "fassung", "alternate", "alternativ", "reprise", "bonus",
+    "interlude", "cover", "session", "rehearsal", "club", "dub", "single", "original", "orchestral",
+    "piano", "sped up", "slowed", "nightcore", "clean", "explicit", "edit)", "mix", "take",
+];
+
+/// Sind zwei Dateien desselben Albums wirklich dasselbe Stueck? Gibt den Grund
+/// zurueck, wenn nicht. Jede einzelne Pruefung sagt: "das waere bei derselben
+/// Aufnahme nicht so".
+fn unterschied(a: &Row, b: &Row) -> Option<String> {
+    // Der eindeutigste Fall: MusicBrainz benennt den Track auf dieser Veroeffentlichung.
+    let (ra, rb) = (a.rtid.trim(), b.rtid.trim());
+    if !ra.is_empty() && !rb.is_empty() && ra != rb {
+        return Some("andere MusicBrainz-Release-Track-ID".into());
+    }
+    if a.track != b.track {
+        return Some(format!("Tracknummer {} vs {}", a.track, b.track));
+    }
+    if a.disc != b.disc {
+        return Some(format!("Disc {} vs {}", a.disc, b.disc));
+    }
+    // Innerhalb eines Albums darf die Laufzeit nur minimal abweichen. Eine andere
+    // Fassung ist praktisch immer deutlich laenger oder kuerzer.
+    if (a.duration - b.duration).abs() > 1.0 {
+        return Some(format!("Laufzeit {:.1}s vs {:.1}s", a.duration, b.duration));
+    }
+    let (sa, sb) = (a.subtitle.trim(), b.subtitle.trim());
+    if !sa.is_empty() && !sb.is_empty() && !sa.eq_ignore_ascii_case(sb) {
+        return Some(format!("Disc-Untertitel '{sa}' vs '{sb}'"));
+    }
+    let ma = version_marks(&format!("{} {}", a.title, a.subtitle));
+    let mb = version_marks(&format!("{} {}", b.title, b.subtitle));
+    if ma != mb {
+        return Some(format!("Fassung unterscheidet sich ({ma:?} vs {mb:?})"));
+    }
+    None
+}
+
+/// Welche Versionsmerkmale stecken in diesem Text?
+fn version_marks(text: &str) -> Vec<&'static str> {
+    let hay = text.to_lowercase();
+    let mut v: Vec<&'static str> = VERSION_WORDS.iter().copied().filter(|w| hay.contains(w)).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
 /// Sieht der Dateiname nach einer Kopie aus ("track (1).flac")?
 pub fn is_copy_name(path: &str) -> bool {
     let stem = Path::new(path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
@@ -562,6 +631,10 @@ struct Row {
     bit_depth: i64,
     channels: i64,
     mbz: String,
+    /// MusicBrainz-Release-Track: benennt genau diesen Track auf genau dieser Veroeffentlichung
+    rtid: String,
+    disc: i64,
+    subtitle: String,
     comment: String,
     tags: String,
     tag_flags: String,
@@ -1179,7 +1252,7 @@ fn scan(
     };
     let sql = format!(
         "SELECT id, library_id, path, title, album, album_id, artist_id, {disc}, {ot}, suffix, size, duration, bit_rate, \
-                {comment}, {track}, {srate}, {depth}, {chan}, {mbz}, {tags}, {flags} \
+                {comment}, {track}, {srate}, {depth}, {chan}, {mbz}, {rtid}, {sub}, {flags} \
          FROM media_file WHERE {missing}lower(suffix) IN ({all_exts}) ORDER BY {order}",
         comment = schema.expr("comment", "''"),
         track = schema.expr("track_number", "0"),
@@ -1187,11 +1260,21 @@ fn scan(
         depth = schema.expr("bit_depth", "0"),
         chan = schema.expr("channels", "0"),
         mbz = schema.expr("mbz_recording_id", "''"),
-        tags = if schema.mf("tags") { "CAST(tags AS TEXT)" } else { "''" },
+        rtid = schema.expr("mbz_release_track_id", "''"),
+        sub = schema.expr("disc_subtitle", "''"),
         flags = schema.tag_flags_expr(),
     );
 
-    let mut ctx = Ctx { sh, env, same_exts: same_exts.to_vec(), settings: settings.clone(), libs: libs.clone(), planner };
+    let mut ctx = Ctx {
+        sh,
+        env,
+        reader,
+        has_tags: schema.mf("tags"),
+        same_exts: same_exts.to_vec(),
+        settings: settings.clone(),
+        libs: libs.clone(),
+        planner,
+    };
     sh.phase("scanne und plane");
 
     let mut stmt = reader.prepare(&sql).map_err(|e| format!("Abfrage vorbereiten: {e}"))?;
@@ -1227,8 +1310,11 @@ fn scan(
             bit_depth: n(r, 16),
             channels: n(r, 17),
             mbz: s(r, 18),
-            tags: s(r, 19),
-            tag_flags: s(r, 20),
+            rtid: s(r, 19),
+            subtitle: s(r, 20),
+            disc: n(r, 7),
+            tags: String::new(), // wird nur fuer Kandidaten nachgeladen
+            tag_flags: s(r, 21),
         };
         let (album_id, artist_id, disc_v, raw_title) = (s(r, 5), s(r, 6), n(r, 7), s(r, 8));
         // "Song (1)" und "Song" landen damit in derselben Gruppe
@@ -1256,6 +1342,8 @@ fn scan(
 struct Ctx<'a, 'p> {
     sh: &'a Shared,
     env: &'a Env,
+    reader: &'a Connection,
+    has_tags: bool,
     same_exts: Vec<String>,
     settings: Settings,
     libs: HashMap<i64, String>,
@@ -1335,10 +1423,23 @@ impl<'a, 'p> Ctx<'a, 'p> {
         )
     }
 
-    fn group(&mut self, g: Vec<Row>) -> Result<(), String> {
+    fn group(&mut self, mut g: Vec<Row>) -> Result<(), String> {
         if g.len() < 2 {
             return Ok(());
         }
+        // Der Tag-Block wird nur fuer die Schutz-Begriffe gebraucht. Ihn fuer jede
+        // Zeile mitzulesen kostet bei Millionen Titeln hunderte Megabyte. Hier sind
+        // es nur noch Gruppen mit mindestens zwei Dateien – ein Bruchteil davon.
+        if self.has_tags {
+            if let Ok(mut st) = self.reader.prepare_cached("SELECT CAST(tags AS TEXT) FROM media_file WHERE id=?1") {
+                for r in g.iter_mut() {
+                    if let Ok(t) = st.query_row(params![r.id], |x| x.get::<_, Option<String>>(0)) {
+                        r.tags = t.unwrap_or_default();
+                    }
+                }
+            }
+        }
+        let g = g;
         let sh = self.sh;
         let max = self.settings.max_delete;
         if max > 0 && sh.stats.duplicates.load(Relaxed) >= max {
@@ -1427,11 +1528,25 @@ impl<'a, 'p> Ctx<'a, 'p> {
                 sh.log(format!("SKIP (Tracknummer {} vs {} bei gleichem Format): {}", d.track, keeper.track, d.path));
                 continue;
             }
+            // Zwei Dateien im selben Album: hier muss es wirklich 1:1 dasselbe
+            // Stueck sein. Eine andere Fassung – Live, Remix, Radio Edit – traegt
+            // oft denselben Titel und waere sonst nicht zu unterscheiden.
+            let same_album = d.album.eq_ignore_ascii_case(&keeper.album) && !d.album.trim().is_empty();
+            if same_album && self.settings.strict_album_match {
+                if let Some(grund) = unterschied(&keeper, &d) {
+                    sh.stats.mismatch.fetch_add(1, Relaxed);
+                    sh.log(format!("SKIP (im selben Album, aber {grund}): {}", d.path));
+                    continue;
+                }
+            }
             let mut reason = if same_format {
                 format!("gleiches-format:{}", d.suffix)
             } else {
                 format!("{}->{}", d.suffix, keeper.suffix)
             };
+            if same_album {
+                reason.push_str(";album-dublette");
+            }
             // Tags: haette die zu loeschende Datei Felder, die der behaltenen fehlen?
             let lost = d.tags_missing_in(&keeper);
             if !lost.is_empty() {
@@ -1460,6 +1575,9 @@ impl<'a, 'p> Ctx<'a, 'p> {
             sh.stats.duplicates.fetch_add(1, Relaxed);
             if same_format {
                 sh.stats.same_format.fetch_add(1, Relaxed);
+            }
+            if same_album {
+                sh.stats.album_dupes.fetch_add(1, Relaxed);
             }
             if !self.sh.execute.load(Relaxed) {
                 sh.stats.bytes_freed.fetch_add(d.size.max(0) as u64, Relaxed);
@@ -2247,6 +2365,7 @@ mod tests {
         order_album_artist_name varchar collate NOCASE default '' not null,
         mbz_recording_id varchar default '' not null,
         mbz_album_id varchar default '' not null,
+        mbz_release_track_id varchar default '' not null,
         channels integer default 0 not null,
         lyrics jsonb default '[]' not null,
         sample_rate integer default 0 not null,
@@ -2458,6 +2577,7 @@ mod tests {
             generated_pass: false,
             require_dryrun: false,
             log_keep: 5,
+            scan_threads: 2,
         };
         (env, music, cfg)
     }
@@ -3277,6 +3397,119 @@ mod tests {
             .filter(|n| n.starts_with(".nd-dedupe"))
             .collect();
         assert!(reste.is_empty(), "die Testdatei wurde wieder entfernt, gefunden: {reste:?}");
+    }
+
+    // ───────── Album-Dubletten: 1:1 oder andere Fassung? ─────────
+
+    /// Legt zwei Dateien mit gleichem Titel im selben Album an.
+    /// `extra` passt die zweite Zeile danach an.
+    fn album_paar(env: &Env, music: &Path, extra: &str) {
+        fs::write(music.join("a1.flac"), vec![b'1'; 900]).unwrap();
+        fs::write(music.join("a2.flac"), vec![b'2'; 800]).unwrap();
+        let c = Connection::open(&env.db_path).unwrap();
+        let ins = "INSERT INTO media_file (id, library_id, path, title, album, album_id, artist_id, \
+                   disc_number, order_title, suffix, size, duration, bit_rate, comment, track_number, \
+                   sample_rate, bit_depth, channels, mbz_recording_id, mbz_release_track_id, disc_subtitle, \
+                   tags, missing, genre) \
+                   VALUES (?1, 1, ?2, 'Lied', 'Das Album', 'albX', 'art1', 1, 'lied', 'flac', ?3, 210.0, \
+                   900, '', 4, 44100, 16, 2, '', '', '', '{}', 0, 'Pop')";
+        c.execute(ins, params!["alpha", "a1.flac", 900]).unwrap();
+        c.execute(ins, params!["beta", "a2.flac", 800]).unwrap();
+        if !extra.is_empty() {
+            c.execute(extra, []).unwrap();
+        }
+    }
+
+    fn laeuft(env: Env) -> Shared {
+        let sh = db_mode(env);
+        sh.settings.lock().unwrap().dedupe_flac = true;
+        run(&sh, true);
+        sh
+    }
+
+    #[test]
+    fn echte_dublette_im_album_wird_entfernt() {
+        let (env, music, _cfg) = fixture();
+        album_paar(&env, &music, "");
+        let sh = laeuft(env);
+        assert!(sh.stats.album_dupes.load(Relaxed) >= 1, "als Album-Dublette gezaehlt");
+        assert!(music.join("a1.flac").exists(), "die groessere bleibt");
+        assert!(!music.join("a2.flac").exists(), "die Dublette geht");
+    }
+
+    #[test]
+    fn andere_laufzeit_im_album_ist_eine_andere_fassung() {
+        let (env, music, _cfg) = fixture();
+        // 2,5 s laenger: innerhalb der allgemeinen Toleranz von 3 s, aber fuer
+        // dasselbe Stueck auf demselben Album zu viel
+        album_paar(&env, &music, "UPDATE media_file SET duration=212.5 WHERE id='beta'");
+        let sh = laeuft(env);
+        assert!(music.join("a2.flac").exists(), "bleibt liegen");
+        assert!(music.join("a1.flac").exists(), "und die andere auch");
+    }
+
+    #[test]
+    fn andere_release_track_id_ist_ein_anderer_track() {
+        let (env, music, _cfg) = fixture();
+        album_paar(&env, &music, "UPDATE media_file SET mbz_release_track_id='aaa' WHERE id='alpha'");
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("UPDATE media_file SET mbz_release_track_id='bbb' WHERE id='beta'", []).unwrap();
+        }
+        let sh = laeuft(env);
+        assert!(music.join("a2.flac").exists(), "MusicBrainz sagt: anderer Track");
+        assert_eq!(sh.stats.errors.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn live_fassung_mit_gleichem_titel_bleibt() {
+        let (env, music, _cfg) = fixture();
+        // Gleicher Titel, gleiche Laufzeit, gleicher Track – nur der
+        // Disc-Untertitel verraet, dass es die Live-Aufnahme ist.
+        album_paar(&env, &music, "UPDATE media_file SET disc_subtitle='Live in Hamburg' WHERE id='beta'");
+        let sh = laeuft(env);
+        assert!(music.join("a2.flac").exists(), "andere Fassung bleibt");
+    }
+
+    #[test]
+    fn andere_tracknummer_auch_ueber_formatgrenzen_hinweg() {
+        // Vorher erlaubt: mp3 und flac mit gleichem Titel im selben Album, aber
+        // verschiedenen Tracknummern – typisch fuer Album- und Live-Fassung
+        // auf einer Zusammenstellung.
+        let (env, music, _cfg) = fixture();
+        fs::write(music.join("b1.flac"), vec![b'1'; 900]).unwrap();
+        fs::write(music.join("b2.mp3"), vec![b'2'; 300]).unwrap();
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            let ins = "INSERT INTO media_file (id, library_id, path, title, album, album_id, artist_id, \
+                       disc_number, order_title, suffix, size, duration, bit_rate, comment, track_number, \
+                       sample_rate, bit_depth, channels, mbz_recording_id, tags, missing, genre) \
+                       VALUES (?1, 1, ?2, 'Hit', 'Best Of', 'albB', 'art1', 1, 'hit', ?3, ?4, 210.0, \
+                       ?5, '', ?6, 44100, ?7, 2, '', '{}', 0, 'Pop')";
+            c.execute(ins, params!["bflac", "b1.flac", "flac", 900, 900, 5, 16]).unwrap();
+            c.execute(ins, params!["bmp3", "b2.mp3", "mp3", 300, 320, 12, 0]).unwrap();
+        }
+        let sh = laeuft(env);
+        assert!(music.join("b2.mp3").exists(), "Track 5 und Track 12 sind nicht dasselbe Stueck");
+    }
+
+    #[test]
+    fn strenge_pruefung_laesst_sich_abschalten() {
+        let (env, music, _cfg) = fixture();
+        album_paar(&env, &music, "UPDATE media_file SET duration=212.5 WHERE id='beta'");
+        let sh = db_mode(env);
+        sh.settings.lock().unwrap().strict_album_match = false;
+        run(&sh, true);
+        assert!(!music.join("a2.flac").exists(), "ohne strenge Pruefung greift nur die allgemeine Toleranz");
+    }
+
+    #[test]
+    fn versionsmerkmale_werden_erkannt() {
+        assert_eq!(version_marks("Lied"), Vec::<&str>::new());
+        assert!(version_marks("Lied (Live)").contains(&"live"));
+        assert!(version_marks("Lied - Radio Edit").contains(&"radio"));
+        assert!(version_marks("Lied (2024 Remaster)").contains(&"remaster"));
+        assert_eq!(version_marks("Lied (Live)"), version_marks("LIED live"), "Gross- und Kleinschreibung egal");
     }
 
     #[test]
