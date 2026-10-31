@@ -198,6 +198,7 @@
       <label class="chk"><input type="checkbox" id="verify_bytes"> Treffer ohne FLAC-Prüfsumme vor dem Löschen Byte für Byte vergleichen</label>
       <label class="chk"><input type="checkbox" id="report_unknown"> Dateien auflisten, die Navidrome nicht kennt</label>
       <label class="chk"><input type="checkbox" id="use_trash"> in den Papierkorb verschieben statt löschen (Ordner /trash)</label>
+      <label class="chk"><input type="checkbox" id="verify_size_before_delete"> vor dem Löschen prüfen, ob die Datei noch die Größe aus dem Plan hat</label>
       <label class="chk"><input type="checkbox" id="rewrite_m3u"> Pfad in eingelesenen Playlist-Dateien (m3u) mitschreiben</label>
       <label class="chk"><input type="checkbox" id="use_index"> eigenen Index führen (/config/index.db)</label>
       <label class="chk"><input type="checkbox" id="reuse_index"> unveränderte Dateien nicht erneut einlesen (schnelle Folgeläufe)</label>
@@ -394,7 +395,7 @@ async function stopRun() { await press($("stop"), "stoppt …", () => api("/api/
 /* Einstellungen */
 const FLAGS = ["dedupe_flac","strip_copy_suffix","skip_on_tag_loss","require_mbz_match","require_same_track",
                "playlist_keep_duplicates","verify_bytes","report_unknown","use_trash",
-               "use_index","reuse_index","reuse_plan","rewrite_m3u"];
+               "use_index","reuse_index","reuse_plan","rewrite_m3u","verify_size_before_delete"];
 const lines = t => t.split("\n").map(x => x.trim()).filter(Boolean);
 async function loadCfg() {
   const c = await (await api("/api/config")).json();

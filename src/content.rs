@@ -124,6 +124,7 @@ pub fn scan(
     // ── 2. Navidromes Sicht einlesen ──
     sh.phase("lese Navidrome-Datenbank");
     load_media_files(sh, reader, schema, idx)?;
+    let _ = settings;
 
     let unknown: i64 = idx
         .query_row(
@@ -153,7 +154,7 @@ pub fn scan(
     sh.phase("vergleiche Dateiinhalte");
     let sql = "SELECT f.fkey, f.abs, f.size, f.astart, f.alen, COALESCE(nd.id,''), \
                       COALESCE(nd.flags,''), COALESCE(nd.title,''), COALESCE(nd.album,''), \
-                      COALESCE(nd.comment,''), COALESCE(nd.tags,'') \
+                      COALESCE(nd.comment,'') \
                FROM files f LEFT JOIN nd ON nd.lib = f.lib AND nd.rel = f.rel \
                WHERE f.fkey IN (SELECT fkey FROM files GROUP BY fkey HAVING count(*) > 1) \
                ORDER BY f.fkey";
@@ -178,10 +179,10 @@ pub fn scan(
             title: r.get(7).map_err(|e| e.to_string())?,
             album: r.get(8).map_err(|e| e.to_string())?,
             comment: r.get(9).map_err(|e| e.to_string())?,
-            tags: r.get(10).map_err(|e| e.to_string())?,
+            tags: String::new(), // wird nur fuer Kandidaten nachgeladen
         };
         if k != key {
-            handle(sh, settings, &key, std::mem::take(&mut group), planner)?;
+            handle(sh, reader, schema, settings, &key, std::mem::take(&mut group), planner)?;
             key = k;
             gruppen += 1;
             if takt.faellig() {
@@ -191,7 +192,7 @@ pub fn scan(
         group.push(c);
     }
     if !sh.scan_done() {
-        handle(sh, settings, &key, group, planner)?;
+        handle(sh, reader, schema, settings, &key, group, planner)?;
     }
     Ok(())
 }
@@ -394,9 +395,32 @@ fn store(
 /// als ebenso viele Einzelabfragen ueber zwei Datenbanken hinweg.
 fn load_media_files(sh: &Shared, reader: &Connection, schema: &Schema, idx: &mut Connection) -> Result<(), String> {
     let missing = if schema.mf("missing") { "missing=0 AND " } else { "" };
+
+    // Hat sich Navidromes Bestand seit dem letzten Lauf ueberhaupt veraendert?
+    // Zahl der Titel plus juengster Aenderungszeitpunkt genuegen als Fingerabdruck.
+    // Stimmt er, sparen wir uns das Neuschreiben von Millionen Zeilen.
+    let fp: Option<String> = if schema.mf("updated_at") {
+        reader
+            .query_row(
+                &format!("SELECT count(*) || '/' || COALESCE(max(updated_at),'') FROM media_file WHERE {missing}1=1"),
+                [],
+                |r| r.get(0),
+            )
+            .ok()
+    } else {
+        None
+    };
+    if let Some(f) = &fp {
+        let gefuellt: i64 = idx.query_row("SELECT count(*) FROM nd", [], |r| r.get(0)).unwrap_or(0);
+        if gefuellt > 0 && crate::index::get_meta(idx, "nd_fingerprint").as_deref() == Some(f.as_str()) {
+            sh.log(format!("Navidrome-Bestand unveraendert ({gefuellt} Titel) – Zuordnung aus dem Index uebernommen"));
+            return Ok(());
+        }
+    }
+
     let sql = format!(
         "SELECT library_id, path, id, {flags}, title, {album}, {artist}, {track}, {disc}, {mbz}, \
-                {brate}, {comment}, {tags} \
+                {brate}, {comment} \
          FROM media_file WHERE {missing}1=1",
         flags = schema.tag_flags_expr(),
         album = schema.expr("album", "''"),
@@ -406,7 +430,6 @@ fn load_media_files(sh: &Shared, reader: &Connection, schema: &Schema, idx: &mut
         mbz = schema.expr("mbz_recording_id", "''"),
         brate = schema.expr("bit_rate", "0"),
         comment = schema.expr("comment", "''"),
-        tags = if schema.mf("tags") { "CAST(tags AS TEXT)" } else { "''" },
     );
     let mut st = reader.prepare(&sql).map_err(|e| e.to_string())?;
     let mut rows = st.query([]).map_err(|e| e.to_string())?;
@@ -419,14 +442,14 @@ fn load_media_files(sh: &Shared, reader: &Connection, schema: &Schema, idx: &mut
         {
             let mut ins = tx
                 .prepare_cached(
-                    "INSERT OR REPLACE INTO nd (lib, rel, id, flags, title, album, artist, track, disc, mbz, brate, comment, tags) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                    "INSERT OR REPLACE INTO nd (lib, rel, id, flags, title, album, artist, track, disc, mbz, brate, comment) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                 )
                 .map_err(|e| e.to_string())?;
             let s = |i: usize| r.get::<_, Option<String>>(i).ok().flatten().unwrap_or_default();
             let n64 = |i: usize| r.get::<_, Option<i64>>(i).ok().flatten().unwrap_or(0);
             ins.execute(params![
-                n64(0), s(1), s(2), s(3), s(4), s(5), s(6), n64(7), n64(8), s(9), n64(10), s(11), s(12)
+                n64(0), s(1), s(2), s(3), s(4), s(5), s(6), n64(7), n64(8), s(9), n64(10), s(11)
             ])
             .map_err(|e| e.to_string())?;
         }
@@ -440,6 +463,9 @@ fn load_media_files(sh: &Shared, reader: &Connection, schema: &Schema, idx: &mut
         }
     }
     tx.commit().map_err(|e| e.to_string())?;
+    if let Some(f) = &fp {
+        crate::index::set_meta(idx, "nd_fingerprint", f);
+    }
     sh.log(format!("{n} Navidrome-Eintraege zugeordnet"));
     Ok(())
 }
@@ -447,7 +473,16 @@ fn load_media_files(sh: &Shared, reader: &Connection, schema: &Schema, idx: &mut
 // ───────────────────────── Entscheidung ─────────────────────────
 
 /// Entscheidet innerhalb einer Fingerabdruck-Gruppe, was bleibt und was geht.
-fn handle(sh: &Shared, settings: &Settings, key: &str, group: Vec<Cand>, planner: &mut Planner) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+fn handle(
+    sh: &Shared,
+    reader: &Connection,
+    schema: &Schema,
+    settings: &Settings,
+    key: &str,
+    mut group: Vec<Cand>,
+    planner: &mut Planner,
+) -> Result<(), String> {
     if group.len() < 2 || key.is_empty() {
         return Ok(());
     }
@@ -460,6 +495,17 @@ fn handle(sh: &Shared, settings: &Settings, key: &str, group: Vec<Cand>, planner
     }
     // `f:` kommt aus der FLAC-Pruefsumme und ist damit bereits beweisend;
     // `s:` heisst nur "gleiche Audio-Laenge" und muss noch geprueft werden.
+    // Tag-Block erst jetzt nachladen: er wird nur fuer die Schutz-Begriffe
+    // gebraucht und waere im Index der mit Abstand groesste Posten.
+    if schema.mf("tags") {
+        if let Ok(mut st) = reader.prepare_cached("SELECT CAST(tags AS TEXT) FROM media_file WHERE id=?1") {
+            for c in group.iter_mut().filter(|c| c.known()) {
+                if let Ok(t) = st.query_row(params![c.id], |r| r.get::<_, Option<String>>(0)) {
+                    c.tags = t.unwrap_or_default();
+                }
+            }
+        }
+    }
     let exact = key.starts_with("f:");
     if exact {
         decide(sh, settings, group, true, planner)

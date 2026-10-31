@@ -60,9 +60,13 @@ CREATE TABLE IF NOT EXISTS nd (
     mbz   TEXT,
     brate INTEGER,
     comment TEXT,
-    tags  TEXT,
     PRIMARY KEY (lib, rel)
 ) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS meta (
+    k TEXT PRIMARY KEY,
+    v TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS runs (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,6 +122,16 @@ pub fn open_ro(env: &Env) -> Result<Connection, String> {
         .map_err(|e| format!("Index {}: {e}", p.display()))?;
     c.busy_timeout(std::time::Duration::from_secs(10)).map_err(|e| e.to_string())?;
     Ok(c)
+}
+
+/// Kleiner Schluessel-Wert-Speicher im Index, z. B. fuer den Fingerabdruck
+/// von Navidromes Bestand.
+pub fn get_meta(c: &Connection, k: &str) -> Option<String> {
+    c.query_row("SELECT v FROM meta WHERE k=?1", params![k], |r| r.get(0)).ok()
+}
+
+pub fn set_meta(c: &Connection, k: &str, v: &str) {
+    let _ = c.execute("INSERT OR REPLACE INTO meta (k, v) VALUES (?1, ?2)", params![k, v]);
 }
 
 pub fn start_run(c: &Connection, mode: &str, execute: bool) -> Result<i64, String> {

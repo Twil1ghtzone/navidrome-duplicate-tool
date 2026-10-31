@@ -170,6 +170,9 @@ pub struct Settings {
     pub use_index: bool,
     /// Unveraenderte Dateien nicht erneut untersuchen, sondern aus dem Index nehmen.
     pub reuse_index: bool,
+    /// Vor dem Loeschen pruefen, ob die Datei noch die Groesse aus dem Plan hat.
+    /// Weicht sie ab, wurde sie seit der Planung ersetzt – dann bleibt sie liegen.
+    pub verify_size_before_delete: bool,
     /// In Playlist-Dateien (m3u), die Navidrome einliest, den Pfad mitschreiben.
     /// Sonst baut Navidrome die Playlist beim naechsten Scan aus der Datei neu auf
     /// und der Eintrag faellt heraus, weil die alte Datei nicht mehr existiert.
@@ -200,6 +203,7 @@ impl Default for Settings {
             reuse_index: true,
             reuse_plan: false,
             rewrite_m3u: true,
+            verify_size_before_delete: true,
         }
     }
 }
@@ -918,6 +922,10 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
                         sh.log(format!("SKIP (nicht mehr vorhanden): {dp}"));
                         continue;
                     }
+                    if !Path::new(&kp).is_file() {
+                        sh.log(format!("SKIP (zu behaltende Datei fehlt inzwischen): {kp}"));
+                        continue;
+                    }
                     planner.add(sh, &ki, &kp, &di, &dp, size, &reason)?;
                 }
                 planner.flush()?;
@@ -954,8 +962,16 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
         let phases = do_content as u64 + do_db as u64;
         sh.stats.total.store(media_count * phases.max(1), Relaxed);
         sh.log(format!("{media_count} relevante Titel in Navidrome"));
+        check_music_writable(sh, &libs);
         if settings.rewrite_m3u {
             check_m3u(sh, &reader, &schema);
+        }
+        if env.delete_rows {
+            sh.log(
+                "ACHTUNG: DELETE_ROWS=true entfernt die Navidrome-Zeilen wirklich. Dabei laufen die \
+                 FTS5-Trigger des Suchindex mit, fuer die es offene Fehlerberichte gibt. Der Standard \
+                 (als fehlend markieren) fasst den Suchindex nicht an und ist umkehrbar.",
+            );
         }
         sh.log(format!("Report/Plan: {}", plan_path.display()));
         let planner = Planner::new(fs::File::create(&plan_path).map_err(|e| format!("Plan-Datei: {e}"))?);
@@ -1020,6 +1036,28 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
     };
     let applied = rdir.join(format!("{ts}-execute-applied.tsv"));
     apply(sh, &mut w, &schema, &settings, trash.as_deref(), idx.as_ref().map(|c| (c, plan_run)), &plan_path, &applied)
+}
+
+/// Loeschen braucht Schreibrecht auf dem **Ordner**, nicht auf der Datei.
+/// Das laesst sich nur pruefen, indem man es versucht – also eine winzige
+/// Datei anlegen und sofort wieder entfernen. Laeuft im Dry-Run mit, damit
+/// ein schreibgeschuetzt eingebundenes Volume vorher auffaellt.
+fn check_music_writable(sh: &Shared, libs: &HashMap<i64, String>) {
+    for (id, root) in libs {
+        let base = map_root(&sh.env, root);
+        let probe = Path::new(&base).join(format!(".nd-dedupe-schreibtest-{}", std::process::id()));
+        match fs::write(&probe, b"") {
+            Ok(()) => {
+                let _ = fs::remove_file(&probe);
+            }
+            Err(e) => {
+                sh.log(format!(
+                    "ACHTUNG: In Bibliothek {id} ({base}) laesst sich nichts anlegen oder loeschen: {e}. \
+                     Die Datenbank wuerde angepasst, die Dateien blieben aber liegen – Volume read-write einbinden."
+                ));
+            }
+        }
+    }
 }
 
 /// Meldet vor dem Lauf, welche eingelesenen Playlist-Dateien angefasst werden
@@ -1542,7 +1580,13 @@ fn to_trash(root: &Path, file: &Path) -> std::io::Result<PathBuf> {
         Ok(()) => Ok(target),
         // anderes Dateisystem: kopieren und erst danach das Original entfernen
         Err(e) if e.raw_os_error() == Some(18) => {
-            fs::copy(file, &target)?;
+            // Scheitert das Kopieren mittendrin (z. B. Platte voll), darf kein
+            // halbes Bruchstueck im Papierkorb liegen bleiben – und das Original
+            // bleibt unangetastet.
+            if let Err(e) = fs::copy(file, &target) {
+                let _ = fs::remove_file(&target);
+                return Err(e);
+            }
             fs::remove_file(file)?;
             Ok(target)
         }
@@ -1568,7 +1612,7 @@ fn flush(
     match commit_batch(sh, w, schema, settings, &batch, &mut m3u) {
         Ok(()) => {
             rewrite_m3u(sh, &m3u);
-            remove_files(sh, trash, idx, &batch, applied);
+            remove_files(sh, settings, trash, idx, &batch, applied);
             Ok(())
         }
         Err(e) => {
@@ -1579,7 +1623,7 @@ fn flush(
                 match commit_batch(sh, w, schema, settings, &single, &mut m1) {
                     Ok(()) => {
                         rewrite_m3u(sh, &m1);
-                        remove_files(sh, trash, idx, &single, None)
+                        remove_files(sh, settings, trash, idx, &single, None)
                     }
                     Err(e) => {
                         sh.stats.errors.fetch_add(1, Relaxed);
@@ -1817,8 +1861,10 @@ fn rewrite_m3u(sh: &Shared, fixes: &[M3uFix]) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn remove_files(
     sh: &Shared,
+    settings: &Settings,
     trash: Option<&Path>,
     idx: Option<(&Connection, i64)>,
     batch: &[PlanRow],
@@ -1830,6 +1876,25 @@ fn remove_files(
         // Letzte Sicherung: die zu behaltende Datei muss existieren und nicht dieselbe sein
         if dpath == kpath {
             continue;
+        }
+        // Zwischen Planung und Loeschen liegt Zeit – bei uebernommenen Plaenen
+        // sogar Tage. Passt die Groesse nicht mehr, ist es nicht mehr dieselbe Datei.
+        if settings.verify_size_before_delete && p.size > 0 {
+            if let Ok(m) = fs::metadata(dpath) {
+                if m.len() as i64 != p.size {
+                    sh.stats.mismatch.fetch_add(1, Relaxed);
+                    sh.log(format!(
+                        "SKIP (Datei hat jetzt {} statt {} Byte – seit der Planung veraendert): {}",
+                        m.len(),
+                        p.size,
+                        p.del_path
+                    ));
+                    if let Some((c, run)) = idx {
+                        crate::index::set_status(c, run, &p.del_path, "veraendert");
+                    }
+                    continue;
+                }
+            }
         }
         match fs::metadata(kpath) {
             Ok(m) if m.len() > 0 => {}
@@ -1908,8 +1973,29 @@ fn transfer(
     playlists: &mut HashSet<String>,
     delete_rows: bool,
 ) -> rusqlite::Result<u64> {
-    if keeper == del || keeper.is_empty() || del.is_empty() {
+    if keeper == del {
         return Ok(0);
+    }
+    // Kennt Navidrome die zu loeschende Datei nicht, gibt es nichts zu uebertragen.
+    if del.is_empty() {
+        return Ok(0);
+    }
+    // Umgekehrt ist es gefaehrlich: die Quelle hat Favoriten, Playlist-Plaetze und
+    // Historie, aber es gibt kein Ziel dafuer. Dann lieber gar nicht loeschen.
+    if keeper.is_empty() {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "die zu behaltende Datei ist Navidrome nicht bekannt – Favoriten und Playlist-Plaetze \
+             haetten kein Ziel, deshalb wird nichts geloescht"
+                .into(),
+        ));
+    }
+    // Die Zielzeile muss es auch wirklich geben (sie kann seit der Planung
+    // verschwunden sein, etwa weil Navidrome dazwischen aufgeraeumt hat).
+    let ziel: i64 = tx.query_row("SELECT count(*) FROM media_file WHERE id=?1", params![keeper], |r| r.get(0))?;
+    if ziel == 0 {
+        return Err(rusqlite::Error::InvalidParameterName(format!(
+            "die zu behaltende Zeile {keeper} gibt es in Navidrome nicht mehr – nichts geloescht"
+        )));
     }
 
     // ── 1. Annotationen zusammenfuehren (Favorit bleibt Favorit, Plays werden addiert) ──
@@ -2457,7 +2543,10 @@ mod tests {
         add_copy_pair(&env, &music);
         // Die Kopie ist groesser und hat die hoehere Bitrate - trotzdem muss das
         // besser getaggte Original gewinnen, weil Tags vor Bitrate/Groesse zaehlen.
+        // Datei und Datenbank muessen dabei zusammenpassen, sonst greift die
+        // Groessenpruefung vor dem Loeschen.
         {
+            fs::write(music.join("g3 (1).flac"), vec![b'x'; 99999]).unwrap();
             let c = Connection::open(&env.db_path).unwrap();
             c.execute("UPDATE media_file SET size=99999, bit_rate=1200 WHERE id='flacCopy'", []).unwrap();
         }
@@ -3022,6 +3111,172 @@ mod tests {
         let mut t = Takt::new(3600);
         assert!(!t.faellig(), "frisch angelegt ist noch nichts faellig");
         assert!(!t.faellig(), "und bleibt es auch");
+    }
+
+    // ───────── Angriffe auf den Loeschpfad ─────────
+    //
+    // Diese Tests bauen von Hand einen Plan in den Index und lassen ihn ueber
+    // "Plan uebernehmen" durch den echten Loeschpfad laufen. So laesst sich
+    // pruefen, was bei einem Plan passiert, der nicht mehr zur Wirklichkeit passt.
+
+    fn plan_einschleusen(env: &Env, rows: &[(&str, String, &str, String, i64)]) {
+        let c = crate::index::open(env).unwrap();
+        c.execute(
+            "INSERT INTO runs (id, started, ended, mode, execute, complete) \
+             VALUES (99, '2026-01-01 00:00:00', '2026-01-01 00:00:01', 'db', 0, 1)",
+            [],
+        )
+        .unwrap();
+        for (ki, kp, di, dp, size) in rows {
+            crate::index::add_plan(&c, 99, ki, kp, di, dp, *size, "test").unwrap();
+        }
+    }
+
+    fn mit_plan(env: Env) -> Shared {
+        let sh = db_mode(env);
+        let mut st = sh.settings.lock().unwrap();
+        st.reuse_plan = true;
+        drop(st);
+        sh
+    }
+
+    #[test]
+    fn plan_ohne_keeper_eintrag_loescht_nicht() {
+        // Die zu loeschende Datei kennt Navidrome, die zu behaltende nicht.
+        // Wuerde hier geloescht, blieben Favoriten auf einer Zeile liegen,
+        // deren Datei es nicht mehr gibt.
+        let (env, music, _cfg) = fixture();
+        let flac = music.join("g1.flac").to_string_lossy().to_string();
+        let mp3 = music.join("g1.mp3").to_string_lossy().to_string();
+        plan_einschleusen(&env, &[("", flac, "mp3a", mp3, 300)]);
+        let db = env.db_path.clone();
+        let sh = mit_plan(env);
+        run(&sh, true);
+
+        assert!(music.join("g1.mp3").exists(), "ohne Ziel fuer die Favoriten darf nichts geloescht werden");
+        let c = Connection::open(&db).unwrap();
+        let n: i64 = c.query_row("SELECT count(*) FROM annotation WHERE item_id='mp3a'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2, "die Favoriten liegen unveraendert auf der mp3");
+        assert!(sh.stats.errors.load(Relaxed) > 0, "und es gibt eine Fehlermeldung");
+    }
+
+    #[test]
+    fn plan_mit_verschwundenem_keeper_eintrag_loescht_nicht() {
+        // Zwischen Dry-Run und Ausfuehren hat Navidrome die behaltene Zeile entfernt.
+        let (env, music, _cfg) = fixture();
+        let flac = music.join("g1.flac").to_string_lossy().to_string();
+        let mp3 = music.join("g1.mp3").to_string_lossy().to_string();
+        plan_einschleusen(&env, &[("flacA", flac, "mp3a", mp3, 300)]);
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("DELETE FROM media_file WHERE id='flacA'", []).unwrap();
+        }
+        let db = env.db_path.clone();
+        let sh = mit_plan(env);
+        run(&sh, true);
+
+        assert!(music.join("g1.mp3").exists(), "ohne Zielzeile darf nichts geloescht werden");
+        let c = Connection::open(&db).unwrap();
+        let n: i64 = c.query_row("SELECT count(*) FROM annotation WHERE item_id='mp3a'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2, "Favoriten unveraendert");
+    }
+
+    #[test]
+    fn nach_dem_plan_geaenderte_datei_wird_nicht_geloescht() {
+        // Zwischen Dry-Run und Ausfuehren wurde die Datei ersetzt – der Plan
+        // beschreibt sie nicht mehr.
+        let (env, music, _cfg) = fixture();
+        let flac = music.join("g1.flac").to_string_lossy().to_string();
+        let mp3 = music.join("g1.mp3").to_string_lossy().to_string();
+        plan_einschleusen(&env, &[("flacA", flac, "mp3a", mp3, 300)]);
+        // andere Groesse als im Plan vermerkt
+        fs::write(music.join("g1.mp3"), vec![b'n'; 4242]).unwrap();
+        let sh = mit_plan(env);
+        run(&sh, true);
+        assert!(music.join("g1.mp3").exists(), "veraenderte Datei bleibt liegen");
+        assert_eq!(sh.stats.deleted.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn unveraenderter_navidrome_bestand_wird_nicht_neu_eingelesen() {
+        let (env, _music, _cfg) = content_fixture();
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute("UPDATE media_file SET updated_at='2026-01-01 10:00:00'", []).unwrap();
+        }
+        let sh = content_mode(env);
+        run(&sh, false);
+        let protokoll = |sh: &Shared| -> String {
+            sh.log.lock().unwrap().1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n")
+        };
+        assert!(protokoll(&sh).contains("Navidrome-Eintraege zugeordnet"), "erster Lauf liest ein");
+
+        run(&sh, false);
+        assert!(protokoll(&sh).contains("Bestand unveraendert"), "zweiter Lauf nimmt die Zuordnung aus dem Index");
+
+        // Sobald Navidrome etwas anfasst, wird wieder eingelesen
+        {
+            let c = Connection::open(&sh.env.db_path).unwrap();
+            c.execute("UPDATE media_file SET updated_at='2026-02-02 11:00:00' WHERE id='album1'", []).unwrap();
+        }
+        run(&sh, false);
+        assert!(protokoll(&sh).contains("Navidrome-Eintraege zugeordnet"), "geaenderter Bestand wird neu eingelesen");
+    }
+
+    #[test]
+    fn schutz_begriffe_greifen_auch_ohne_tags_im_index() {
+        // Der Tag-Block liegt nicht mehr im Index, sondern wird fuer Kandidaten
+        // nachgeladen. Der Schutz muss trotzdem wirken.
+        let (env, music, _cfg) = content_fixture();
+        {
+            let c = Connection::open(&env.db_path).unwrap();
+            c.execute(
+                "UPDATE media_file SET tags='{\"mood\":[{\"value\":\"Karaoke Version\"}]}' WHERE id='dl1'",
+                [],
+            )
+            .unwrap();
+        }
+        let sh = content_mode(env);
+        sh.settings.lock().unwrap().keywords = vec!["karaoke".into()];
+        run(&sh, true);
+        assert_eq!(sh.stats.protected.load(Relaxed), 1, "Schutz-Begriff aus dem Tag-Block erkannt");
+        assert!(music.join("Downloads/irgendwas.flac").exists(), "geschuetzt, also nicht geloescht");
+    }
+
+    #[test]
+    fn schreibgeschuetzte_bibliothek_wird_vorher_gemeldet() {
+        let (env, music, _cfg) = fixture();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&music, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        let sh = db_mode(env);
+        run(&sh, false); // schon der Dry-Run muss warnen
+        let log: String = sh.log.lock().unwrap().1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&music, fs::Permissions::from_mode(0o755));
+        }
+        #[cfg(unix)]
+        assert!(log.contains("laesst sich nichts anlegen oder loeschen"), "Warnung fehlt:\n{log}");
+    }
+
+    #[test]
+    fn beschreibbare_bibliothek_meldet_nichts_und_hinterlaesst_nichts() {
+        let (env, music, _cfg) = fixture();
+        let sh = db_mode(env);
+        run(&sh, false);
+        let log: String = sh.log.lock().unwrap().1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(!log.contains("laesst sich nichts anlegen"), "keine Warnung noetig:\n{log}");
+        let reste: Vec<String> = fs::read_dir(&music)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(".nd-dedupe"))
+            .collect();
+        assert!(reste.is_empty(), "die Testdatei wurde wieder entfernt, gefunden: {reste:?}");
     }
 
     #[test]

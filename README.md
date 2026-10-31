@@ -56,6 +56,38 @@ Den Stack-Ordner verraet der Container selbst. Die Datei heisst je nach Werkzeug
 docker inspect navidrome-dedupe --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}'
 ```
 
+## Zusammenspiel mit Navidrome
+Punkte, die aus den oeffentlichen Fehlerberichten und der Navidrome-Doku stammen und das Loeschen betreffen.
+
+**Navidrome waehrend des Laufs anhalten.** Das Tool schreibt in dieselbe SQLite-Datei wie Navidrome.
+Transaktionen und `busy_timeout` verhindern Datensalat, aber das Backup (`VACUUM INTO`) haelt fuer seine
+ganze Dauer eine Lesesperre – bei einer mehrere Gigabyte grossen Datenbank blockiert das Navidromes
+Schreibzugriffe spuerbar. Offizielle Aussagen zum Bearbeiten der Datenbank im laufenden Betrieb gibt es
+nicht; Navidromes eigenes `backup restore` verlangt ausdruecklich einen gestoppten Server.
+
+**Danach pruefen lassen.** `navidrome doctor` prueft die Datenbank auf Beschaedigung und auf verwaiste
+Zeilen. Es liest nur und aendert nichts:
+
+```
+docker exec navidrome navidrome doctor
+```
+
+**Zeilen werden markiert, nicht geloescht.** Standard ist `DELETE_ROWS=false`: die Zeile der entfernten
+Datei bekommt `missing=1`. Diese Eintraege sammeln sich in Navidrome unter *Einstellungen → Fehlende
+Dateien* und lassen sich dort gesammelt entfernen. Wer das automatisch will, setzt in Navidrome
+`ND_SCANNER_PURGEMISSING` (Standard `never`).
+
+**Warum nicht gleich loeschen?** `DELETE_ROWS=true` entfernt die Zeile wirklich – dabei laufen Navidromes
+FTS5-Trigger des Suchindex mit. Fuer deren Zusammenspiel gibt es offene Fehlerberichte ueber einen
+beschaedigten Suchindex ("database disk image is malformed"). Das Markieren als fehlend fasst den
+Suchindex nachweislich nicht an: der Trigger `media_file_fts_au` haengt an Titel- und Sortierfeldern,
+nicht an `missing`. Zwei Tests halten genau das fest. Sollte der Suchindex doch einmal beschaedigt sein,
+repariert ihn ab Navidrome 0.64 `navidrome search rebuild --force` bei gestopptem Server.
+
+**Verwandt:** `navidrome missing fix` schiebt die Daten eines fehlenden Eintrags (Wiedergaben, Bewertungen)
+auf eine vorhandene Datei. Das ist fuer Umbenennungen gedacht, nicht fuer Duplikate – dieses Tool macht
+dasselbe, aber geplant und fuer viele Dateien auf einmal.
+
 ## Eigene Index-Datenbank (`/config/index.db`)
 Der Bibliotheks-Scan schreibt alles, was er herausfindet, in eine eigene SQLite-Datenbank: Pfad, Groesse,
 Aenderungszeit, Audio-Fingerabdruck, Abtastrate, Bit-Tiefe, Laufzeit und die Zuordnung zu Navidrome
@@ -112,7 +144,14 @@ Fuer andere Formate wird der reine Audiobereich bestimmt (ID3v2, ID3v1 und APE-T
 zwei MP3s mit unterschiedlichen Tags gelten also als gleich). Gehasht wird nur bei gleicher Audio-Laenge,
 und vor dem Loeschen wird der Bereich zusaetzlich **Byte fuer Byte verglichen** (abschaltbar).
 
-Zwischenspeicher ist eine temporaere SQLite-Datei in `/config`, die nach dem Lauf geloescht wird.
+Gemessen an 100.000 Dateien: erster Lauf 1,5 s, zweiter Lauf 0,9 s, Index 63 MB (rund 630 Byte je Datei,
+also etwa 6 GB bei 10 Millionen Titeln). Der Tag-Block von Navidrome wird bewusst **nicht** mitgespeichert –
+bei 450 Byte je Titel waeren das allein 4,5 GB. Er wird nur fuer die wenigen Kandidaten nachgeladen,
+bei denen die Schutz-Begriffe geprueft werden muessen.
+
+Aendert sich Navidromes Bestand zwischen zwei Laeufen nicht (gleiche Titelzahl, gleicher juengster
+Aenderungszeitpunkt), wird die Zuordnung komplett aus dem Index uebernommen, statt Millionen Zeilen neu
+zu schreiben. Im Zweifel hilft der Knopf **Index verwerfen**.
 Der Arbeitsspeicher bleibt dadurch konstant; plane je nach Bibliotheksgroesse etwas Platz dafuer ein.
 
 ### 2. Navidrome-Datenbank
@@ -150,6 +189,21 @@ Navidrome-Versionen hinweg funktioniert (vorhandene Tabellen/Spalten werden genu
 
 Am Ende jeder Transaktion wird geprueft, dass kein `annotation`-, `bookmark`- oder `playlist_tracks`-Eintrag mehr auf die
 geloeschte Datei zeigt. Schlaegt die Pruefung fehl, wird der Block zurueckgerollt und keine Datei angefasst.
+
+### Vor jeder Loeschung
+Die Transaktion bricht ab und laesst die Datei liegen, wenn
+* die zu loeschende Datei einen Navidrome-Eintrag hat, die zu behaltende aber nicht –
+  Favoriten, Playlist-Plaetze und Historie haetten dann kein Ziel;
+* die Zeile der zu behaltenden Datei in Navidrome nicht mehr existiert;
+* die Datei nicht mehr die Groesse hat, die im Plan steht (abschaltbar). Zwischen Planung und
+  Loeschung liegt Zeit – bei uebernommenen Plaenen sogar Tage. Passt die Groesse nicht mehr,
+  ist es nicht mehr dieselbe Datei;
+* die zu behaltende Datei fehlt oder leer ist.
+
+Zusaetzlich meldet schon der Dry-Run, wenn sich in einer Bibliothek nichts anlegen oder loeschen laesst
+(schreibgeschuetzt eingebundenes Volume). Sonst wuerde die Datenbank angepasst, die Dateien blieben aber
+liegen. Geprueft wird das, indem eine winzige Datei angelegt und sofort wieder entfernt wird – Schreibrecht
+auf den **Ordner** laesst sich anders nicht zuverlaessig feststellen.
 
 ### Playlists im Besonderen
 Eintraege werden **umgebogen, nie geloescht** – auch dann nicht, wenn die behaltene Datei dadurch doppelt in der
@@ -257,7 +311,9 @@ Fuer ein integriertes Gefuehl eignet sich ein Reverse-Proxy, der Navidrome unter
 z. B. `/dedupe/` ausliefert.
 
 ## Entwicklung
-`cargo test` startet die Tests (aktuell 44). Das Testschema ist aus dem Schema-Dump einer echten
+`cargo test` startet die Tests (aktuell 51). Drei davon schleusen von Hand einen Plan in den Index und
+lassen ihn durch den echten Loeschpfad laufen – so laesst sich pruefen, was bei einem Plan passiert,
+der nicht mehr zur Wirklichkeit passt. Das Testschema ist aus dem Schema-Dump einer echten
 Navidrome-Installation uebernommen: dieselben Spalten, dieselben Fremdschluessel (mit `PRAGMA foreign_keys=ON`
 scharf geschaltet) und die FTS5-Trigger, die bei jedem INSERT, UPDATE und DELETE auf `media_file` mitlaufen.
 Zwei Tests pruefen den Suchindex ausdruecklich: als fehlend markieren laesst ihn unberuehrt (der Trigger haengt
