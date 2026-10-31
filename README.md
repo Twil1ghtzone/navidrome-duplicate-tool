@@ -335,8 +335,28 @@ umhaengen – laesst sich damit nicht abbilden.
 Fuer ein integriertes Gefuehl eignet sich ein Reverse-Proxy, der Navidrome unter `/` und dieses Tool unter
 z. B. `/dedupe/` ausliefert.
 
+## Gemessene Trefferquote
+Ein Test baut eine Bibliothek, bei der fuer jede Datei feststeht, ob sie weg darf: vier Arten echter
+Duplikate (identische FLACs, MP3 neben FLAC, zwei MP3s ohne FLAC, inhaltsgleich mit voellig anderen Tags
+in einem anderen Ordner) gegen sieben Arten von Fallen (Live-Fassung, Radio Edit, andere Tracknummer
+ueber Formatgrenzen hinweg, andere MusicBrainz-Release-Track-ID, verschiedene Aufnahmen mit identischen
+Tags, Instrumentalfassung nur ueber das Genre erkennbar, Einzelstuecke ohne Partner).
+
+Der Test besteht nur, wenn mindestens **99 % der echten Duplikate gefunden** und hoechstens **1 % der
+Fallen faelschlich vorgemerkt** werden. Zurzeit: 100 % gefunden, 0 % Fehlgriffe, keine unerwarteten
+Eintraege im Plan.
+
+Beim Bau dieses Tests sind zwei echte Maengel aufgefallen: das Genre zaehlte nicht zu den Schutz-Begriffen
+(eine nur ueber das Genre gekennzeichnete Instrumentalfassung waere geloescht worden), und bei
+inhaltsgleichen Dateien gewann die groessere – auch wenn das die unsortierte Kopie im Download-Ordner war
+und das einsortierte Original verloren gegangen waere. Beides ist behoben; die Rangfolge bewertet jetzt
+auch, ob die Ablage zu den Tags passt.
+
+Die Zahlen gelten fuer diesen Pruefstand, nicht als Versprechen fuer eine echte Bibliothek – aber die
+Faelle darin sind genau die, an denen so ein Werkzeug sonst scheitert.
+
 ## Entwicklung
-`cargo test` startet die Tests (aktuell 58). Drei davon schleusen von Hand einen Plan in den Index und
+`cargo test` startet die Tests (aktuell 59). Drei davon schleusen von Hand einen Plan in den Index und
 lassen ihn durch den echten Loeschpfad laufen – so laesst sich pruefen, was bei einem Plan passiert,
 der nicht mehr zur Wirklichkeit passt. Das Testschema ist aus dem Schema-Dump einer echten
 Navidrome-Installation uebernommen: dieselben Spalten, dieselben Fremdschluessel (mit `PRAGMA foreign_keys=ON`

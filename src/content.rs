@@ -38,6 +38,8 @@ struct Cand {
     title: String,
     album: String,
     comment: String,
+    genre: String,
+    subtitle: String,
     tags: String,
 }
 
@@ -49,10 +51,29 @@ impl Cand {
     /// (damit Favoriten und Playlists ihren Anker behalten), dann Tag-Vollstaendigkeit,
     /// dann ein Dateiname ohne Kopie-Zaehler. Weil das Audio identisch ist, entscheidet
     /// zuletzt die groessere Datei – sie traegt eher eingebettete Cover und Zusatz-Tags.
-    fn rank(&self) -> (i64, i64, i64, i64, std::cmp::Reverse<String>) {
+    /// Passt die Ablage zu den Tags? Eine Datei unter "Interpret/Album/01 Titel.flac"
+    /// ist offensichtlich einsortiert; eine unter "Downloads/zufall_42.flac" nicht –
+    /// selbst wenn beide dasselbe Audio enthalten und gleich getaggt sind.
+    fn path_fit(&self) -> i64 {
+        let p = norm(&self.abs);
+        let mut s = 0;
+        let album = self.album.trim().to_lowercase();
+        if album.len() >= 3 && p.contains(&album) {
+            s += 1;
+        }
+        let title = self.title.trim().to_lowercase();
+        if title.len() >= 3 && p.contains(&title) {
+            s += 1;
+        }
+        s
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn rank(&self) -> (i64, i64, i64, i64, i64, std::cmp::Reverse<String>) {
         (
             self.known() as i64,
             tag_score(&self.flags),
+            self.path_fit(),
             !is_copy_name(&self.abs) as i64,
             self.size,
             std::cmp::Reverse(self.abs.clone()),
@@ -179,6 +200,8 @@ pub fn scan(
             title: r.get(7).map_err(|e| e.to_string())?,
             album: r.get(8).map_err(|e| e.to_string())?,
             comment: r.get(9).map_err(|e| e.to_string())?,
+            genre: String::new(),
+            subtitle: String::new(),
             tags: String::new(), // wird nur fuer Kandidaten nachgeladen
         };
         if k != key {
@@ -526,11 +549,25 @@ fn handle(
     // `s:` heisst nur "gleiche Audio-Laenge" und muss noch geprueft werden.
     // Tag-Block erst jetzt nachladen: er wird nur fuer die Schutz-Begriffe
     // gebraucht und waere im Index der mit Abstand groesste Posten.
-    if schema.mf("tags") {
-        if let Ok(mut st) = reader.prepare_cached("SELECT CAST(tags AS TEXT) FROM media_file WHERE id=?1") {
+    {
+        let sql = format!(
+            "SELECT {}, {}, {} FROM media_file WHERE id=?1",
+            if schema.mf("tags") { "CAST(tags AS TEXT)" } else { "''" },
+            schema.expr("genre", "''"),
+            schema.expr("disc_subtitle", "''"),
+        );
+        if let Ok(mut st) = reader.prepare_cached(&sql) {
             for c in group.iter_mut().filter(|c| c.known()) {
-                if let Ok(t) = st.query_row(params![c.id], |r| r.get::<_, Option<String>>(0)) {
+                if let Ok((t, g, sub)) = st.query_row(params![c.id], |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                }) {
                     c.tags = t.unwrap_or_default();
+                    c.genre = g.unwrap_or_default();
+                    c.subtitle = sub.unwrap_or_default();
                 }
             }
         }
@@ -571,7 +608,11 @@ fn excluded(settings: &Settings, abs: &str) -> bool {
 }
 
 fn protected(settings: &Settings, c: &Cand) -> bool {
-    let hay = format!("{}\n{}\n{}\n{}\n{}", c.title, c.album, c.comment, c.tags, c.abs).to_lowercase();
+    let hay = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        c.title, c.album, c.comment, c.genre, c.subtitle, c.tags, c.abs
+    )
+    .to_lowercase();
     settings.keywords.iter().any(|k| {
         let k = k.trim().to_lowercase();
         !k.is_empty() && hay.contains(&k)
