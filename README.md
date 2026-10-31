@@ -112,7 +112,14 @@ Fuer andere Formate wird der reine Audiobereich bestimmt (ID3v2, ID3v1 und APE-T
 zwei MP3s mit unterschiedlichen Tags gelten also als gleich). Gehasht wird nur bei gleicher Audio-Laenge,
 und vor dem Loeschen wird der Bereich zusaetzlich **Byte fuer Byte verglichen** (abschaltbar).
 
-Zwischenspeicher ist eine temporaere SQLite-Datei in `/config`, die nach dem Lauf geloescht wird.
+Gemessen an 100.000 Dateien: erster Lauf 1,5 s, zweiter Lauf 0,9 s, Index 63 MB (rund 630 Byte je Datei,
+also etwa 6 GB bei 10 Millionen Titeln). Der Tag-Block von Navidrome wird bewusst **nicht** mitgespeichert –
+bei 450 Byte je Titel waeren das allein 4,5 GB. Er wird nur fuer die wenigen Kandidaten nachgeladen,
+bei denen die Schutz-Begriffe geprueft werden muessen.
+
+Aendert sich Navidromes Bestand zwischen zwei Laeufen nicht (gleiche Titelzahl, gleicher juengster
+Aenderungszeitpunkt), wird die Zuordnung komplett aus dem Index uebernommen, statt Millionen Zeilen neu
+zu schreiben. Im Zweifel hilft der Knopf **Index verwerfen**.
 Der Arbeitsspeicher bleibt dadurch konstant; plane je nach Bibliotheksgroesse etwas Platz dafuer ein.
 
 ### 2. Navidrome-Datenbank
@@ -150,6 +157,16 @@ Navidrome-Versionen hinweg funktioniert (vorhandene Tabellen/Spalten werden genu
 
 Am Ende jeder Transaktion wird geprueft, dass kein `annotation`-, `bookmark`- oder `playlist_tracks`-Eintrag mehr auf die
 geloeschte Datei zeigt. Schlaegt die Pruefung fehl, wird der Block zurueckgerollt und keine Datei angefasst.
+
+### Vor jeder Loeschung
+Die Transaktion bricht ab und laesst die Datei liegen, wenn
+* die zu loeschende Datei einen Navidrome-Eintrag hat, die zu behaltende aber nicht –
+  Favoriten, Playlist-Plaetze und Historie haetten dann kein Ziel;
+* die Zeile der zu behaltenden Datei in Navidrome nicht mehr existiert;
+* die Datei nicht mehr die Groesse hat, die im Plan steht (abschaltbar). Zwischen Planung und
+  Loeschung liegt Zeit – bei uebernommenen Plaenen sogar Tage. Passt die Groesse nicht mehr,
+  ist es nicht mehr dieselbe Datei;
+* die zu behaltende Datei fehlt oder leer ist.
 
 ### Playlists im Besonderen
 Eintraege werden **umgebogen, nie geloescht** – auch dann nicht, wenn die behaltene Datei dadurch doppelt in der
@@ -257,7 +274,9 @@ Fuer ein integriertes Gefuehl eignet sich ein Reverse-Proxy, der Navidrome unter
 z. B. `/dedupe/` ausliefert.
 
 ## Entwicklung
-`cargo test` startet die Tests (aktuell 44). Das Testschema ist aus dem Schema-Dump einer echten
+`cargo test` startet die Tests (aktuell 49). Drei davon schleusen von Hand einen Plan in den Index und
+lassen ihn durch den echten Loeschpfad laufen – so laesst sich pruefen, was bei einem Plan passiert,
+der nicht mehr zur Wirklichkeit passt. Das Testschema ist aus dem Schema-Dump einer echten
 Navidrome-Installation uebernommen: dieselben Spalten, dieselben Fremdschluessel (mit `PRAGMA foreign_keys=ON`
 scharf geschaltet) und die FTS5-Trigger, die bei jedem INSERT, UPDATE und DELETE auf `media_file` mitlaufen.
 Zwei Tests pruefen den Suchindex ausdruecklich: als fehlend markieren laesst ihn unberuehrt (der Trigger haengt
