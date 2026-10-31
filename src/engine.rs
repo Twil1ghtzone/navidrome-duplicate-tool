@@ -962,8 +962,16 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
         let phases = do_content as u64 + do_db as u64;
         sh.stats.total.store(media_count * phases.max(1), Relaxed);
         sh.log(format!("{media_count} relevante Titel in Navidrome"));
+        check_music_writable(sh, &libs);
         if settings.rewrite_m3u {
             check_m3u(sh, &reader, &schema);
+        }
+        if env.delete_rows {
+            sh.log(
+                "ACHTUNG: DELETE_ROWS=true entfernt die Navidrome-Zeilen wirklich. Dabei laufen die \
+                 FTS5-Trigger des Suchindex mit, fuer die es offene Fehlerberichte gibt. Der Standard \
+                 (als fehlend markieren) fasst den Suchindex nicht an und ist umkehrbar.",
+            );
         }
         sh.log(format!("Report/Plan: {}", plan_path.display()));
         let planner = Planner::new(fs::File::create(&plan_path).map_err(|e| format!("Plan-Datei: {e}"))?);
@@ -1028,6 +1036,28 @@ fn run_inner(sh: &Shared, execute: bool) -> Result<(), String> {
     };
     let applied = rdir.join(format!("{ts}-execute-applied.tsv"));
     apply(sh, &mut w, &schema, &settings, trash.as_deref(), idx.as_ref().map(|c| (c, plan_run)), &plan_path, &applied)
+}
+
+/// Loeschen braucht Schreibrecht auf dem **Ordner**, nicht auf der Datei.
+/// Das laesst sich nur pruefen, indem man es versucht – also eine winzige
+/// Datei anlegen und sofort wieder entfernen. Laeuft im Dry-Run mit, damit
+/// ein schreibgeschuetzt eingebundenes Volume vorher auffaellt.
+fn check_music_writable(sh: &Shared, libs: &HashMap<i64, String>) {
+    for (id, root) in libs {
+        let base = map_root(&sh.env, root);
+        let probe = Path::new(&base).join(format!(".nd-dedupe-schreibtest-{}", std::process::id()));
+        match fs::write(&probe, b"") {
+            Ok(()) => {
+                let _ = fs::remove_file(&probe);
+            }
+            Err(e) => {
+                sh.log(format!(
+                    "ACHTUNG: In Bibliothek {id} ({base}) laesst sich nichts anlegen oder loeschen: {e}. \
+                     Die Datenbank wuerde angepasst, die Dateien blieben aber liegen – Volume read-write einbinden."
+                ));
+            }
+        }
+    }
 }
 
 /// Meldet vor dem Lauf, welche eingelesenen Playlist-Dateien angefasst werden
@@ -1550,7 +1580,13 @@ fn to_trash(root: &Path, file: &Path) -> std::io::Result<PathBuf> {
         Ok(()) => Ok(target),
         // anderes Dateisystem: kopieren und erst danach das Original entfernen
         Err(e) if e.raw_os_error() == Some(18) => {
-            fs::copy(file, &target)?;
+            // Scheitert das Kopieren mittendrin (z. B. Platte voll), darf kein
+            // halbes Bruchstueck im Papierkorb liegen bleiben – und das Original
+            // bleibt unangetastet.
+            if let Err(e) = fs::copy(file, &target) {
+                let _ = fs::remove_file(&target);
+                return Err(e);
+            }
             fs::remove_file(file)?;
             Ok(target)
         }
@@ -3205,6 +3241,42 @@ mod tests {
         run(&sh, true);
         assert_eq!(sh.stats.protected.load(Relaxed), 1, "Schutz-Begriff aus dem Tag-Block erkannt");
         assert!(music.join("Downloads/irgendwas.flac").exists(), "geschuetzt, also nicht geloescht");
+    }
+
+    #[test]
+    fn schreibgeschuetzte_bibliothek_wird_vorher_gemeldet() {
+        let (env, music, _cfg) = fixture();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&music, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        let sh = db_mode(env);
+        run(&sh, false); // schon der Dry-Run muss warnen
+        let log: String = sh.log.lock().unwrap().1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&music, fs::Permissions::from_mode(0o755));
+        }
+        #[cfg(unix)]
+        assert!(log.contains("laesst sich nichts anlegen oder loeschen"), "Warnung fehlt:\n{log}");
+    }
+
+    #[test]
+    fn beschreibbare_bibliothek_meldet_nichts_und_hinterlaesst_nichts() {
+        let (env, music, _cfg) = fixture();
+        let sh = db_mode(env);
+        run(&sh, false);
+        let log: String = sh.log.lock().unwrap().1.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(!log.contains("laesst sich nichts anlegen"), "keine Warnung noetig:\n{log}");
+        let reste: Vec<String> = fs::read_dir(&music)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(".nd-dedupe"))
+            .collect();
+        assert!(reste.is_empty(), "die Testdatei wurde wieder entfernt, gefunden: {reste:?}");
     }
 
     #[test]
